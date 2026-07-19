@@ -21,6 +21,7 @@
   }}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
   .wrap{max-width:1040px;margin:0 auto;padding:22px 20px 60px}
   .cmd{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding-bottom:16px;border-bottom:1px solid var(--line)}
   .mark{font-family:var(--mono);font-weight:700;font-size:19px;letter-spacing:-.5px}
@@ -52,6 +53,8 @@
   .chip.done,.chip.stopped,.chip.resuming{color:var(--done);background:color-mix(in srgb,var(--done) 16%,transparent)}
   .meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px;font-family:var(--mono);font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
   .meta .branch{color:var(--dim)}
+  .qprev{margin-top:8px;font-size:13px;line-height:1.45;color:var(--wait);border-left:2px solid var(--wait);padding-left:9px}
+  .hint{font-family:var(--mono);font-size:11px;color:var(--faint)}
   .phases{display:flex;gap:4px;margin-top:11px}
   .seg{flex:1;min-width:0}
   .seg .bar{height:4px;border-radius:2px;background:var(--line-soft)}
@@ -83,6 +86,9 @@
 </style>
 </head>
 <body>
+<!-- Screen-reader announcements: an agent flipping to "needs you" must be heard,
+     not just seen. Targeted messages (not the whole board re-render). -->
+<div id="live" class="sr-only" aria-live="polite" aria-atomic="false"></div>
 <div class="wrap">
   <header class="cmd">
     <span class="mark">gorch<b>·</b>inbox</span>
@@ -102,8 +108,29 @@
 <script>
 const PHASES=["plan","run","review","qa","ship","done"];
 let tasks=[];
+let lastStatus={},announceSeeded=false;
+// Append one node per message (aria-live announces added children) so a burst
+// of transitions never clobbers a prior announcement before it's read.
+function announce(msg){const el=document.getElementById("live");if(!el)return;const d=document.createElement("div");d.textContent=msg;el.appendChild(d);setTimeout(()=>d.remove(),6000);}
+function announceTransitions(next){
+  // Seed silently on first snapshot so a page load with N waiting agents doesn't
+  // fire N announcements at once.
+  if(!announceSeeded){for(const t of next)lastStatus[t.id]=t.status;announceSeeded=true;return;}
+  for(const t of next){
+    const prev=lastStatus[t.id];
+    if(t.status!==prev){
+      if(t.status==="waiting")announce(`${t.title} attend ta réponse.`);
+      else if(t.status==="error")announce(`${t.title} : erreur.`);
+      else if(t.status==="done"&&prev)announce(`${t.title} terminé.`);
+    }
+    lastStatus[t.id]=t.status;
+  }
+}
 function ago(ts){const s=Math.max(0,Math.round((Date.now()-ts)/1000));if(s<60)return`il y a ${s} s`;const m=Math.round(s/60);if(m<60)return`il y a ${m} min`;return`il y a ${Math.round(m/60)} h`;}
-function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function esc(s){return (s||"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));}
+// One-line preview of a prose question for the agent row: prefer the last line
+// with a "?", strip common markdown, truncate.
+function preview(text,max){max=max||120;const lines=(text||"").split("\n").map(s=>s.trim()).filter(Boolean);let q=lines.slice().reverse().find(l=>l.includes("?"))||lines[lines.length-1]||"";q=q.replace(/[*_`#>]/g,"").trim();return q.length>max?q.slice(0,max-1).trimEnd()+"…":q;}
 
 function phaseBar(t){
   const idx=PHASES.indexOf(t.phase);
@@ -126,14 +153,17 @@ function rowHtml(t){
         <span class="chip ${t.status}">${t.status==="waiting"?"Waiting for user":t.status}</span></div>
       <div class="meta"><span class="branch">⑂ ${esc(t.branch)}</span>
         <span>${esc(t.id)}</span>${t.error?`<span>${esc(t.error.slice(0,50))}</span>`:""}</div>
+      ${t.status==="waiting"&&t.pendingQuestion?`<div class="qprev">${esc(preview(t.pendingQuestion))}</div>`:""}
       ${phaseBar(t)}
     </div>
     <div class="aside"><span class="ago">${ago(t.lastActivity)}</span>${actions(t)}</div>
   </article>`;
 }
+// Isolate each row: one task that throws must not blank the whole board.
+function safeRow(t){try{return rowHtml(t);}catch(e){return `<article class="row error"><div class="rail"></div><div class="body"><div class="toprow"><span class="name">${esc((t&&t.title)||(t&&t.id)||"tâche")}</span><span class="chip error">erreur d'affichage</span></div></div><div class="aside"></div></article>`;}}
 function section(title,list){
   if(!list.length)return "";
-  return `<div class="lbl">${title}</div><div class="rows">${list.map(rowHtml).join("")}</div>`;
+  return `<div class="lbl">${title}</div><div class="rows">${list.map(safeRow).join("")}</div>`;
 }
 function render(){
   const wait=tasks.filter(t=>t.status==="waiting"||t.status==="error");
@@ -159,7 +189,8 @@ function openNew(){
   showDrawer(`<h2>Nouvelle tâche</h2>
     <label class="lbl">Titre</label><input id="nt" placeholder="Refonte facturation">
     <label class="lbl">Instruction pour l'agent</label>
-    <textarea id="np" placeholder="Implémente X en suivant le workflow gstack…"></textarea>
+    <textarea id="np" placeholder="Implémente X en suivant le workflow gstack…" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')createTask()"></textarea>
+    <div class="hint">⌘/Ctrl + Entrée pour lancer</div>
     <button class="btn primary" onclick="createTask()">Lancer l'agent</button>`);
   setTimeout(()=>document.getElementById("nt")?.focus(),50);
 }
@@ -174,7 +205,8 @@ function reply(id){
   showDrawer(`<h2>${esc(t.title)} attend</h2>
     <div class="q">${esc(t.pendingQuestion||"(pas de texte de question)")}</div>
     <label class="lbl">Ta réponse (injectée via claude --resume)</label>
-    <textarea id="ans" placeholder="Tape ta décision…"></textarea>
+    <textarea id="ans" placeholder="Tape ta décision…" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')sendAnswer('${id}')"></textarea>
+    <div class="hint">⌘/Ctrl + Entrée pour envoyer</div>
     <button class="btn primary" onclick="sendAnswer('${id}')">Envoyer à l'agent</button>`);
   setTimeout(()=>document.getElementById("ans")?.focus(),50);
 }
@@ -204,8 +236,9 @@ function connect(){
   const ws=new WebSocket(`ws://${location.host}/ws`);
   ws.onopen=()=>document.getElementById("conn").textContent="live";
   ws.onclose=()=>{document.getElementById("conn").textContent="reconnexion…";setTimeout(connect,1500);};
-  ws.onmessage=(m)=>{const d=JSON.parse(m.data);if(d.type==="tasks"){tasks=d.tasks;render();}};
+  ws.onmessage=(m)=>{const d=JSON.parse(m.data);if(d.type==="tasks"){announceTransitions(d.tasks);tasks=d.tasks;render();}};
 }
+document.addEventListener("keydown",(e)=>{if(e.key!=="Escape")return;const a=document.activeElement;if(a&&a.tagName==="TEXTAREA"&&a.value.trim())return;closeDrawer();});
 connect();
 setInterval(render,10000); // refresh relative times
 </script>
