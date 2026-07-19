@@ -29,6 +29,12 @@ const PROMPT = custom || (useGstack ? GSTACK_PROMPT : DEFAULT_PROMPT);
 const ANSWER = "blue";
 
 const baseOut = ["--output-format", "stream-json", "--verbose", "--include-partial-messages"];
+// A1b launch config: an unattended orchestrator must skip permission prompts so
+// gstack's tools (Bash, Skill, ...) run without blocking. Mirrors AgentDeck's
+// GORCH_PERMISSION_MODE. Only for the gstack test — the plain prose test needs
+// no extra perms. MUST run in a plain shell on the VPS, NOT nested inside an
+// interactive Claude Code session (that sandbox blocks skill/filesystem access).
+const PERM = useGstack ? ["--dangerously-skip-permissions"] : [];
 
 type Turn = { sessionId: string | null; text: string; subtype: string; tools: string[]; auqAvailable: boolean };
 
@@ -65,7 +71,7 @@ console.log(`\n╭─ gorch spike T1 (v2) ${"─".repeat(45)}`);
 console.log(`│ mode: ${useGstack ? "gstack skill" : "plain prose question"}`);
 console.log(`╰${"─".repeat(66)}\n─ turn 1: agent asks ─\n`);
 
-const t1 = await runClaude(["-p", ...baseOut, PROMPT]);
+const t1 = await runClaude(["-p", ...baseOut, ...PERM, PROMPT]);
 console.log(`\n\n[turn1] session=${t1.sessionId}  subtype=${t1.subtype}  AUQ-tool-available=${t1.auqAvailable}  tools=[${t1.tools.join(",")}]`);
 
 if (!t1.sessionId) {
@@ -75,7 +81,7 @@ if (!t1.sessionId) {
 
 const askedInProse = /\?/.test(t1.text) && t1.subtype === "success";
 console.log(`\n─ turn 2: gorch injects the human answer via --resume ("${ANSWER}") ─\n`);
-const t2 = await runClaude(["--resume", t1.sessionId, "-p", ...baseOut, `My answer: ${ANSWER}`]);
+const t2 = await runClaude(["--resume", t1.sessionId, "-p", ...baseOut, ...PERM, `My answer: ${ANSWER}`]);
 
 const continued = t2.subtype === "success" && t2.text.trim().length > 0;
 const acknowledged = new RegExp(ANSWER, "i").test(t2.text);
