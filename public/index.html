@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gorch · Master Inbox</title>
+<style>
+  :root{
+    color-scheme:dark;
+    --bg:#0d1117;--surface:#161b22;--line:#232b36;--line-soft:#1a212b;
+    --text:#e6edf3;--dim:#9aa7b4;--faint:#6b7683;
+    --accent:#4dd0c7;--accent-dim:#2b6f6b;
+    --wait:#f5a623;--wait-bg:#2a2011;--err:#f85149;--err-bg:#2a1517;--ok:#3fb950;--done:#6b7683;
+    --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme:light){:root{
+    color-scheme:light;--bg:#f6f8fa;--surface:#fff;--line:#d6dde5;--line-soft:#e6ebf0;
+    --text:#1c2128;--dim:#5a6570;--faint:#8b97a3;--accent:#157e77;--accent-dim:#9bd4cf;
+    --wait:#b8770a;--wait-bg:#fdf3e0;--err:#cf222e;--err-bg:#fdeceb;--ok:#1a7f37;--done:#8b97a3;
+  }}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1040px;margin:0 auto;padding:22px 20px 60px}
+  .cmd{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding-bottom:16px;border-bottom:1px solid var(--line)}
+  .mark{font-family:var(--mono);font-weight:700;font-size:19px;letter-spacing:-.5px}
+  .mark b{color:var(--accent)}
+  .sub{font-family:var(--mono);font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.3px}
+  .pills{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+  .pill{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums;padding:5px 11px;border-radius:999px;background:var(--surface);border:1px solid var(--line);color:var(--dim)}
+  .pill .n{color:var(--text);font-weight:600}
+  .pill.wait{border-color:var(--wait);color:var(--wait);background:var(--wait-bg)}
+  .pill.err{border-color:var(--err);color:var(--err)}
+  .dot{width:7px;height:7px;border-radius:50%}
+  .dot.ok{background:var(--ok)}.dot.done{background:var(--done)}
+  .newbtn{font-family:var(--sans);font-weight:600;font-size:13px;cursor:pointer;padding:6px 13px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent)}
+  .lbl{font-family:var(--mono);font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--faint);margin:22px 2px 9px}
+  .rows{display:flex;flex-direction:column;gap:8px}
+  .row{position:relative;display:grid;grid-template-columns:3px 1fr auto;background:var(--surface);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .rail{background:var(--done)}
+  .row.running .rail{background:var(--ok)}.row.waiting .rail{background:var(--wait)}.row.error .rail{background:var(--err)}
+  .row.waiting{border-color:var(--wait);background:var(--wait-bg)}
+  .row.error{border-color:var(--err);background:var(--err-bg)}
+  .row.done,.row.stopped{opacity:.62}
+  .body{padding:13px 16px;min-width:0}
+  .toprow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .name{font-family:var(--mono);font-size:15px;font-weight:600;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  .chip{font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;padding:2px 8px;border-radius:5px;white-space:nowrap}
+  .chip.running{color:var(--ok);background:color-mix(in srgb,var(--ok) 15%,transparent)}
+  .chip.waiting{color:var(--wait);background:color-mix(in srgb,var(--wait) 22%,transparent)}
+  .chip.error{color:var(--err);background:color-mix(in srgb,var(--err) 20%,transparent)}
+  .chip.done,.chip.stopped,.chip.resuming{color:var(--done);background:color-mix(in srgb,var(--done) 16%,transparent)}
+  .meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px;font-family:var(--mono);font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .meta .branch{color:var(--dim)}
+  .phases{display:flex;gap:4px;margin-top:11px}
+  .seg{flex:1;min-width:0}
+  .seg .bar{height:4px;border-radius:2px;background:var(--line-soft)}
+  .seg.done .bar{background:var(--accent-dim)}
+  .seg.active .bar{background:var(--accent)}
+  .row.waiting .seg.active .bar{background:var(--wait)}.row.error .seg.active .bar{background:var(--err)}
+  .seg .pl{font-family:var(--mono);font-size:9.5px;letter-spacing:.3px;text-transform:uppercase;color:var(--faint);margin-top:5px;text-align:center;white-space:nowrap}
+  .seg.active .pl{color:var(--text);font-weight:600}
+  .aside{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:8px;padding:13px 16px;border-left:1px solid var(--line-soft);min-width:150px}
+  .ago{font-family:var(--mono);font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .row.waiting .ago{color:var(--wait)}.row.error .ago{color:var(--err)}
+  .btn{font-family:var(--sans);font-size:13px;font-weight:600;cursor:pointer;padding:7px 14px;border-radius:6px;border:1px solid transparent;white-space:nowrap}
+  .btn.primary{background:var(--wait);color:#14100a;border-color:var(--wait)}
+  .btn.danger{background:transparent;color:var(--err);border-color:var(--err)}
+  .btn.ghost{background:transparent;color:var(--dim);border-color:var(--line)}
+  .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .empty{margin-top:26px;padding:22px;border:1px dashed var(--line);border-radius:8px;color:var(--faint);font-family:var(--mono);font-size:13px;text-align:center}
+  /* drawer */
+  .scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .15s}
+  .scrim.on{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;height:100%;width:min(440px,92vw);background:var(--surface);border-left:1px solid var(--line);transform:translateX(100%);transition:transform .18s ease;display:flex;flex-direction:column;padding:20px;gap:14px;overflow:auto}
+  .drawer.on{transform:translateX(0)}
+  .drawer h2{font-family:var(--mono);font-size:16px;margin:0}
+  .drawer .q{white-space:pre-wrap;font-family:var(--mono);font-size:13px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:12px;color:var(--dim);max-height:40vh;overflow:auto}
+  .drawer textarea,.drawer input{width:100%;font-family:var(--mono);font-size:13px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:10px}
+  .drawer textarea{min-height:90px;resize:vertical}
+  .drawer .close{position:absolute;top:14px;right:16px;cursor:pointer;color:var(--faint);background:none;border:none;font-size:20px}
+  @media(max-width:620px){.row{grid-template-columns:3px 1fr}.aside{grid-column:2;border-left:0;border-top:1px solid var(--line-soft);flex-direction:row;align-items:center;justify-content:space-between;min-width:0}.seg .pl{display:none}.seg.active .pl{display:block}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="cmd">
+    <span class="mark">gorch<b>·</b>inbox</span>
+    <span class="sub" id="conn">connexion…</span>
+    <div class="pills" id="pills"></div>
+    <button class="newbtn" onclick="openNew()">+ Nouvelle tâche</button>
+  </header>
+  <div id="board"></div>
+</div>
+
+<div class="scrim" id="scrim" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer">
+  <button class="close" onclick="closeDrawer()">×</button>
+  <div id="drawerBody"></div>
+</aside>
+
+<script>
+const PHASES=["plan","run","review","qa","ship","done"];
+let tasks=[];
+function ago(ts){const s=Math.max(0,Math.round((Date.now()-ts)/1000));if(s<60)return`il y a ${s} s`;const m=Math.round(s/60);if(m<60)return`il y a ${m} min`;return`il y a ${Math.round(m/60)} h`;}
+function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function phaseBar(t){
+  const idx=PHASES.indexOf(t.phase);
+  return `<div class="phases">`+PHASES.map((p,i)=>{
+    const cls=i<idx?"done":i===idx?"active":"";
+    return `<div class="seg ${cls}"><div class="bar"></div><div class="pl">${p}</div></div>`;
+  }).join("")+`</div>`;
+}
+function actions(t){
+  if(t.status==="waiting")return `<button class="btn primary" onclick="reply('${t.id}')">Répondre</button>`;
+  if(t.status==="error")return `<button class="btn danger" onclick="openTask('${t.id}')">Voir les logs</button>`;
+  if(t.status==="done")return `<button class="btn ghost" onclick="del('${t.id}')">Nettoyer</button>`;
+  return `<button class="btn ghost" onclick="openTask('${t.id}')">Ouvrir</button>`;
+}
+function rowHtml(t){
+  return `<article class="row ${t.status}">
+    <div class="rail"></div>
+    <div class="body">
+      <div class="toprow"><span class="name">${esc(t.title)}</span>
+        <span class="chip ${t.status}">${t.status==="waiting"?"Waiting for user":t.status}</span></div>
+      <div class="meta"><span class="branch">⑂ ${esc(t.branch)}</span>
+        <span>${esc(t.id)}</span>${t.error?`<span>${esc(t.error.slice(0,50))}</span>`:""}</div>
+      ${phaseBar(t)}
+    </div>
+    <div class="aside"><span class="ago">${ago(t.lastActivity)}</span>${actions(t)}</div>
+  </article>`;
+}
+function section(title,list){
+  if(!list.length)return "";
+  return `<div class="lbl">${title}</div><div class="rows">${list.map(rowHtml).join("")}</div>`;
+}
+function render(){
+  const wait=tasks.filter(t=>t.status==="waiting"||t.status==="error");
+  const run=tasks.filter(t=>t.status==="running"||t.status==="resuming");
+  const done=tasks.filter(t=>t.status==="done"||t.status==="stopped");
+  const counts={waiting:tasks.filter(t=>t.status==="waiting").length,error:tasks.filter(t=>t.status==="error").length,
+    running:run.length,done:done.length};
+  document.getElementById("pills").innerHTML=
+    (counts.waiting?`<span class="pill wait"><span class="n">${counts.waiting}</span> waiting</span>`:"")+
+    (counts.error?`<span class="pill err"><span class="n">${counts.error}</span> error</span>`:"")+
+    `<span class="pill"><span class="dot ok"></span><span class="n">${counts.running}</span> running</span>`+
+    `<span class="pill"><span class="dot done"></span><span class="n">${counts.done}</span> done</span>`;
+  const board=document.getElementById("board");
+  if(!tasks.length){board.innerHTML=`<div class="empty">Aucun agent en cours.<br>Décris une tâche — gorch crée la branche, le worktree, lance l'agent et le workflow gstack.<br><br><button class="newbtn" onclick="openNew()">+ Nouvelle tâche</button></div>`;return;}
+  board.innerHTML=section("A besoin de toi",wait)+section("Roulent tout seuls",run)+section("Terminés",done);
+}
+
+// ── drawer ──
+const drawer=document.getElementById("drawer"),scrim=document.getElementById("scrim");
+function showDrawer(html){document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
+function closeDrawer(){drawer.classList.remove("on");scrim.classList.remove("on");}
+function openNew(){
+  showDrawer(`<h2>Nouvelle tâche</h2>
+    <label class="lbl">Titre</label><input id="nt" placeholder="Refonte facturation">
+    <label class="lbl">Instruction pour l'agent</label>
+    <textarea id="np" placeholder="Implémente X en suivant le workflow gstack…"></textarea>
+    <button class="btn primary" onclick="createTask()">Lancer l'agent</button>`);
+  setTimeout(()=>document.getElementById("nt")?.focus(),50);
+}
+async function createTask(){
+  const title=document.getElementById("nt").value.trim(),prompt=document.getElementById("np").value.trim();
+  if(!title||!prompt)return;
+  const r=await fetch("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,prompt})});
+  if(r.ok)closeDrawer();else alert("Erreur: "+(await r.json()).error);
+}
+function reply(id){
+  const t=tasks.find(x=>x.id===id);if(!t)return;
+  showDrawer(`<h2>${esc(t.title)} attend</h2>
+    <div class="q">${esc(t.pendingQuestion||"(pas de texte de question)")}</div>
+    <label class="lbl">Ta réponse (injectée via claude --resume)</label>
+    <textarea id="ans" placeholder="Tape ta décision…"></textarea>
+    <button class="btn primary" onclick="sendAnswer('${id}')">Envoyer à l'agent</button>`);
+  setTimeout(()=>document.getElementById("ans")?.focus(),50);
+}
+async function sendAnswer(id){
+  const text=document.getElementById("ans").value.trim();if(!text)return;
+  const r=await fetch(`/api/tasks/${id}/answer`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
+  if(r.ok)closeDrawer();else alert("Erreur: "+(await r.json()).error);
+}
+async function openTask(id){
+  const t=tasks.find(x=>x.id===id);
+  const ev=await fetch(`/api/tasks/${id}/events`).then(r=>r.json()).catch(()=>({events:[]}));
+  const df=await fetch(`/api/tasks/${id}/diff`).then(r=>r.json()).catch(()=>({diff:""}));
+  showDrawer(`<h2>${esc(t.title)}</h2>
+    <div class="meta"><span class="branch">⑂ ${esc(t.branch)}</span><span>phase ${t.phase}</span><span>${t.status}</span></div>
+    <label class="lbl">Diff</label><div class="q">${esc(df.diff||"(aucun changement)")}</div>
+    <label class="lbl">Événements récents</label>
+    <div class="q">${ev.events.slice(-40).map(e=>`${new Date(e.ts).toLocaleTimeString()} · ${e.kind} · ${esc(String(e.data)).slice(0,120)}`).join("\n")||"(rien)"}</div>
+    <div style="display:flex;gap:8px">
+      <button class="btn ghost" onclick="stop('${id}')">Suspendre</button>
+      <button class="btn danger" onclick="del('${id}')">Supprimer</button></div>`);
+}
+async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST"});closeDrawer();}
+async function del(id){if(!confirm("Supprimer worktree + branche ?"))return;const r=await fetch(`/api/tasks/${id}`,{method:"DELETE"});const j=await r.json();if(!j.removed)alert(j.reason||"refusé");closeDrawer();}
+
+// ── live ──
+function connect(){
+  const ws=new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen=()=>document.getElementById("conn").textContent="live";
+  ws.onclose=()=>{document.getElementById("conn").textContent="reconnexion…";setTimeout(connect,1500);};
+  ws.onmessage=(m)=>{const d=JSON.parse(m.data);if(d.type==="tasks"){tasks=d.tasks;render();}};
+}
+connect();
+setInterval(render,10000); // refresh relative times
+</script>
+</body>
+</html>

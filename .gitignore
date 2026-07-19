@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+.env
+worktrees/
+data/
+.claude/settings.local.json
