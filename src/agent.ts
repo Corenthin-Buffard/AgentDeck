@@ -35,13 +35,16 @@ function baseArgs(): string[] {
   const perm = config.dangerouslySkipPermissions
     ? ["--dangerously-skip-permissions"]
     : ["--permission-mode", config.permissionMode];
+  // Load the daemon's hook settings so the agent POSTs Notification events back.
+  const settings = config.notificationHooks ? ["--settings", config.agentSettingsPath] : [];
   return [
     "-p",
     "--output-format", "stream-json",
     "--verbose",
     "--include-partial-messages",
     ...perm,
-    ...config.extraClaudeArgs, // e.g. --add-dir, --settings, --model
+    ...settings,
+    ...config.extraClaudeArgs, // e.g. --add-dir, --model
   ];
 }
 
