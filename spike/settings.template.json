@@ -1,0 +1,31 @@
+{
+  "//": "Drop this into the agent's working dir at .claude/settings.json to make Claude Code POST hook events to the gorch hook server. Optional for the spike (run.ts detects the question from the stream directly); required in prod so the daemon gets a first-class 'needs you' signal for ALL blocking causes, not just AskUserQuestion.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion|mcp__.*__AskUserQuestion",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:8080/hooks/pre-tool-use",
+            "timeout": 30,
+            "async": false
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:8080/hooks/notification",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
