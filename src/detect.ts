@@ -2,7 +2,7 @@
 // these are unit-testable in isolation (see test/detect.test.ts).
 
 const QUESTION_CUES =
-  /\b(which|choose|should i|do you want|would you like|which option|let me know|please (confirm|pick|reply)|reply with|waiting for your (answer|reply)|proceed\?)\b/i;
+  /\b(which|choose|should i|do you want|would you like|option|let me know|please (confirm|pick|reply)|reply with|waiting for your (answer|reply)|proceed\?)\b/i;
 
 /**
  * Did the agent stop to ask the human something (prose), vs finish the task?

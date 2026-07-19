@@ -11,6 +11,10 @@ describe("looksLikeQuestion", () => {
     expect(looksLikeQuestion("Reply with A, B, or C.")).toBe(true);
   });
 
+  test("a bare 'option' cue counts (regression guard: don't strand a waiting agent as done)", () => {
+    expect(looksLikeQuestion("Select an option to continue.")).toBe(true);
+  });
+
   test("treats a completion statement as not-a-question", () => {
     expect(looksLikeQuestion("Done. Shipped v1.2.0 and opened the PR.")).toBe(false);
   });
