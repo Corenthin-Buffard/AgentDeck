@@ -4,6 +4,7 @@ import { store } from "./db.ts";
 import { emitUpdate } from "./bus.ts";
 import { notify } from "./notify.ts";
 import { phaseFromSignal, mergePhase } from "./phase.ts";
+import { looksLikeQuestion } from "./detect.ts";
 import type { Task, Phase, Status } from "./types.ts";
 
 // The agent supervisor. Everything the spike proved lives here:
@@ -42,16 +43,6 @@ function baseArgs(): string[] {
     ...perm,
     ...config.extraClaudeArgs, // e.g. --add-dir, --settings, --model
   ];
-}
-
-// Heuristic: did the agent stop to ask us something (vs finish the task)?
-// Fragile by nature (headless has no structured AUQ); the Notification hook is
-// the stronger signal when wired. Kept conservative.
-function looksLikeQuestion(text: string): boolean {
-  const tail = text.trim().slice(-500);
-  if (!tail) return false;
-  return /\?\s*$/.test(tail)
-    || /\b(which|choose|should i|do you want|would you like|option|let me know|please (confirm|pick|reply)|proceed\?)\b/i.test(tail);
 }
 
 function attach(task: Task, child: ChildProcess) {
