@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.1.0] - 2026-07-19
+
+Reply-drawer polish, accessibility, and the first tests.
+
+### Added
+- Master Inbox: a **pending-question preview** on waiting agent rows;
+  **Cmd/Ctrl+Enter** to submit in the reply and new-task drawers; **Escape** to close
+  (unless a non-empty textarea is focused).
+- **Screen-reader support**: an `aria-live` region announces agents flipping to
+  waiting / error / done — appends one node per message so a burst isn't clobbered,
+  and seeds silently on first load so a page reload doesn't announce the whole board.
+- **Unit tests (15)** for the state-detection logic: `looksLikeQuestion` + phase mapping.
+
+### Changed
+- Extract `looksLikeQuestion` into `src/detect.ts` (pure, testable module).
+
+### Fixed
+- Restore the standalone "option" cue in `looksLikeQuestion` — a prose question ending
+  in "select an option" was mis-classified as done, stranding a waiting agent (with a
+  regression test).
+- Isolate each dashboard row render so one bad task can't blank the whole board.
+- `esc()` also escapes `'` and `` ` `` (defense in depth).
+
 ## [0.1.0.0] - 2026-07-19
 
 First cut. The daemon spine runs end to end and the make-or-break mechanic is proven.
