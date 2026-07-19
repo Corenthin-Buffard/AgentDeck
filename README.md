@@ -29,7 +29,7 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
 
 **The human-in-loop mechanic (proven):** in headless mode Claude Code has no AskUserQuestion tool, so the agent asks in **prose** and the turn ends. AgentDeck reads the question, notifies you (Slack/Telegram), and when you reply in the dashboard it injects the answer as a new `claude --resume <sessionId>` turn. That same `resume` is also how agents survive a daemon restart — injection and durability are one operation.
 
-**Faster "waiting" detection (corroborating):** agents launch with `--settings` pointing at a generated hooks file, so Claude Code POSTs its `Notification` events ("agent needs your attention") straight to the daemon — a first-class signal that also covers permission prompts, not just questions. The prose heuristic stays the primary, proven path; the hook corroborates and speeds it up. Whether `Notification` fires under headless `claude -p` still needs a VPS run to confirm (`GORCH_HOOKS=false` disables the wiring).
+**Faster "waiting" detection (opt-in, corroborating):** with `GORCH_HOOKS=true`, agents launch with `--settings` pointing at a generated hooks file, so Claude Code POSTs its `Notification` events ("agent needs your attention") straight to the daemon — a first-class signal that also covers permission prompts, not just questions. The prose heuristic stays the primary, proven path; the hook corroborates and speeds it up. It ships **off by default** because whether `Notification` fires under headless `claude -p` still needs a VPS run to confirm — turn it on there to validate.
 
 ## Run
 

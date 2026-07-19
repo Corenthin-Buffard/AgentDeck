@@ -26,9 +26,12 @@ export const config: GorchConfig = {
   permissionMode: process.env.GORCH_PERMISSION_MODE ?? "acceptEdits",
   extraClaudeArgs: (process.env.GORCH_CLAUDE_ARGS ?? "").split(" ").filter(Boolean),
 
-  // Notification-hook wiring. Agents are local subprocesses, so they reach the
-  // daemon on 127.0.0.1 even when host is 0.0.0.0. Disable with GORCH_HOOKS=false.
-  notificationHooks: (process.env.GORCH_HOOKS ?? "true") !== "false",
+  // Notification-hook wiring. OPT-IN (off by default): it's unproven under
+  // headless `claude -p` and it sits in the launch path (every agent gets
+  // --settings), so validate on a VPS before trusting it — enable with
+  // GORCH_HOOKS=true. Agents are local subprocesses, so they reach the daemon on
+  // 127.0.0.1 even when host is 0.0.0.0.
+  notificationHooks: process.env.GORCH_HOOKS === "true",
   hookBaseUrl: process.env.GORCH_HOOK_BASE_URL ?? `http://127.0.0.1:${port}`,
   agentSettingsPath: join(dataDir, "agent-settings.json"),
 

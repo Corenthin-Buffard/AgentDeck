@@ -14,8 +14,13 @@ mkdirSync(config.worktreesDir, { recursive: true });
 // Code POSTs Notification/PreToolUse hook events back to us. Written before we
 // resume any in-flight agent below.
 if (config.notificationHooks) {
-  writeFileSync(config.agentSettingsPath, JSON.stringify(hookSettings(config.hookBaseUrl), null, 2));
-  console.log(`[hooks] agents POST Notification/PreToolUse → ${config.hookBaseUrl}`);
+  try {
+    writeFileSync(config.agentSettingsPath, JSON.stringify(hookSettings(config.hookBaseUrl), null, 2));
+    console.log(`[hooks] agents POST Notification/PreToolUse → ${config.hookBaseUrl}`);
+  } catch (e) {
+    config.notificationHooks = false; // degrade — never crash the daemon over an optional enhancement
+    console.warn(`[hooks] disabled: could not write ${config.agentSettingsPath}: ${(e as Error).message}`);
+  }
 }
 
 // A2 durability: on (re)start, resume any task that was mid-run. Injection and
