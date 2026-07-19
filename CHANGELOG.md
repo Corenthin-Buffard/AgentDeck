@@ -19,7 +19,12 @@ First cut. The daemon spine runs end to end and the make-or-break mechanic is pr
 - **Spike (`spike/`)** — the instrument that proved A1: in headless mode the AskUserQuestion tool is
   unavailable, the agent asks in prose, and a `claude --resume` turn injects the answer and continues.
 
-### Known / next
-- **A1b** — validate the agent launch config (skills in scope + permission mode) on a real VPS;
-  a nested sandbox blocks skill resolution. See `README.md`.
+### Validated
+- **A1b — resolved.** A real gstack skill runs headless, asks in prose (no `BLOCKED`), and a
+  `claude --resume` turn continues it. Launch config: agents start with
+  `--dangerously-skip-permissions` (`GORCH_SKIP_PERMISSIONS`, default on). Path A proven end to end.
+
+### Next
 - Reply drawer wired to the `Notification` hook, `resuming` state UI, `aria-live` (DT1–DT3).
+- Confirm a *valid* answer advances a gstack workflow (the A1b test used an invalid answer, so the
+  agent re-asked — the round-trip mechanic is proven, full-flow advance is the follow-up).

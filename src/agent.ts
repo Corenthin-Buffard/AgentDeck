@@ -27,14 +27,19 @@ function pump(): void {
 }
 function schedule(spawnFn: () => void): void { waitQueue.push(spawnFn); pump(); }
 
-// ── A1b: the launch config that decides whether an agent can run gstack ──
+// ── A1b (proven): the launch config that lets an agent run gstack headlessly ──
+// The spike confirmed gstack only resolves + runs unattended with permissions
+// fully skipped; `--permission-mode acceptEdits` was not enough.
 function baseArgs(): string[] {
+  const perm = config.dangerouslySkipPermissions
+    ? ["--dangerously-skip-permissions"]
+    : ["--permission-mode", config.permissionMode];
   return [
     "-p",
     "--output-format", "stream-json",
     "--verbose",
     "--include-partial-messages",
-    "--permission-mode", config.permissionMode,
+    ...perm,
     ...config.extraClaudeArgs, // e.g. --add-dir, --settings, --model
   ];
 }

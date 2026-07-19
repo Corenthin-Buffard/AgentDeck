@@ -16,10 +16,12 @@ export const config: GorchConfig = {
   worktreesDir: process.env.GORCH_WORKTREES ?? join(dataDir, "worktrees"),
   claudeBin: process.env.GORCH_CLAUDE_BIN ?? "claude",
 
-  // ── A1b launch config (see spike finding) ──────────────────────────────
-  // Headless agents need enough permission to actually work. On the VPS this
-  // is the knob that decides whether gstack can run. Default is conservative;
-  // set GORCH_PERMISSION_MODE=bypassPermissions for fully unattended runs.
+  // ── A1b launch config (PROVEN by the spike) ─────────────────────────────
+  // gstack skills only resolve + run in a headless agent when permissions are
+  // fully skipped. This is THE knob that decides whether gstack runs. Default
+  // on (unattended orchestrator). Set GORCH_SKIP_PERMISSIONS=false + a
+  // GORCH_PERMISSION_MODE only for a supervised debugging session.
+  dangerouslySkipPermissions: (process.env.GORCH_SKIP_PERMISSIONS ?? "true") !== "false",
   permissionMode: process.env.GORCH_PERMISSION_MODE ?? "acceptEdits",
   extraClaudeArgs: (process.env.GORCH_CLAUDE_ARGS ?? "").split(" ").filter(Boolean),
 

@@ -43,8 +43,11 @@ export interface GorchConfig {
   targetRepo: string;      // the repo whose branches/worktrees agents operate on
   worktreesDir: string;
   claudeBin: string;
-  // ── A1b: the launch config that makes agents able to run gstack headlessly ──
-  permissionMode: string;  // e.g. 'acceptEdits' | 'bypassPermissions' | 'default'
+  // ── A1b (proven): the launch config that makes agents run gstack headlessly ──
+  // The spike proved gstack only resolves + runs unattended with permissions
+  // fully skipped. Default true. Set false only for a hands-on debugging run.
+  dangerouslySkipPermissions: boolean;
+  permissionMode: string;  // used only when dangerouslySkipPermissions=false
   extraClaudeArgs: string[]; // escape hatch for --add-dir, --settings, etc.
   maxConcurrentAgents: number;
   notify: {

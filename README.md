@@ -4,7 +4,7 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 
 `1 task = 1 branch = 1 git worktree = 1 agent.` Strict isolation, no sharing. Agents run on the server, so they keep going when you close your laptop or drop the SSH connection.
 
-> Status: **v0.1.0.0** — the daemon spine runs end to end (create task → branch → worktree → agent → live dashboard) and the core human-in-loop mechanic is proven (see A1 below). Not yet production-hardened. One open validation: **A1b** (below).
+> Status: **v0.1.0.0** — the daemon spine runs end to end (create task → branch → worktree → agent → live dashboard) and the core mechanic is proven end to end: a real gstack skill runs headless, asks in prose, and a `claude --resume` turn continues it (**A1 + A1b, below**). Not yet production-hardened.
 
 ## Why this and not Claude Squad / Conductor / amux
 
@@ -52,9 +52,9 @@ bun run spike            # plain prose question → resume → continues
 bun run spike -- --gstack  # drive a real gstack skill (see A1b caveat)
 ```
 
-## Open validation — A1b
+## A1b — resolved ✅
 
-The spike proved the transport (prose + resume) with a plain agent. The remaining unknown: driving a **gstack** skill headlessly needs the right **launch config** — skills in scope, permission mode, trusted dirs. A nested sandbox blocks skill resolution, so this must be validated on a real VPS with AgentDeck's launch config. The `GORCH_PERMISSION_MODE` / `GORCH_CLAUDE_ARGS` knobs exist for exactly this.
+Proven on 2026-07-19: a real gstack skill (`/office-hours`) runs headless and asks its question **in prose** (no `BLOCKED`), then a `claude --resume` turn continues it. The one requirement is the launch config — agents must be started with **`--dangerously-skip-permissions`** so gstack's tools resolve and run unattended (`--permission-mode acceptEdits` was not enough). AgentDeck does this by default (`GORCH_SKIP_PERMISSIONS`, on unless set to `false`). Reproduce with `bun run spike -- --gstack` in a plain shell (not nested inside another Claude Code session, whose sandbox blocks it).
 
 ## Layout
 
