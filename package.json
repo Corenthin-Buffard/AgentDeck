@@ -1,6 +1,6 @@
 {
   "name": "agentdeck",
-  "version": "0.1.3.7",
+  "version": "0.1.3.8",
   "type": "module",
   "private": true,
   "description": "AgentDeck — self-hosted, gstack-native orchestrator for parallel Claude Code agents. Air-traffic-control board for your VPS.",
