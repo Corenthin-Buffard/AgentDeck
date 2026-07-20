@@ -48,7 +48,11 @@ export interface GorchConfig {
   // fully skipped. Default true. Set false only for a hands-on debugging run.
   dangerouslySkipPermissions: boolean;
   permissionMode: string;  // used only when dangerouslySkipPermissions=false
-  extraClaudeArgs: string[]; // escape hatch for --add-dir, --settings, etc.
+  extraClaudeArgs: string[]; // escape hatch for extra claude flags (--add-dir, --model, …)
+  // Notification-hook wiring: launched agents POST hook events to the daemon.
+  notificationHooks: boolean;    // wire the Notification/PreToolUse HTTP hooks
+  hookBaseUrl: string;           // where agents POST hook events (the daemon)
+  agentSettingsPath: string;     // the generated `claude --settings` file
   maxConcurrentAgents: number;
   notify: {
     telegram?: { botToken: string; chatId: string };

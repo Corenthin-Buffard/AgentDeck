@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.2.0] - 2026-07-20
+
+Opt-in Notification-hook wiring for faster "waiting" detection, hardened after review.
+
+### Added
+- **Notification-hook wiring (opt-in, `GORCH_HOOKS=true`)**: launched agents load a
+  generated settings file via `claude --settings`, so Claude Code POSTs its `Notification`
+  (and PreToolUse) HTTP hooks to the daemon — a first-class "needs you" signal that also
+  covers permission prompts. The prose heuristic stays primary; the hook corroborates and
+  speeds detection. **Off by default** until validated on a VPS.
+- `src/hooks-config.ts`: pure settings generator (+ 3 tests).
+
+### Fixed
+- **One live child per task (critical)**: a Notification-driven `waiting` can fire while
+  the agent is still running; `answer()`/`resumeTask()` now kill the existing child first
+  and the exit handler is identity-guarded — no two concurrent `claude --resume` on one
+  session, no orphaned or false-error tasks.
+- The settings-file write is guarded — a failure degrades to hooks-off instead of crashing
+  the daemon.
+- Cap the hook message length (2000); skip our `--settings` if the operator passed their own.
+
 ## [0.1.1.0] - 2026-07-19
 
 Reply-drawer polish, accessibility, and the first tests.

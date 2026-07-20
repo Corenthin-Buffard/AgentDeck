@@ -71,7 +71,7 @@ export function startServer() {
         const b = await req.json().catch(() => ({}));
         const t = b?.session_id ? findBySession(b.session_id) : undefined;
         if (t && t.status === "running") {
-          store.patchTask(t.id, { status: "waiting", pendingQuestion: b.message ?? "needs your attention", lastActivity: Date.now() });
+          store.patchTask(t.id, { status: "waiting", pendingQuestion: String(b.message ?? "needs your attention").slice(0, 2000), lastActivity: Date.now() });
           bus.emit("update", t.id);
           notify(store.getTask(t.id)!, "waiting");
         }

@@ -28,6 +28,15 @@ function pump(): void {
 }
 function schedule(spawnFn: () => void): void { waitQueue.push(spawnFn); pump(); }
 
+// One live child per task. A resume/answer while a child is still alive (e.g. a
+// Notification-driven `waiting` fires mid-turn) must NOT spawn a second
+// `claude --resume` on the same session — kill the old one first. Removing it
+// from `running` here means its exit handler (identity-guarded) becomes a no-op.
+function killExisting(taskId: string): void {
+  const c = running.get(taskId);
+  if (c) { running.delete(taskId); try { c.kill("SIGTERM"); } catch { /* already gone */ } }
+}
+
 // ── A1b (proven): the launch config that lets an agent run gstack headlessly ──
 // The spike confirmed gstack only resolves + runs unattended with permissions
 // fully skipped; `--permission-mode acceptEdits` was not enough.
@@ -35,13 +44,18 @@ function baseArgs(): string[] {
   const perm = config.dangerouslySkipPermissions
     ? ["--dangerously-skip-permissions"]
     : ["--permission-mode", config.permissionMode];
+  // Load the daemon's hook settings so the agent POSTs Notification events back.
+  // Skip it if the operator already passed their own --settings (avoid a duplicate flag).
+  const userSettings = config.extraClaudeArgs.includes("--settings");
+  const settings = config.notificationHooks && !userSettings ? ["--settings", config.agentSettingsPath] : [];
   return [
     "-p",
     "--output-format", "stream-json",
     "--verbose",
     "--include-partial-messages",
     ...perm,
-    ...config.extraClaudeArgs, // e.g. --add-dir, --settings, --model
+    ...settings,
+    ...config.extraClaudeArgs, // e.g. --add-dir, --model
   ];
 }
 
@@ -71,6 +85,10 @@ function attach(task: Task, child: ChildProcess) {
   });
 
   child.on("exit", (code) => {
+    // Only the currently-registered child owns this task's slot + status. A child
+    // superseded by killExisting() (answer/resume) is a no-op on exit — otherwise
+    // it would delete the new child's slot entry and falsely mark the task error.
+    if (running.get(task.id) !== child) return;
     running.delete(task.id);
     const t = store.getTask(task.id);
     if (t && t.status === "running") { patch({ status: "error", error: `agent exited (code ${code}) mid-run` }); notify(store.getTask(task.id)!, "error"); }
@@ -134,6 +152,7 @@ export function launchTask(task: Task): void {
 export function answer(taskId: string, text: string): void {
   const t = store.getTask(taskId);
   if (!t?.sessionId) throw new Error("no session id to resume");
+  killExisting(taskId); // never run two claude --resume on one session
   store.patchTask(taskId, { status: "running", pendingQuestion: null, lastActivity: Date.now() });
   emitUpdate(taskId);
   schedule(() => {
@@ -148,6 +167,7 @@ export function answer(taskId: string, text: string): void {
 export function resumeTask(taskId: string): void {
   const t = store.getTask(taskId);
   if (!t?.sessionId) return;
+  killExisting(taskId);
   store.patchTask(taskId, { status: "resuming", lastActivity: Date.now() });
   emitUpdate(taskId);
   schedule(() => {
