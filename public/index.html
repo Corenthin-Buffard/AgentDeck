@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gorch · Master Inbox</title>
+<title>AgentDeck · Master Inbox</title>
 <style>
   :root{
     color-scheme:dark;
@@ -91,7 +91,7 @@
 <div id="live" class="sr-only" aria-live="polite" aria-atomic="false"></div>
 <div class="wrap">
   <header class="cmd">
-    <span class="mark">gorch<b>·</b>inbox</span>
+    <span class="mark">Agent<b>Deck</b></span>
     <span class="sub" id="conn">connexion…</span>
     <div class="pills" id="pills"></div>
     <button class="newbtn" onclick="openNew()">+ Nouvelle tâche</button>
@@ -177,7 +177,7 @@ function render(){
     `<span class="pill"><span class="dot ok"></span><span class="n">${counts.running}</span> running</span>`+
     `<span class="pill"><span class="dot done"></span><span class="n">${counts.done}</span> done</span>`;
   const board=document.getElementById("board");
-  if(!tasks.length){board.innerHTML=`<div class="empty">Aucun agent en cours.<br>Décris une tâche — gorch crée la branche, le worktree, lance l'agent et le workflow gstack.<br><br><button class="newbtn" onclick="openNew()">+ Nouvelle tâche</button></div>`;return;}
+  if(!tasks.length){board.innerHTML=`<div class="empty">Aucun agent en cours.<br>Décris une tâche — AgentDeck crée la branche, le worktree, lance l'agent et le workflow gstack.<br><br><button class="newbtn" onclick="openNew()">+ Nouvelle tâche</button></div>`;return;}
   board.innerHTML=section("A besoin de toi",wait)+section("Roulent tout seuls",run)+section("Terminés",done);
 }
 
