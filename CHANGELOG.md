@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3.4] - 2026-07-20
+
+### Changed
+- **Full rename of the internal `gorch` codename to AgentDeck.** Environment variables
+  `GORCH_*` → `AGENTDECK_*`, the git branch prefix `gorch/` → `agentdeck/`, the state DB
+  `gorch.db` → `agentdeck.db`, the default data dir `~/.gorch` → `~/.agentdeck`, the daemon
+  log line, and the `GorchConfig` type. No behavior change — the codebase is now gorch-free.
+
 ## [0.1.3.3] - 2026-07-20
 
 ### Changed
@@ -81,7 +89,7 @@ Two fixes surfaced by the first real end-to-end run; the second was a critical c
 Opt-in Notification-hook wiring for faster "waiting" detection, hardened after review.
 
 ### Added
-- **Notification-hook wiring (opt-in, `GORCH_HOOKS=true`)**: launched agents load a
+- **Notification-hook wiring (opt-in, `AGENTDECK_HOOKS=true`)**: launched agents load a
   generated settings file via `claude --settings`, so Claude Code POSTs its `Notification`
   (and PreToolUse) HTTP hooks to the daemon — a first-class "needs you" signal that also
   covers permission prompts. The prose heuristic stays primary; the hook corroborates and
@@ -142,7 +150,7 @@ First cut. The daemon spine runs end to end and the make-or-break mechanic is pr
 ### Validated
 - **A1b — resolved.** A real gstack skill runs headless, asks in prose (no `BLOCKED`), and a
   `claude --resume` turn continues it. Launch config: agents start with
-  `--dangerously-skip-permissions` (`GORCH_SKIP_PERMISSIONS`, default on). Path A proven end to end.
+  `--dangerously-skip-permissions` (`AGENTDECK_SKIP_PERMISSIONS`, default on). Path A proven end to end.
 
 ### Next
 - Reply drawer wired to the `Notification` hook, `resuming` state UI, `aria-live` (DT1–DT3).

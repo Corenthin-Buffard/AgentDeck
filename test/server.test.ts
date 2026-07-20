@@ -5,7 +5,7 @@ import { expect, test } from "bun:test";
 // `Bun.file(...)`. Compiling only proves the `with { type: "text" }` import
 // bundles; this proves the route actually serves the dashboard at runtime.
 test('GET "/" serves the embedded dashboard HTML', async () => {
-  process.env.GORCH_PORT = "0"; // ephemeral port — don't collide with a running daemon
+  process.env.AGENTDECK_PORT = "0"; // ephemeral port — don't collide with a running daemon
   const { startServer } = await import("../src/server.ts");
   const server = startServer();
   try {

@@ -5,7 +5,7 @@ import { resumeTask } from "./agent.ts";
 import { startServer } from "./server.ts";
 import { hookSettings } from "./hooks-config.ts";
 
-// gorch daemon entry. Runs as a systemd --user service on the VPS so agents
+// AgentDeck daemon entry. Runs as a systemd --user service on the VPS so agents
 // survive SSH/browser disconnects (they live here, not on your laptop).
 
 mkdirSync(config.worktreesDir, { recursive: true });

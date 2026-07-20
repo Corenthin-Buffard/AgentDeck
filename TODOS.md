@@ -48,12 +48,12 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 ## Distribution (OSS)
 
 - **Make the repo public** — **Priority: P2**
-  The release + binaries work, but the repo is private, so the README's anonymous `curl .../releases/latest/download/...` install URL 404s. `gh repo edit Corenthin-Buffard/AgentDeck --visibility public` unblocks distribution. README + LICENSE (MIT) are now public-ready and no secrets are tracked. Deliberately deferred (2026-07-20). Optional before flipping: reconcile the internal `gorch` codename (env vars `GORCH_*`, dashboard title, daemon log) with the AgentDeck branding.
+  The release + binaries work, but the repo is private, so the README's anonymous `curl .../releases/latest/download/...` install URL 404s. `gh repo edit Corenthin-Buffard/AgentDeck --visibility public` unblocks distribution. README + LICENSE (MIT) are public-ready, the codebase is fully rebranded to AgentDeck (no `gorch` left), and no secrets are tracked. Deliberately deferred (2026-07-20).
 
 ## Notifications
 
 - **Notification hook for a future interactive mode** — **Priority: P4**
-  Validated (2026-07-20) as inert under headless `claude -p` — the `Notification` event doesn't fire. The wiring is kept opt-in (`GORCH_HOOKS=true`) for a future interactive/SDK (`query()` + Channels) mode where it would fire. Revisit if/when the daemon drives agents via the SDK library instead of the CLI.
+  Validated (2026-07-20) as inert under headless `claude -p` — the `Notification` event doesn't fire. The wiring is kept opt-in (`AGENTDECK_HOOKS=true`) for a future interactive/SDK (`query()` + Channels) mode where it would fire. Revisit if/when the daemon drives agents via the SDK library instead of the CLI.
 
 - **Discord provider + public auth/TLS** — **Priority: P4**
   Slack + Telegram ship (notification-only). Discord is stubbed. Public exposure (reverse proxy + auth/TLS) is deferred to V2 — localhost + SSH tunnel covers self-host today.

@@ -5,7 +5,7 @@ import { config } from "./config.ts";
 import type { Task, AgentEvent, Status, Phase } from "./types.ts";
 
 // SQLite in WAL mode (eng-review finding: N streams + UI + hook POSTs contend).
-const dbPath = join(config.dataDir, "gorch.db");
+const dbPath = join(config.dataDir, "agentdeck.db");
 mkdirSync(dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
 db.exec("PRAGMA journal_mode = WAL;");

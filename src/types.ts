@@ -1,4 +1,4 @@
-// Shared domain types for the gorch daemon.
+// Shared domain types for the AgentDeck daemon.
 
 /** The 6 gstack pipeline phases, plus 'unknown' before we've observed one. */
 export type Phase = "plan" | "run" | "review" | "qa" | "ship" | "done" | "unknown";
@@ -13,7 +13,7 @@ export type Status =
   | "stopped";   // suspended by the user
 
 export interface Task {
-  id: string;              // gorch-generated taskId, propagated everywhere (NOT the branch)
+  id: string;              // AgentDeck-generated taskId, propagated everywhere (NOT the branch)
   title: string;
   prompt: string;          // the initial instruction handed to the agent
   branch: string;
@@ -36,7 +36,7 @@ export interface AgentEvent {
 }
 
 /** Config knobs — the A1b launch config lives here. */
-export interface GorchConfig {
+export interface AgentDeckConfig {
   dataDir: string;
   host: string;            // bind address — 127.0.0.1 by default (A3: localhost + SSH tunnel)
   port: number;

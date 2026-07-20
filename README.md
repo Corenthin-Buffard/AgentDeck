@@ -38,7 +38,7 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
 
 **How "waiting" is detected:** a headless agent can't interrupt mid-turn — under `claude -p`, Claude Code's `Notification` hook doesn't fire (only `Stop` does, which is redundant with the turn-end `result` event). So when a turn ends, the daemon reads the `result` and decides waiting-vs-done from the prose. The prose heuristic is the signal.
 
-The `Notification`-hook wiring still ships but is **off by default** (`GORCH_HOOKS=true`). The HTTP hook transport works; `Notification` is simply inert under `claude -p`, and it's kept ready for a future interactive / SDK (`query()` + Channels) mode where it would fire.
+The `Notification`-hook wiring still ships but is **off by default** (`AGENTDECK_HOOKS=true`). The HTTP hook transport works; `Notification` is simply inert under `claude -p`, and it's kept ready for a future interactive / SDK (`query()` + Channels) mode where it would fire.
 
 ## Install
 
@@ -48,7 +48,7 @@ Grab the single binary for your platform from [Releases](https://github.com/Core
 # Linux x64 (swap the suffix for -linux-arm64 or -darwin-arm64)
 curl -fsSL https://github.com/Corenthin-Buffard/AgentDeck/releases/latest/download/agentdeck-linux-x64 -o agentdeck
 chmod +x agentdeck
-GORCH_TARGET_REPO=/path/to/your/project ./agentdeck
+AGENTDECK_TARGET_REPO=/path/to/your/project ./agentdeck
 # → http://127.0.0.1:8787  (bind is localhost — reach it via an SSH tunnel)
 ```
 
@@ -62,19 +62,19 @@ Prereqs: [Bun](https://bun.sh), `claude` (Claude Code) on PATH and authenticated
 
 ```bash
 bun install   # (no deps yet, but conventional)
-GORCH_TARGET_REPO=/path/to/your/project \
-GORCH_TG_TOKEN=... GORCH_TG_CHAT=... \
+AGENTDECK_TARGET_REPO=/path/to/your/project \
+AGENTDECK_TG_TOKEN=... AGENTDECK_TG_CHAT=... \
 bun run daemon
 # → http://127.0.0.1:8787  (bind is localhost — reach it via an SSH tunnel)
 
 bun run build     # → dist/agentdeck, the same self-contained binary CI ships
 ```
 
-Config knobs (env): `GORCH_HOST` (default `127.0.0.1`), `GORCH_PORT`, `GORCH_TARGET_REPO`, `GORCH_MAX_AGENTS`, `GORCH_PERMISSION_MODE`, `GORCH_CLAUDE_ARGS`, `GORCH_TG_TOKEN`/`GORCH_TG_CHAT`, `GORCH_SLACK_WEBHOOK`.
+Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT`, `AGENTDECK_TARGET_REPO`, `AGENTDECK_MAX_AGENTS`, `AGENTDECK_PERMISSION_MODE`, `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
 
 ## Launch requirement
 
-For gstack's skills to resolve and run inside a headless agent, agents must be started with **`--dangerously-skip-permissions`** — `--permission-mode acceptEdits` isn't enough. AgentDeck sets this by default. Each agent is confined to its own git worktree on your own box, so the blast radius is that one task's branch; set `GORCH_SKIP_PERMISSIONS=false` only for a supervised, hands-on debugging run.
+For gstack's skills to resolve and run inside a headless agent, agents must be started with **`--dangerously-skip-permissions`** — `--permission-mode acceptEdits` isn't enough. AgentDeck sets this by default. Each agent is confined to its own git worktree on your own box, so the blast radius is that one task's branch; set `AGENTDECK_SKIP_PERMISSIONS=false` only for a supervised, hands-on debugging run.
 
 ## Layout
 

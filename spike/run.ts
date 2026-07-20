@@ -1,4 +1,4 @@
-// gorch spike T1 — the make-or-break instrument (v2, resume-per-turn).
+// AgentDeck spike T1 — the make-or-break instrument (v2, resume-per-turn).
 //
 // EMPIRICAL FINDINGS from v1 (kept here so we don't relearn them):
 //   1. In headless `claude -p`, the AskUserQuestion TOOL is NOT available.
@@ -7,7 +7,7 @@
 //      does not sit on stdin waiting. So "injecting an answer" = starting a NEW
 //      turn with `claude --resume <sessionId> -p "<answer>"`.
 //
-// THE MECHANIC THIS PROVES (and recommends for gorch):
+// THE MECHANIC THIS PROVES (and recommends for AgentDeck):
 //   answer  == `claude --resume <sid> -p "<answer>"`      (human-in-loop)
 //   durability(A2) == `claude --resume <sid> -p "continue"` after daemon restart
 //   → injection and A2 are THE SAME operation. The daemon only stores sessionIds.
@@ -31,7 +31,7 @@ const ANSWER = "blue";
 const baseOut = ["--output-format", "stream-json", "--verbose", "--include-partial-messages"];
 // A1b launch config: an unattended orchestrator must skip permission prompts so
 // gstack's tools (Bash, Skill, ...) run without blocking. Mirrors AgentDeck's
-// GORCH_PERMISSION_MODE. Only for the gstack test — the plain prose test needs
+// AGENTDECK_PERMISSION_MODE. Only for the gstack test — the plain prose test needs
 // no extra perms. MUST run in a plain shell on the VPS, NOT nested inside an
 // interactive Claude Code session (that sandbox blocks skill/filesystem access).
 const PERM = useGstack ? ["--dangerously-skip-permissions"] : [];
@@ -67,7 +67,7 @@ function runClaude(args: string[]): Promise<Turn> {
   });
 }
 
-console.log(`\n╭─ gorch spike T1 (v2) ${"─".repeat(45)}`);
+console.log(`\n╭─ AgentDeck spike T1 (v2) ${"─".repeat(45)}`);
 console.log(`│ mode: ${useGstack ? "gstack skill" : "plain prose question"}`);
 console.log(`╰${"─".repeat(66)}\n─ turn 1: agent asks ─\n`);
 
@@ -80,7 +80,7 @@ if (!t1.sessionId) {
 }
 
 const askedInProse = /\?/.test(t1.text) && t1.subtype === "success";
-console.log(`\n─ turn 2: gorch injects the human answer via --resume ("${ANSWER}") ─\n`);
+console.log(`\n─ turn 2: AgentDeck injects the human answer via --resume ("${ANSWER}") ─\n`);
 const t2 = await runClaude(["--resume", t1.sessionId, "-p", ...baseOut, ...PERM, `My answer: ${ANSWER}`]);
 
 const continued = t2.subtype === "success" && t2.text.trim().length > 0;
@@ -104,7 +104,7 @@ if (blocked) {
   console.log(`│    dirs), then re-run. Do NOT read this as A1 proven.`);
 } else if (askedInProse && continued && acknowledged) {
   console.log(`│ ✅ A1 HOLDS via PROSE + RESUME — this is the V1 mechanic.`);
-  console.log(`│    gorch drives the agent, reads the prose question, notifies you,`);
+  console.log(`│    AgentDeck drives the agent, reads the prose question, notifies you,`);
   console.log(`│    and injects your answer as \`claude --resume <sid> -p\`.`);
 } else {
   console.log(`│ ⚠️  partial — read the streams above. If turn 2 ignored the answer,`);

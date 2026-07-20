@@ -94,6 +94,6 @@ export function startServer() {
       message() { /* dashboard is read + REST; ws is push-only */ },
     },
   });
-  console.log(`gorch daemon on http://localhost:${server.port}  (target repo: ${config.targetRepo})`);
+  console.log(`AgentDeck daemon on http://localhost:${server.port}  (target repo: ${config.targetRepo})`);
   return server;
 }
