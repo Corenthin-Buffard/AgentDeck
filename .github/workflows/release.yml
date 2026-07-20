@@ -1,6 +1,6 @@
 name: release
 
-# Cut a release by pushing a tag: `git tag v0.1.2.2 && git push origin v0.1.2.2`.
+# Cut a release by pushing a tag that matches VERSION: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 # Builds a self-contained single binary per platform and attaches them to the
 # GitHub Release (the dashboard HTML is embedded, so each binary runs standalone).
 on:
@@ -15,6 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Guard: the tag must equal v<VERSION>, so a mistagged push can't publish
+      # a release the shipped binaries can't be traced back to.
+      - name: Verify tag matches VERSION
+        run: |
+          test "v$(cat VERSION)" = "${GITHUB_REF_NAME}" \
+            || { echo "tag ${GITHUB_REF_NAME} does not match v$(cat VERSION)"; exit 1; }
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile || bun install
       - run: bun test
@@ -28,4 +34,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/agentdeck-*
+          fail_on_unmatched_files: true
           generate_release_notes: true

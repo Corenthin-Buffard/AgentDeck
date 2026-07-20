@@ -10,7 +10,7 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 <p align="center"><img src="docs/demo.gif" alt="AgentDeck: parallel agents on the Master Inbox board" width="720"></p>
 -->
 
-> Status: **v0.1.2.2** — the full loop is proven end to end with a real agent (create task → branch → worktree → agent runs → asks in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk). A1 + A1b below. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
+> Status: **v0.1.3.0** — the full loop is proven end to end with a real agent (create task → branch → worktree → agent runs → asks in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk). A1 + A1b below. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
 
 ## Why this and not Claude Squad / Conductor / amux
 

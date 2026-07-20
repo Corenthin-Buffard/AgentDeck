@@ -18,6 +18,15 @@ The distribution pipeline (T8). AgentDeck now ships as a single self-contained b
 - **README install section.** Single-binary `curl` + `chmod` instructions, a "Run from
   source" section, and a demo-GIF placeholder (recording tracked in TODOS).
 
+### Hardened (review)
+- **The release actually gets exercised.** CI now smoke-runs the compiled linux-x64
+  binary (boots it, curls `/`, asserts the dashboard) and a unit test boots the server
+  and asserts `GET "/"` serves the embedded HTML — the pipeline compiled the binary but
+  never ran it, so the embed change had zero runtime coverage.
+- **Release guardrails.** `release.yml` verifies the pushed tag equals `v<VERSION>` before
+  building, and `fail_on_unmatched_files: true` stops it publishing an empty release (and
+  404-ing the README download links) if the artifact glob ever misses.
+
 ## [0.1.2.2] - 2026-07-20
 
 Two fixes surfaced by the first real end-to-end run; the second was a critical caught in review.

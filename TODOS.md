@@ -28,6 +28,9 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **Session-resume hardening (A2)** — **Priority: P3**
   On daemon restart, `claude --resume <sessionId>` reattaches, but only `sessionId` is persisted. Confirm cwd/worktree, pending question, and phase survive a real restart mid-run; persist whatever's missing.
 
+- **Make daemon boot idempotent under `bun --watch` hot-reload** — **Priority: P3**
+  `bun run dev` (`bun --watch`) re-execs `daemon.ts`'s top-level on every source change, which re-runs the A2 resume loop and spawns a second `claude --resume <session>` while the prior child (orphaned in the old module instance) is still alive — the one-live-child guard lives in the in-memory `running` map, which the reload resets. Pre-existing for `.ts` edits; embedding `public/index.html` into the module graph (v0.1.3.0) newly triggers it on dashboard edits too. Dev-only (the compiled binary and `bun run daemon` don't `--watch`). Fix: gate daemon boot side-effects behind a `globalThis` sentinel so hot-reload re-execs are inert. (Adversarial review, 2026-07-20.)
+
 - **Full agent survival across a daemon crash** — **Priority: P4**
   Today a daemon crash pauses agents until it resumes (Path A2-A). The V2 option: agents as detached processes that keep running while the daemon is down, reconnecting to the stream on restart. Only worth it if daemon crashes become a real problem.
 
@@ -37,7 +40,7 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
   `/hooks/notification` is unauthenticated. Localhost-bound so low risk today, but if hooks get enabled/exposed, any local process could forge a `waiting`. Add a per-session token written into the settings file and checked in the handler. (Deferred with A3.)
 
 - **Pin release-workflow actions to commit SHAs** — **Priority: P4**
-  `.github/workflows/release.yml` runs the third-party `softprops/action-gh-release@v2` in a `contents: write` job, pinned to a major tag. Supply-chain-hardened choice is a full commit SHA (add Dependabot to bump it). Major-tag pinning is fine for now; revisit if the repo gets more contributors. (Review finding, 2026-07-20.)
+  `.github/workflows/release.yml` runs three actions (`actions/checkout@v4`, `oven-sh/setup-bun@v2`, `softprops/action-gh-release@v2`) pinned to mutable major tags in a `contents: write` job. Supply-chain-hardened choice is a full commit SHA for each (add Dependabot to bump them). Major-tag pinning is fine for now; revisit if the repo gets more contributors. (Review finding, 2026-07-20.)
 
 - **Operational isolation (per-agent ports / RAM)** — **Priority: P4**
   Agents share the box; a runaway agent can starve others (port 3000, RAM, npm cache). Add per-agent port ranges + a memory cap when real contention shows up. (Not security — mono-user; it's about agents not stepping on each other.)
