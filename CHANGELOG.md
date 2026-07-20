@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3.3] - 2026-07-20
+
+### Changed
+- **Dashboard branding.** The header wordmark, browser title, and empty-state copy now read
+  **AgentDeck** (was the internal codename `gorch·inbox`). Regenerated the demo GIF to match,
+  and switched its sample task IDs to the real `t_…` format so nothing off-brand shows.
+
 ## [0.1.3.2] - 2026-07-20
 
 Public-readiness pass.

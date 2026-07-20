@@ -12,7 +12,7 @@ test('GET "/" serves the embedded dashboard HTML', async () => {
     const res = await fetch(`http://127.0.0.1:${server.port}/`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
-    expect(await res.text()).toContain("<title>gorch"); // non-empty + right file
+    expect(await res.text()).toContain("<title>AgentDeck"); // non-empty + right file
   } finally {
     server.stop(true);
   }
