@@ -1,8 +1,8 @@
-// gorch spike — HTTP hook receiver.
+// AgentDeck spike — HTTP hook receiver.
 //
 // Claude Code (2026) can POST hook events to a local server instead of running
 // a shell script. This is the native IPC the daemon will use in prod. Here it
-// just logs what arrives so we can SEE the two signals gorch depends on:
+// just logs what arrives so we can SEE the two signals AgentDeck depends on:
 //   - PreToolUse(AskUserQuestion) → the agent is about to ask the human
 //   - Notification(*)             → the agent needs attention (any cause)
 //
@@ -13,7 +13,7 @@
 //
 //   run:  bun run spike/hook-server.ts   (listens on :8080)
 
-const PORT = Number(process.env.GORCH_HOOK_PORT ?? 8080);
+const PORT = Number(process.env.AGENTDECK_HOOK_PORT ?? 8080);
 
 function log(tag: string, obj: unknown) {
   console.log(`\n── HOOK ${tag} ${"─".repeat(40)}`);
@@ -35,7 +35,7 @@ Bun.serve({
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "allow",
-          permissionDecisionReason: "gorch: observed, human loop handled over stdin",
+          permissionDecisionReason: "AgentDeck: observed, human loop handled over stdin",
         },
       });
     }
@@ -47,10 +47,10 @@ Bun.serve({
       return new Response(null, { status: 204 });
     }
 
-    return new Response("gorch hook server", { status: 200 });
+    return new Response("AgentDeck hook server", { status: 200 });
   },
 });
 
-console.log(`gorch hook server listening on http://localhost:${PORT}`);
+console.log(`AgentDeck hook server listening on http://localhost:${PORT}`);
 console.log("  POST /hooks/pre-tool-use   (PreToolUse:AskUserQuestion)");
 console.log("  POST /hooks/notification   (Notification:*)");

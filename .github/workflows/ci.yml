@@ -30,7 +30,7 @@ jobs:
       # binary runs. The x64 target runs natively on this runner.
       - name: Smoke-test the linux-x64 binary
         run: |
-          GORCH_TARGET_REPO="$PWD" ./dist/agentdeck-linux-x64 &
+          AGENTDECK_TARGET_REPO="$PWD" ./dist/agentdeck-linux-x64 &
           PID=$!
           ok=0
           for i in $(seq 1 40); do

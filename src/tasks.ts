@@ -12,7 +12,7 @@ function slugify(s: string): string {
 /** 1 task = 1 branch = 1 worktree = 1 agent. taskId is the correlation key. */
 export async function createTask(title: string, prompt: string): Promise<Task> {
   const id = "t_" + randomUUID().slice(0, 8);
-  const branch = `gorch/${slugify(title)}-${id.slice(2)}`;
+  const branch = `agentdeck/${slugify(title)}-${id.slice(2)}`;
   const worktree = await createWorktree(id, branch);
   const now = Date.now();
   const task: Task = {

@@ -1,5 +1,5 @@
 {
-  "//": "Drop this into the agent's working dir at .claude/settings.json to make Claude Code POST hook events to the gorch hook server. Optional for the spike (run.ts detects the question from the stream directly); required in prod so the daemon gets a first-class 'needs you' signal for ALL blocking causes, not just AskUserQuestion.",
+  "//": "Drop this into the agent's working dir at .claude/settings.json to make Claude Code POST hook events to the AgentDeck hook server. Optional for the spike (run.ts detects the question from the stream directly); required in prod so the daemon gets a first-class 'needs you' signal for ALL blocking causes, not just AskUserQuestion.",
   "hooks": {
     "PreToolUse": [
       {
