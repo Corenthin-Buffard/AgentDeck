@@ -129,8 +129,12 @@ function attach(task: Task, child: ChildProcess) {
         patch({ status: "error", error: `result: ${e.subtype}` });
         notify(store.getTask(task.id)!, "error");
       } else if (looksLikeQuestion(finalText)) {
-        patch({ status: "waiting", pendingQuestion: finalText.slice(0, 2000) });
-        log("question", finalText.slice(0, 2000));
+        // The agent's ask sits at the END of the turn; for a long turn (a heavy
+        // gstack skill) keep the TAIL, not the head, so the drawer shows the
+        // actual question/decision briefs instead of the intro.
+        const shown = finalText.length > 2000 ? "…" + finalText.slice(-1999) : finalText;
+        patch({ status: "waiting", pendingQuestion: shown });
+        log("question", shown);
         notify(store.getTask(task.id)!, "waiting");
       } else {
         setPhase("done");
