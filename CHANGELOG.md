@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.3.5] - 2026-07-20
+
+### Added
+- **Install with Claude Code** — a copy-paste prompt (README) that installs gstack (if missing)
+  + AgentDeck and sets up a `systemd --user` service in one paste. It checks whether gstack is
+  already installed, is idempotent, validates the download and the target repo, and bakes the
+  runtime PATH into the service so the daemon can actually spawn `claude` agents. Hardened via
+  `/plan-eng-review` (Codex outside voice; core-critical bar).
+
+### Docs
+- Refreshed the stale status version and completed the `AGENTDECK_*` config-knobs list.
+
 ## [0.1.3.4] - 2026-07-20
 
 ### Changed
