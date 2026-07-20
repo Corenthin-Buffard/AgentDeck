@@ -29,7 +29,9 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
 
 **The human-in-loop mechanic (proven):** in headless mode Claude Code has no AskUserQuestion tool, so the agent asks in **prose** and the turn ends. AgentDeck reads the question, notifies you (Slack/Telegram), and when you reply in the dashboard it injects the answer as a new `claude --resume <sessionId>` turn. That same `resume` is also how agents survive a daemon restart — injection and durability are one operation.
 
-**Faster "waiting" detection (opt-in, corroborating):** with `GORCH_HOOKS=true`, agents launch with `--settings` pointing at a generated hooks file, so Claude Code POSTs its `Notification` events ("agent needs your attention") straight to the daemon — a first-class signal that also covers permission prompts, not just questions. The prose heuristic stays the primary, proven path; the hook corroborates and speeds it up. It ships **off by default** because whether `Notification` fires under headless `claude -p` still needs a VPS run to confirm — turn it on there to validate.
+**"waiting" detection — the prose heuristic is the mechanism (validated):** when a headless agent asks in prose and its turn ends, the daemon reads the turn-end `result` event and decides waiting-vs-done. A validation run (2026-07-20) confirmed there is **no mid-turn "needs you" signal under `claude -p`**: Claude Code's `Notification` hook does **not** fire headless (the `Stop` hook does, but it's redundant with `result`). So the prose heuristic is the only signal available for this model — and therefore optimal.
+
+The `Notification`-hook wiring still ships but **off by default** (`GORCH_HOOKS=true`). The HTTP hook transport works (verified — `Stop` POSTed); `Notification` is simply inert under `claude -p`. It's kept ready for a future interactive / SDK (`query()` + Channels) mode where `Notification` would fire.
 
 ## Run
 
