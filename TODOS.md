@@ -20,10 +20,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Agent supervisor / core
 
-- **Full gstack loop end-to-end** — **Priority: P2**
-  The e2e proof used a plain prompt (create a file + ask). Prove a *gstack skill* runs the full cycle: agent runs e.g. `/spec` or `/plan-eng-review`, asks its question in prose, you answer from the dashboard, and it continues the gstack flow. (A1/A1b proved the mechanism; this proves the real workflow.)
-  _Depends on: real VPS launch config (skills in scope + skip-permissions — already wired)._
-
 - **Session-resume hardening (A2)** — **Priority: P3**
   On daemon restart, `claude --resume <sessionId>` reattaches, but only `sessionId` is persisted. Confirm cwd/worktree, pending question, and phase survive a real restart mid-run; persist whatever's missing.
 
@@ -72,5 +68,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **v0.1.3.0** (2026-07-20) — Distribution pipeline (T8): single self-contained binary (`bun --compile` with the dashboard embedded), `release.yml` cross-compiles 3 targets on tag → GitHub Releases, `ci.yml` tests + compiles all targets on PR, README install section. All 3 targets verified to cross-compile; binary boots standalone from a foreign cwd.
 - **v0.1.3.1** (2026-07-20) — Demo GIF in the README (`docs/demo.gif`): the Master Inbox with agents cruising, one flipping to `waiting`, the reply drawer, and the task resuming — captured from the real dashboard over its live WebSocket. Completes T8.
 - **v0.1.3.7** (2026-07-20) — P2 **browser e2e proven** with a real agent: click "New task" → daemon spawns `claude` → it asks in prose → dashboard flips to `waiting` (WebSocket) → reply in the drawer → `claude --resume` → done → artifact (`color.txt`=`blue`), verified 3× incl. a self-contained run. Committed a reproducible harness at `docs/e2e/`. Surfaced a P3: "Clean up" dead-ends on done tasks with artifacts (dirty worktree).
+- **v0.1.3.8** (2026-07-20) — P2 **full gstack loop proven**: a real agent ran `/plan-eng-review` through the daemon — scope-gate `AskUserQuestion` → prose → `waiting` → answer → `claude --resume` → the complete four-section eng review. This run exposed a detection bug (a long skill turn that ends on a decision brief was mis-marked `done`, stranding the agent); fixed `looksLikeQuestion` with a structural decision-brief check + tail-display of the question, hardened over two adversarial rounds (19 `detect.ts` tests).
 - **A1** — proven: gstack skill runs headless, asks in prose, `resume` continues.
 - **A1b** — proven: gstack runs headless with `--dangerously-skip-permissions`; the launch config is the key.

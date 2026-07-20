@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.3.8] - 2026-07-20
+
+### Fixed
+- **A heavy gstack skill no longer strands as `done` when it stops to ask.** The daemon
+  decides `waiting` vs `done` from the agent's turn text (`looksLikeQuestion`). A long
+  `/plan-eng-review`-style turn ends on a decision brief whose *tail* is a `Net:` line with
+  no question cue, so the old 500-char/narrow-cue check mis-read it as finished — leaving a
+  real gstack agent stuck the moment it needed you. Detection now also does a structural
+  check over the last 2000 chars: gstack's decision-brief shape (`Net:`/`Completeness:`
+  lines or a `D<n> —` header, incl. split-chain `D<n>.final`/`.revise-k`, plus ≥2 labeled
+  options — bold, bullet-listed, or inline), or an explicit "reply with a letter / your
+  picks" instruction. Biased toward `waiting`, since stranding an asking agent is the worse
+  error. A headless `BLOCKED — AskUserQuestion unavailable` message now reads as waiting too.
+- **The reply drawer shows the actual question on a long turn.** `pendingQuestion` stored the
+  *head* of the turn (the intro); for a long skill turn the asks are at the *end*, so it now
+  keeps the tail (`…` + last 2000 chars).
+
+### Validated
+- **Full gstack loop end-to-end (P2).** A real `claude` agent ran `/plan-eng-review` through
+  the daemon: it hit the skill's scope-gate `AskUserQuestion`, rendered it as prose, the
+  dashboard flipped to `waiting`, an answer resumed it via `claude --resume`, and it ran the
+  complete four-section eng review — proving a real gstack skill advances through the loop.
+  This run surfaced the detection bug fixed above. Hardened via two adversarial review rounds
+  (19 `detect.ts` unit tests pin every real brief shape).
+
 ## [0.1.3.7] - 2026-07-20
 
 ### Added
