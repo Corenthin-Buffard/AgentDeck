@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.2.2] - 2026-07-20
+
+Two fixes surfaced by the first real end-to-end run; the second was a critical caught in review.
+
+### Fixed
+- **Untracked files show in the diff view.** A file an agent just created was invisible
+  (`git diff` ignores untracked). Read via `git status --porcelain -z` so paths with
+  spaces / accents / newlines survive; list capped; empty returns "".
+- **Single-source the agent turn text.** The turn's text now comes from one source — the
+  consolidated assistant message. The previous code accumulated deltas *and* the assistant
+  message (doubling the question), and a substring-dedup meant to fix that could drop a
+  restated question and — since detection only reads the trailing 500 chars — silently flip
+  an agent from `waiting` to `done`, stranding it. Deltas are liveness-only now.
+
 ## [0.1.2.1] - 2026-07-20
 
 ### Docs
