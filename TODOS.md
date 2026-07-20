@@ -47,8 +47,8 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Distribution (OSS)
 
-- **Record the demo GIF (T8 remainder)** — **Priority: P2**
-  The binary + CI release pipeline shipped (`bun run build` → self-contained `dist/agentdeck`; `.github/workflows/release.yml` cross-compiles linux x64/arm64 + darwin arm64 on tag and uploads to Releases; the frontend is embedded via `import … with { type: "text" }`). What's left is the manual asset: record N parallel agents on the board — one flips to `waiting`, a phone notification fires, you reply in the drawer, it resumes — save to `docs/demo.gif`, and uncomment the `<img>` in README. Distribution IS the product for an OSS repo (design-doc Premise 3).
+- **Make the repo public** — **Priority: P2**
+  The release + binaries work, but the repo is private, so the README's anonymous `curl .../releases/latest/download/...` install URL 404s. `gh repo edit Corenthin-Buffard/AgentDeck --visibility public` unblocks distribution. Deliberately deferred (2026-07-20). Nothing sensitive is tracked.
 
 ## Notifications
 
@@ -70,6 +70,7 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **v0.1.2.0** (2026-07-20) — Opt-in Notification-hook wiring; hardened after review (one-live-child-per-task, opt-in default, guarded settings write).
 - **v0.1.2.1** (2026-07-20) — Docs: recorded that the Notification hook does not fire headless (validated on a real run).
 - **v0.1.2.2** (2026-07-20) — Fixed: untracked files show in the diff view; single-source the agent turn text (a review CRITICAL — a dropped restated question could have stranded an agent as `done`).
-- **v0.1.3.0** (2026-07-20) — Distribution pipeline (T8): single self-contained binary (`bun --compile` with the dashboard embedded), `release.yml` cross-compiles 3 targets on tag → GitHub Releases, `ci.yml` tests + compiles all targets on PR, README install section. All 3 targets verified to cross-compile; binary boots standalone from a foreign cwd. GIF recording still open.
+- **v0.1.3.0** (2026-07-20) — Distribution pipeline (T8): single self-contained binary (`bun --compile` with the dashboard embedded), `release.yml` cross-compiles 3 targets on tag → GitHub Releases, `ci.yml` tests + compiles all targets on PR, README install section. All 3 targets verified to cross-compile; binary boots standalone from a foreign cwd.
+- **v0.1.3.1** (2026-07-20) — Demo GIF in the README (`docs/demo.gif`): the Master Inbox with agents cruising, one flipping to `waiting`, the reply drawer, and the task resuming — captured from the real dashboard over its live WebSocket. Completes T8.
 - **A1** — proven: gstack skill runs headless, asks in prose, `resume` continues.
 - **A1b** — proven: gstack runs headless with `--dangerously-skip-permissions`; the launch config is the key.

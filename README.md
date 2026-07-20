@@ -4,11 +4,12 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 
 `1 task = 1 branch = 1 git worktree = 1 agent.` Strict isolation, no sharing. Agents run on the server, so they keep going when you close your laptop or drop the SSH connection.
 
-<!-- DEMO GIF: record N parallel agents on the board — one flips to `waiting`, a phone
-     notification fires, you reply in the drawer, it resumes — and drop it at docs/demo.gif,
-     then uncomment the line below. (Tracked in TODOS.md → Distribution.)
-<p align="center"><img src="docs/demo.gif" alt="AgentDeck: parallel agents on the Master Inbox board" width="720"></p>
--->
+<p align="center">
+  <img src="docs/demo.gif" width="820"
+       alt="AgentDeck Master Inbox: several agents cruising, one flips to waiting, you reply in the drawer, and it resumes.">
+</p>
+
+<p align="center"><sub>One agent flips to <code>waiting</code>, you answer in the drawer, and it resumes — live over WebSocket.</sub></p>
 
 > Status: **v0.1.3.0** — the full loop is proven end to end with a real agent (create task → branch → worktree → agent runs → asks in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk). A1 + A1b below. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3.1] - 2026-07-20
+
+### Docs
+- **Demo GIF** (`docs/demo.gif`, shown in the README): the Master Inbox with several agents
+  cruising, one flipping to `waiting`, the reply drawer opening, an answer typed, and the task
+  resuming. Captured from the real server + dashboard driven over its live WebSocket.
+
 ## [0.1.3.0] - 2026-07-20
 
 The distribution pipeline (T8). AgentDeck now ships as a single self-contained binary — distribution is the product for an OSS repo.
