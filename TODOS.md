@@ -36,13 +36,16 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **Shared-secret token on the hook endpoint (A3 / T5)** — **Priority: P3**
   `/hooks/notification` is unauthenticated. Localhost-bound so low risk today, but if hooks get enabled/exposed, any local process could forge a `waiting`. Add a per-session token written into the settings file and checked in the handler. (Deferred with A3.)
 
+- **Pin release-workflow actions to commit SHAs** — **Priority: P4**
+  `.github/workflows/release.yml` runs the third-party `softprops/action-gh-release@v2` in a `contents: write` job, pinned to a major tag. Supply-chain-hardened choice is a full commit SHA (add Dependabot to bump it). Major-tag pinning is fine for now; revisit if the repo gets more contributors. (Review finding, 2026-07-20.)
+
 - **Operational isolation (per-agent ports / RAM)** — **Priority: P4**
   Agents share the box; a runaway agent can starve others (port 3000, RAM, npm cache). Add per-agent port ranges + a memory cap when real contention shows up. (Not security — mono-user; it's about agents not stepping on each other.)
 
 ## Distribution (OSS)
 
-- **Single-binary release pipeline (T8)** — **Priority: P2**
-  `bun build --compile` → one binary (linux x64/arm64) with the frontend embedded, published to GitHub Releases via GitHub Actions on tag. Plus a README GIF of N parallel agents + a phone notification. Distribution IS the product for an OSS repo (design-doc Premise 3).
+- **Record the demo GIF (T8 remainder)** — **Priority: P2**
+  The binary + CI release pipeline shipped (`bun run build` → self-contained `dist/agentdeck`; `.github/workflows/release.yml` cross-compiles linux x64/arm64 + darwin arm64 on tag and uploads to Releases; the frontend is embedded via `import … with { type: "text" }`). What's left is the manual asset: record N parallel agents on the board — one flips to `waiting`, a phone notification fires, you reply in the drawer, it resumes — save to `docs/demo.gif`, and uncomment the `<img>` in README. Distribution IS the product for an OSS repo (design-doc Premise 3).
 
 ## Notifications
 
@@ -64,5 +67,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **v0.1.2.0** (2026-07-20) — Opt-in Notification-hook wiring; hardened after review (one-live-child-per-task, opt-in default, guarded settings write).
 - **v0.1.2.1** (2026-07-20) — Docs: recorded that the Notification hook does not fire headless (validated on a real run).
 - **v0.1.2.2** (2026-07-20) — Fixed: untracked files show in the diff view; single-source the agent turn text (a review CRITICAL — a dropped restated question could have stranded an agent as `done`).
+- **v0.1.3.0** (2026-07-20) — Distribution pipeline (T8): single self-contained binary (`bun --compile` with the dashboard embedded), `release.yml` cross-compiles 3 targets on tag → GitHub Releases, `ci.yml` tests + compiles all targets on PR, README install section. All 3 targets verified to cross-compile; binary boots standalone from a foreign cwd. GIF recording still open.
 - **A1** — proven: gstack skill runs headless, asks in prose, `resume` continues.
 - **A1b** — proven: gstack runs headless with `--dangerously-skip-permissions`; the launch config is the key.

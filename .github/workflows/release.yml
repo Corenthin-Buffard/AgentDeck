@@ -1,0 +1,31 @@
+name: release
+
+# Cut a release by pushing a tag: `git tag v0.1.2.2 && git push origin v0.1.2.2`.
+# Builds a self-contained single binary per platform and attaches them to the
+# GitHub Release (the dashboard HTML is embedded, so each binary runs standalone).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile || bun install
+      - run: bun test
+      - name: Build binaries (cross-compiled from one runner)
+        run: |
+          mkdir -p dist
+          bun build src/daemon.ts --compile --target=bun-linux-x64    --outfile dist/agentdeck-linux-x64
+          bun build src/daemon.ts --compile --target=bun-linux-arm64  --outfile dist/agentdeck-linux-arm64
+          bun build src/daemon.ts --compile --target=bun-darwin-arm64 --outfile dist/agentdeck-darwin-arm64
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/agentdeck-*
+          generate_release_notes: true
