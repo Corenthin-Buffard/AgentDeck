@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.3.2] - 2026-07-20
+
+Public-readiness pass.
+
+### Added
+- **MIT license** (`LICENSE`) — the repo is now legally usable, forkable, and distributable.
+
+### Docs
+- README cleaned for a public audience: dropped the internal `spike` section and the
+  `A1`/`A1b` proof codenames + dated validation logs, folded the launch requirement into
+  its own section, and refreshed the status version.
+
 ## [0.1.3.1] - 2026-07-20
 
 ### Docs

@@ -11,7 +11,7 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 
 <p align="center"><sub>One agent flips to <code>waiting</code>, you answer in the drawer, and it resumes — live over WebSocket.</sub></p>
 
-> Status: **v0.1.3.0** — the full loop is proven end to end with a real agent (create task → branch → worktree → agent runs → asks in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk). A1 + A1b below. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
+> Status: **v0.1.3.1** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
 
 ## Why this and not Claude Squad / Conductor / amux
 
@@ -36,9 +36,9 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
 
 **The human-in-loop mechanic (proven):** in headless mode Claude Code has no AskUserQuestion tool, so the agent asks in **prose** and the turn ends. AgentDeck reads the question, notifies you (Slack/Telegram), and when you reply in the dashboard it injects the answer as a new `claude --resume <sessionId>` turn. That same `resume` is also how agents survive a daemon restart — injection and durability are one operation.
 
-**"waiting" detection — the prose heuristic is the mechanism (validated):** when a headless agent asks in prose and its turn ends, the daemon reads the turn-end `result` event and decides waiting-vs-done. A validation run (2026-07-20) confirmed there is **no mid-turn "needs you" signal under `claude -p`**: Claude Code's `Notification` hook does **not** fire headless (the `Stop` hook does, but it's redundant with `result`). So the prose heuristic is the only signal available for this model — and therefore optimal.
+**How "waiting" is detected:** a headless agent can't interrupt mid-turn — under `claude -p`, Claude Code's `Notification` hook doesn't fire (only `Stop` does, which is redundant with the turn-end `result` event). So when a turn ends, the daemon reads the `result` and decides waiting-vs-done from the prose. The prose heuristic is the signal.
 
-The `Notification`-hook wiring still ships but **off by default** (`GORCH_HOOKS=true`). The HTTP hook transport works (verified — `Stop` POSTed); `Notification` is simply inert under `claude -p`. It's kept ready for a future interactive / SDK (`query()` + Channels) mode where `Notification` would fire.
+The `Notification`-hook wiring still ships but is **off by default** (`GORCH_HOOKS=true`). The HTTP hook transport works; `Notification` is simply inert under `claude -p`, and it's kept ready for a future interactive / SDK (`query()` + Channels) mode where it would fire.
 
 ## Install
 
@@ -72,18 +72,9 @@ bun run build     # → dist/agentdeck, the same self-contained binary CI ships
 
 Config knobs (env): `GORCH_HOST` (default `127.0.0.1`), `GORCH_PORT`, `GORCH_TARGET_REPO`, `GORCH_MAX_AGENTS`, `GORCH_PERMISSION_MODE`, `GORCH_CLAUDE_ARGS`, `GORCH_TG_TOKEN`/`GORCH_TG_CHAT`, `GORCH_SLACK_WEBHOOK`.
 
-## The spike (how A1 was proven)
+## Launch requirement
 
-`spike/run.ts` is a throwaway instrument, not a feature. It drives one agent and proves the prose + resume round-trip end to end.
-
-```bash
-bun run spike            # plain prose question → resume → continues
-bun run spike -- --gstack  # drive a real gstack skill (see A1b caveat)
-```
-
-## A1b — resolved ✅
-
-Proven on 2026-07-19: a real gstack skill (`/office-hours`) runs headless and asks its question **in prose** (no `BLOCKED`), then a `claude --resume` turn continues it. The one requirement is the launch config — agents must be started with **`--dangerously-skip-permissions`** so gstack's tools resolve and run unattended (`--permission-mode acceptEdits` was not enough). AgentDeck does this by default (`GORCH_SKIP_PERMISSIONS`, on unless set to `false`). Reproduce with `bun run spike -- --gstack` in a plain shell (not nested inside another Claude Code session, whose sandbox blocks it).
+For gstack's skills to resolve and run inside a headless agent, agents must be started with **`--dangerously-skip-permissions`** — `--permission-mode acceptEdits` isn't enough. AgentDeck sets this by default. Each agent is confined to its own git worktree on your own box, so the blast radius is that one task's branch; set `GORCH_SKIP_PERMISSIONS=false` only for a supervised, hands-on debugging run.
 
 ## Layout
 
@@ -91,9 +82,8 @@ Proven on 2026-07-19: a real gstack skill (`/office-hours`) runs headless and as
 src/        daemon: config, types, db (SQLite/WAL), git (worktrees), phase,
             agent (supervisor), notify, tasks, bus, server, daemon
 public/     Master Inbox dashboard (live over WebSocket)
-spike/      A1 instrument (prose+resume proof) + HTTP hook receiver
 ```
 
 ## License
 
-TBD.
+[MIT](LICENSE) © 2026 Corenthin Buffard
