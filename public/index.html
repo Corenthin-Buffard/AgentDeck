@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -92,9 +92,9 @@
 <div class="wrap">
   <header class="cmd">
     <span class="mark">Agent<b>Deck</b></span>
-    <span class="sub" id="conn">connexion…</span>
+    <span class="sub" id="conn">connecting…</span>
     <div class="pills" id="pills"></div>
-    <button class="newbtn" onclick="openNew()">+ Nouvelle tâche</button>
+    <button class="newbtn" onclick="openNew()">+ New task</button>
   </header>
   <div id="board"></div>
 </div>
@@ -119,14 +119,14 @@ function announceTransitions(next){
   for(const t of next){
     const prev=lastStatus[t.id];
     if(t.status!==prev){
-      if(t.status==="waiting")announce(`${t.title} attend ta réponse.`);
-      else if(t.status==="error")announce(`${t.title} : erreur.`);
-      else if(t.status==="done"&&prev)announce(`${t.title} terminé.`);
+      if(t.status==="waiting")announce(`${t.title} needs you.`);
+      else if(t.status==="error")announce(`${t.title}: error.`);
+      else if(t.status==="done"&&prev)announce(`${t.title} done.`);
     }
     lastStatus[t.id]=t.status;
   }
 }
-function ago(ts){const s=Math.max(0,Math.round((Date.now()-ts)/1000));if(s<60)return`il y a ${s} s`;const m=Math.round(s/60);if(m<60)return`il y a ${m} min`;return`il y a ${Math.round(m/60)} h`;}
+function ago(ts){const s=Math.max(0,Math.round((Date.now()-ts)/1000));if(s<60)return`${s}s ago`;const m=Math.round(s/60);if(m<60)return`${m}m ago`;return`${Math.round(m/60)}h ago`;}
 function esc(s){return (s||"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));}
 // One-line preview of a prose question for the agent row: prefer the last line
 // with a "?", strip common markdown, truncate.
@@ -140,10 +140,10 @@ function phaseBar(t){
   }).join("")+`</div>`;
 }
 function actions(t){
-  if(t.status==="waiting")return `<button class="btn primary" onclick="reply('${t.id}')">Répondre</button>`;
-  if(t.status==="error")return `<button class="btn danger" onclick="openTask('${t.id}')">Voir les logs</button>`;
-  if(t.status==="done")return `<button class="btn ghost" onclick="del('${t.id}')">Nettoyer</button>`;
-  return `<button class="btn ghost" onclick="openTask('${t.id}')">Ouvrir</button>`;
+  if(t.status==="waiting")return `<button class="btn primary" onclick="reply('${t.id}')">Reply</button>`;
+  if(t.status==="error")return `<button class="btn danger" onclick="openTask('${t.id}')">View logs</button>`;
+  if(t.status==="done")return `<button class="btn ghost" onclick="del('${t.id}')">Clean up</button>`;
+  return `<button class="btn ghost" onclick="openTask('${t.id}')">Open</button>`;
 }
 function rowHtml(t){
   return `<article class="row ${t.status}">
@@ -160,7 +160,7 @@ function rowHtml(t){
   </article>`;
 }
 // Isolate each row: one task that throws must not blank the whole board.
-function safeRow(t){try{return rowHtml(t);}catch(e){return `<article class="row error"><div class="rail"></div><div class="body"><div class="toprow"><span class="name">${esc((t&&t.title)||(t&&t.id)||"tâche")}</span><span class="chip error">erreur d'affichage</span></div></div><div class="aside"></div></article>`;}}
+function safeRow(t){try{return rowHtml(t);}catch(e){return `<article class="row error"><div class="rail"></div><div class="body"><div class="toprow"><span class="name">${esc((t&&t.title)||(t&&t.id)||"task")}</span><span class="chip error">render error</span></div></div><div class="aside"></div></article>`;}}
 function section(title,list){
   if(!list.length)return "";
   return `<div class="lbl">${title}</div><div class="rows">${list.map(safeRow).join("")}</div>`;
@@ -177,8 +177,8 @@ function render(){
     `<span class="pill"><span class="dot ok"></span><span class="n">${counts.running}</span> running</span>`+
     `<span class="pill"><span class="dot done"></span><span class="n">${counts.done}</span> done</span>`;
   const board=document.getElementById("board");
-  if(!tasks.length){board.innerHTML=`<div class="empty">Aucun agent en cours.<br>Décris une tâche — AgentDeck crée la branche, le worktree, lance l'agent et le workflow gstack.<br><br><button class="newbtn" onclick="openNew()">+ Nouvelle tâche</button></div>`;return;}
-  board.innerHTML=section("A besoin de toi",wait)+section("Roulent tout seuls",run)+section("Terminés",done);
+  if(!tasks.length){board.innerHTML=`<div class="empty">No agents running yet.<br>Describe a task — AgentDeck creates the branch and worktree, then launches the agent and the gstack workflow.<br><br><button class="newbtn" onclick="openNew()">+ New task</button></div>`;return;}
+  board.innerHTML=section("Needs you",wait)+section("Cruising",run)+section("Done",done);
 }
 
 // ── drawer ──
@@ -186,34 +186,34 @@ const drawer=document.getElementById("drawer"),scrim=document.getElementById("sc
 function showDrawer(html){document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
 function closeDrawer(){drawer.classList.remove("on");scrim.classList.remove("on");}
 function openNew(){
-  showDrawer(`<h2>Nouvelle tâche</h2>
-    <label class="lbl">Titre</label><input id="nt" placeholder="Refonte facturation">
-    <label class="lbl">Instruction pour l'agent</label>
-    <textarea id="np" placeholder="Implémente X en suivant le workflow gstack…" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')createTask()"></textarea>
-    <div class="hint">⌘/Ctrl + Entrée pour lancer</div>
-    <button class="btn primary" onclick="createTask()">Lancer l'agent</button>`);
+  showDrawer(`<h2>New task</h2>
+    <label class="lbl">Title</label><input id="nt" placeholder="Billing rework">
+    <label class="lbl">Instructions for the agent</label>
+    <textarea id="np" placeholder="Implement X following the gstack workflow…" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')createTask()"></textarea>
+    <div class="hint">⌘/Ctrl + Enter to launch</div>
+    <button class="btn primary" onclick="createTask()">Launch agent</button>`);
   setTimeout(()=>document.getElementById("nt")?.focus(),50);
 }
 async function createTask(){
   const title=document.getElementById("nt").value.trim(),prompt=document.getElementById("np").value.trim();
   if(!title||!prompt)return;
   const r=await fetch("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,prompt})});
-  if(r.ok)closeDrawer();else alert("Erreur: "+(await r.json()).error);
+  if(r.ok)closeDrawer();else alert("Error: "+(await r.json()).error);
 }
 function reply(id){
   const t=tasks.find(x=>x.id===id);if(!t)return;
-  showDrawer(`<h2>${esc(t.title)} attend</h2>
-    <div class="q">${esc(t.pendingQuestion||"(pas de texte de question)")}</div>
-    <label class="lbl">Ta réponse (injectée via claude --resume)</label>
-    <textarea id="ans" placeholder="Tape ta décision…" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')sendAnswer('${id}')"></textarea>
-    <div class="hint">⌘/Ctrl + Entrée pour envoyer</div>
-    <button class="btn primary" onclick="sendAnswer('${id}')">Envoyer à l'agent</button>`);
+  showDrawer(`<h2>${esc(t.title)} needs you</h2>
+    <div class="q">${esc(t.pendingQuestion||"(no question text)")}</div>
+    <label class="lbl">Your reply (injected via claude --resume)</label>
+    <textarea id="ans" placeholder="Type your decision…" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')sendAnswer('${id}')"></textarea>
+    <div class="hint">⌘/Ctrl + Enter to send</div>
+    <button class="btn primary" onclick="sendAnswer('${id}')">Send to agent</button>`);
   setTimeout(()=>document.getElementById("ans")?.focus(),50);
 }
 async function sendAnswer(id){
   const text=document.getElementById("ans").value.trim();if(!text)return;
   const r=await fetch(`/api/tasks/${id}/answer`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
-  if(r.ok)closeDrawer();else alert("Erreur: "+(await r.json()).error);
+  if(r.ok)closeDrawer();else alert("Error: "+(await r.json()).error);
 }
 async function openTask(id){
   const t=tasks.find(x=>x.id===id);
@@ -221,21 +221,21 @@ async function openTask(id){
   const df=await fetch(`/api/tasks/${id}/diff`).then(r=>r.json()).catch(()=>({diff:""}));
   showDrawer(`<h2>${esc(t.title)}</h2>
     <div class="meta"><span class="branch">⑂ ${esc(t.branch)}</span><span>phase ${t.phase}</span><span>${t.status}</span></div>
-    <label class="lbl">Diff</label><div class="q">${esc(df.diff||"(aucun changement)")}</div>
-    <label class="lbl">Événements récents</label>
-    <div class="q">${ev.events.slice(-40).map(e=>`${new Date(e.ts).toLocaleTimeString()} · ${e.kind} · ${esc(String(e.data)).slice(0,120)}`).join("\n")||"(rien)"}</div>
+    <label class="lbl">Diff</label><div class="q">${esc(df.diff||"(no changes)")}</div>
+    <label class="lbl">Recent events</label>
+    <div class="q">${ev.events.slice(-40).map(e=>`${new Date(e.ts).toLocaleTimeString()} · ${e.kind} · ${esc(String(e.data)).slice(0,120)}`).join("\n")||"(none)"}</div>
     <div style="display:flex;gap:8px">
-      <button class="btn ghost" onclick="stop('${id}')">Suspendre</button>
-      <button class="btn danger" onclick="del('${id}')">Supprimer</button></div>`);
+      <button class="btn ghost" onclick="stop('${id}')">Pause</button>
+      <button class="btn danger" onclick="del('${id}')">Delete</button></div>`);
 }
 async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST"});closeDrawer();}
-async function del(id){if(!confirm("Supprimer worktree + branche ?"))return;const r=await fetch(`/api/tasks/${id}`,{method:"DELETE"});const j=await r.json();if(!j.removed)alert(j.reason||"refusé");closeDrawer();}
+async function del(id){if(!confirm("Delete worktree + branch?"))return;const r=await fetch(`/api/tasks/${id}`,{method:"DELETE"});const j=await r.json();if(!j.removed)alert(j.reason||"refused");closeDrawer();}
 
 // ── live ──
 function connect(){
   const ws=new WebSocket(`ws://${location.host}/ws`);
   ws.onopen=()=>document.getElementById("conn").textContent="live";
-  ws.onclose=()=>{document.getElementById("conn").textContent="reconnexion…";setTimeout(connect,1500);};
+  ws.onclose=()=>{document.getElementById("conn").textContent="reconnecting…";setTimeout(connect,1500);};
   ws.onmessage=(m)=>{const d=JSON.parse(m.data);if(d.type==="tasks"){announceTransitions(d.tasks);tasks=d.tasks;render();}};
 }
 document.addEventListener("keydown",(e)=>{if(e.key!=="Escape")return;const a=document.activeElement;if(a&&a.tagName==="TEXTAREA"&&a.value.trim())return;closeDrawer();});
