@@ -1,0 +1,12 @@
+{
+  "name": "agentdeck-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Browser end-to-end proof of the core AgentDeck loop with a real claude agent. Deps isolated here so the root package stays dependency-free.",
+  "scripts": {
+    "e2e": "bash run.sh"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}

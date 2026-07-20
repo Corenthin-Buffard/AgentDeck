@@ -1,0 +1,4 @@
+node_modules/
+shots/
+daemon.log
+package-lock.json

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.3.7] - 2026-07-20
+
+### Added
+- **Browser e2e harness** (`docs/e2e/`) — a reproducible end-to-end proof of the core loop
+  with a **real** claude agent: it drives the actual dashboard (click "New task" → the agent
+  asks in prose → `waiting` over WebSocket → reply drawer → `claude --resume` → done →
+  artifact on disk). Isolated deps; not wired into CI (a real agent costs money + is
+  non-deterministic). Proves the P2 "real task creation from the browser" item.
+
+### Changed
+- TODOS: closed the browser-e2e P2, and recorded a P3 found during it — the dashboard's
+  "Clean up" button dead-ends on a done task whose worktree is dirty with the agent's artifact
+  (`cleanupWorktree` safely refuses, but the UI gives no path forward).
+
+### Hardened (review)
+- **The e2e cleanup can't leak a real agent.** `run.sh` launches the daemon in its own process
+  group (`set -m`) and tree-kills it on exit (`kill -- -$PGID`), so a mid-run failure/timeout
+  can't orphan the spawned `claude` — which would otherwise keep burning tokens against a
+  `rm -rf`'d worktree. Plus: the daemon log now lives at a stable (gitignored) path so it
+  survives cleanup for diagnosis, and a pre-flight port check fails loud instead of silently
+  driving a stale daemon on 8788.
+
 ## [0.1.3.6] - 2026-07-20
 
 ### Changed

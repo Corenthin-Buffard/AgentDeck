@@ -6,9 +6,8 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Dashboard / UI
 
-- **Real task creation from the browser** — **Priority: P2**
-  The loop is proven via the API/driver. Exercise the actual UX: click "Nouvelle tâche" in the dashboard → real agent runs → waiting appears → reply in the drawer → resumes. Confirm the WebSocket + reply drawer flow end-to-end in a browser, not just curl.
-  _Depends on: nothing (daemon + dashboard shipped)._
+- **"Clean up" dead-ends on a done task with artifacts** — **Priority: P3**
+  The dashboard's "Clean up" button (done tasks) calls `del()` → `DELETE /api/tasks/:id` → `cleanupWorktree`, which safely refuses to remove a **dirty** worktree (`git status --porcelain` non-empty). But a done task's worktree is normally dirty (the agent created the artifact — the whole point), so "Clean up" just alerts "worktree is dirty — needs review before removal" with no path forward. Give the user a way out: review the diff in the drawer → commit or discard → then clean up, or a "force clean up" with a clear warning. (Found during the browser e2e, 2026-07-20.)
 
 - **`resuming` state visual (DT2)** — **Priority: P3**
   The daemon sets `status: "resuming"` on restart (A2). The dashboard renders it with a generic chip; give it a distinct, non-alarming indicator (spinner, not error-red) so a daemon restart doesn't look like a failure.
@@ -17,7 +16,7 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
   `openTask()` renders `df.diff` with no length cap (unlike events/pendingQuestion). A task with a large diff bloats the DOM. Slice it (e.g. first ~4KB) with a "…truncated" note. (Adversarial review F5.)
 
 - **Density at scale (DT3)** — **Priority: P4**
-  With 20-40 agents, the flat list gets long. Make the "Roulent tout seuls" section a compact, collapsible strip; virtualize if needed. Keep the attention hierarchy (waiting/error pinned).
+  With 20-40 agents, the flat list gets long. Make the "Cruising" section a compact, collapsible strip; virtualize if needed. Keep the attention hierarchy (waiting/error pinned).
 
 ## Agent supervisor / core
 
@@ -72,5 +71,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **v0.1.2.2** (2026-07-20) — Fixed: untracked files show in the diff view; single-source the agent turn text (a review CRITICAL — a dropped restated question could have stranded an agent as `done`).
 - **v0.1.3.0** (2026-07-20) — Distribution pipeline (T8): single self-contained binary (`bun --compile` with the dashboard embedded), `release.yml` cross-compiles 3 targets on tag → GitHub Releases, `ci.yml` tests + compiles all targets on PR, README install section. All 3 targets verified to cross-compile; binary boots standalone from a foreign cwd.
 - **v0.1.3.1** (2026-07-20) — Demo GIF in the README (`docs/demo.gif`): the Master Inbox with agents cruising, one flipping to `waiting`, the reply drawer, and the task resuming — captured from the real dashboard over its live WebSocket. Completes T8.
+- **v0.1.3.7** (2026-07-20) — P2 **browser e2e proven** with a real agent: click "New task" → daemon spawns `claude` → it asks in prose → dashboard flips to `waiting` (WebSocket) → reply in the drawer → `claude --resume` → done → artifact (`color.txt`=`blue`), verified 3× incl. a self-contained run. Committed a reproducible harness at `docs/e2e/`. Surfaced a P3: "Clean up" dead-ends on done tasks with artifacts (dirty worktree).
 - **A1** — proven: gstack skill runs headless, asks in prose, `resume` continues.
 - **A1b** — proven: gstack runs headless with `--dangerously-skip-permissions`; the launch config is the key.
