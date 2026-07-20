@@ -11,7 +11,7 @@ import { store } from "../../src/db.ts";
 import { bus } from "../../src/bus.ts";
 import type { Task, Status, Phase } from "../../src/types.ts";
 
-startServer(); // dashboard on GORCH_PORT/AGENTDECK_PORT
+startServer(); // dashboard on AGENTDECK_PORT
 
 const now = Date.now();
 function mk(id: string, title: string, branch: string, status: Status, phase: Phase, agoSec: number, extra: Partial<Task> = {}): Task {

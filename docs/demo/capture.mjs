@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
-const PORT = process.env.GORCH_PORT || process.env.AGENTDECK_PORT || '8790';
+const PORT = process.env.AGENTDECK_PORT || '8790';
 const CTRL = process.env.DEMO_CTRL_PORT || '9099';
 const DASH = `http://127.0.0.1:${PORT}`;
 const FRAMES = join(process.cwd(), 'frames');

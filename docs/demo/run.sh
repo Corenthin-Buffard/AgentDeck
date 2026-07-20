@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 
 DATA="$(mktemp -d)"
 export AGENTDECK_DATA_DIR="$DATA" AGENTDECK_PORT=8790 DEMO_CTRL_PORT=9099 AGENTDECK_TARGET_REPO="$PWD"
-trap 'kill "${DPID:-0}" 2>/dev/null || true; rm -rf "$DATA"' EXIT
+trap 'kill "${DPID:-}" 2>/dev/null || true; rm -rf "$DATA"' EXIT
 
 bun run driver.ts > "$DATA/driver.log" 2>&1 &
 DPID=$!
