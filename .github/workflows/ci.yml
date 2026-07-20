@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile || bun install
+      - run: bun test
+      # Exercise the exact cross-compile targets release.yml ships, so a broken
+      # target fails the PR instead of the tag. arm64/darwin are compile-only
+      # (can't run them on an x64 runner); linux-x64 is also smoke-run below.
+      - name: Build binaries (all release targets)
+        run: |
+          mkdir -p dist
+          bun build src/daemon.ts --compile --target=bun-linux-x64    --outfile dist/agentdeck-linux-x64
+          bun build src/daemon.ts --compile --target=bun-linux-arm64  --outfile dist/agentdeck-linux-arm64
+          bun build src/daemon.ts --compile --target=bun-darwin-arm64 --outfile dist/agentdeck-darwin-arm64
+      # Prove the shipped artifact actually boots and serves the embedded
+      # dashboard — compiling only proves the text import bundles, not that the
+      # binary runs. The x64 target runs natively on this runner.
+      - name: Smoke-test the linux-x64 binary
+        run: |
+          GORCH_TARGET_REPO="$PWD" ./dist/agentdeck-linux-x64 &
+          PID=$!
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8787/ 2>/dev/null | grep -q '<title>gorch'; then ok=1; break; fi
+            sleep 0.25
+          done
+          kill $PID 2>/dev/null || true
+          [ "$ok" = 1 ] || { echo "binary did not serve the dashboard"; exit 1; }
+          echo "smoke OK: binary boots and serves the embedded dashboard"

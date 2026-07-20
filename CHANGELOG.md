@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.1.3.0] - 2026-07-20
+
+The distribution pipeline (T8). AgentDeck now ships as a single self-contained binary — distribution is the product for an OSS repo.
+
+### Added
+- **Single-binary build.** `bun run build` compiles `src/daemon.ts` to a standalone
+  executable (`dist/agentdeck`) via `bun build --compile`. The dashboard HTML is embedded
+  into the binary (`import indexHtml from "../public/index.html" with { type: "text" }`),
+  so it runs from any cwd with no sibling `public/` — verified booting + serving from `/tmp`.
+- **Release workflow** (`.github/workflows/release.yml`). Pushing a `v*` tag runs the tests,
+  cross-compiles three targets (linux x64/arm64, darwin arm64) from one runner, and uploads
+  them to a GitHub Release. All three targets verified to cross-compile locally.
+- **CI workflow** (`.github/workflows/ci.yml`). On push/PR: runs the 18 unit tests and
+  compiles all three release targets, so a broken cross-target fails the PR, not the tag.
+  Pinned to least-privilege `permissions: contents: read`.
+- **README install section.** Single-binary `curl` + `chmod` instructions, a "Run from
+  source" section, and a demo-GIF placeholder (recording tracked in TODOS).
+
+### Hardened (review)
+- **The release actually gets exercised.** CI now smoke-runs the compiled linux-x64
+  binary (boots it, curls `/`, asserts the dashboard) and a unit test boots the server
+  and asserts `GET "/"` serves the embedded HTML — the pipeline compiled the binary but
+  never ran it, so the embed change had zero runtime coverage.
+- **Release guardrails.** `release.yml` verifies the pushed tag equals `v<VERSION>` before
+  building, and `fail_on_unmatched_files: true` stops it publishing an empty release (and
+  404-ing the README download links) if the artifact glob ever misses.
+
 ## [0.1.2.2] - 2026-07-20
 
 Two fixes surfaced by the first real end-to-end run; the second was a critical caught in review.

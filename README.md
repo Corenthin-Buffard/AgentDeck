@@ -4,7 +4,13 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 
 `1 task = 1 branch = 1 git worktree = 1 agent.` Strict isolation, no sharing. Agents run on the server, so they keep going when you close your laptop or drop the SSH connection.
 
-> Status: **v0.1.0.0** — the daemon spine runs end to end (create task → branch → worktree → agent → live dashboard) and the core mechanic is proven end to end: a real gstack skill runs headless, asks in prose, and a `claude --resume` turn continues it (**A1 + A1b, below**). Not yet production-hardened.
+<!-- DEMO GIF: record N parallel agents on the board — one flips to `waiting`, a phone
+     notification fires, you reply in the drawer, it resumes — and drop it at docs/demo.gif,
+     then uncomment the line below. (Tracked in TODOS.md → Distribution.)
+<p align="center"><img src="docs/demo.gif" alt="AgentDeck: parallel agents on the Master Inbox board" width="720"></p>
+-->
+
+> Status: **v0.1.3.0** — the full loop is proven end to end with a real agent (create task → branch → worktree → agent runs → asks in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk). A1 + A1b below. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
 
 ## Why this and not Claude Squad / Conductor / amux
 
@@ -33,7 +39,23 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
 
 The `Notification`-hook wiring still ships but **off by default** (`GORCH_HOOKS=true`). The HTTP hook transport works (verified — `Stop` POSTed); `Notification` is simply inert under `claude -p`. It's kept ready for a future interactive / SDK (`query()` + Channels) mode where `Notification` would fire.
 
-## Run
+## Install
+
+Grab the single binary for your platform from [Releases](https://github.com/Corenthin-Buffard/AgentDeck/releases/latest) — the dashboard is embedded, so it's self-contained (no runtime, no `node_modules`, no sibling files):
+
+```bash
+# Linux x64 (swap the suffix for -linux-arm64 or -darwin-arm64)
+curl -fsSL https://github.com/Corenthin-Buffard/AgentDeck/releases/latest/download/agentdeck-linux-x64 -o agentdeck
+chmod +x agentdeck
+GORCH_TARGET_REPO=/path/to/your/project ./agentdeck
+# → http://127.0.0.1:8787  (bind is localhost — reach it via an SSH tunnel)
+```
+
+On the box it drives you still need `claude` (Claude Code) on PATH and authenticated, plus gstack for the phase tracking — the binary bundles AgentDeck, not the agents it runs.
+
+Run it under systemd `--user` to survive your laptop closing (that's the whole point — the daemon keeps the agents going while you're away).
+
+## Run from source
 
 Prereqs: [Bun](https://bun.sh), `claude` (Claude Code) on PATH and authenticated, and gstack for the phase tracking.
 
@@ -43,6 +65,8 @@ GORCH_TARGET_REPO=/path/to/your/project \
 GORCH_TG_TOKEN=... GORCH_TG_CHAT=... \
 bun run daemon
 # → http://127.0.0.1:8787  (bind is localhost — reach it via an SSH tunnel)
+
+bun run build     # → dist/agentdeck, the same self-contained binary CI ships
 ```
 
 Config knobs (env): `GORCH_HOST` (default `127.0.0.1`), `GORCH_PORT`, `GORCH_TARGET_REPO`, `GORCH_MAX_AGENTS`, `GORCH_PERMISSION_MODE`, `GORCH_CLAUDE_ARGS`, `GORCH_TG_TOKEN`/`GORCH_TG_CHAT`, `GORCH_SLACK_WEBHOOK`.

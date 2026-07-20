@@ -1,5 +1,7 @@
-import { join } from "node:path";
 import type { ServerWebSocket } from "bun";
+// Embed the dashboard into the binary as a string so `bun build --compile`
+// yields a self-contained executable (no sibling public/ dir needed at runtime).
+import indexHtml from "../public/index.html" with { type: "text" };
 import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { bus } from "./bus.ts";
@@ -8,7 +10,6 @@ import { createTask, removeTask, findBySession } from "./tasks.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
 
-const INDEX = join(import.meta.dir, "..", "public", "index.html");
 const clients = new Set<ServerWebSocket<unknown>>();
 
 function broadcast() {
@@ -83,7 +84,7 @@ export function startServer() {
 
       // ── Dashboard ───────────────────────────────────────────────────────
       if (pathname === "/" || pathname === "/index.html") {
-        return new Response(Bun.file(INDEX), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        return new Response(indexHtml, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
       return new Response("not found", { status: 404 });
     },
