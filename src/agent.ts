@@ -113,9 +113,13 @@ function attach(task: Task, child: ChildProcess) {
         patch({}); // bump lastActivity
         return;
       }
-      if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { text += ev.delta.text; return; }
+      if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { return; } // liveness-only; not accumulated
     }
     if (e.type === "assistant" && Array.isArray(e.message?.content)) {
+      // Single source of truth for the turn's text: the consolidated assistant
+      // message(s). Deltas carry the same text and are NOT accumulated, so there's
+      // no doubling — and no substring-dedup that could drop a restated question
+      // and silently flip waiting -> done.
       for (const c of e.message.content) if (c.type === "text") text += c.text;
     }
     if (e.type === "result") {
