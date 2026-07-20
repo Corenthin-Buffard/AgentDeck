@@ -47,6 +47,21 @@ export async function cleanupWorktree(worktree: string, branch: string): Promise
 
 export async function diffStat(worktree: string): Promise<string> {
   const base = await baseBranch();
-  const r = await git(["diff", "--stat", base], worktree);
-  return r.ok ? r.out : r.err;
+  const tracked = await git(["diff", "--stat", base], worktree);
+  // `git diff` ignores untracked files, so a brand-new file an agent just wrote
+  // is invisible. Surface them from `git status`. Use -z (NUL-separated, no
+  // C-quoting) so paths with spaces / accents / newlines survive intact.
+  const status = await git(["status", "--porcelain", "-z"], worktree);
+  const all = status.ok
+    ? status.out.split("\0").filter((l) => l.startsWith("??")).map((l) => l.slice(3)).filter(Boolean)
+    : [];
+  const CAP = 50;
+  const parts: string[] = [];
+  const t = tracked.ok ? tracked.out : tracked.err;
+  if (t) parts.push(t);
+  if (all.length) {
+    const more = all.length > CAP ? ` …and ${all.length - CAP} more` : "";
+    parts.push(`untracked: ${all.slice(0, CAP).join(", ")}${more}`);
+  }
+  return parts.join("\n"); // "" when empty → the dashboard shows its own localized fallback
 }
