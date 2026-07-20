@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.2.1] - 2026-07-20
+
+### Docs
+- Record the validation result: Claude Code's `Notification` hook does **not** fire under
+  headless `claude -p` (the `Stop` hook does, but it's redundant with the stream `result`
+  event). The prose heuristic on turn-end is the detection mechanism and it's optimal for
+  the headless model. The `Notification` wiring stays opt-in/off, ready for a future
+  interactive mode; the HTTP hook transport itself is confirmed working.
+
 ## [0.1.2.0] - 2026-07-20
 
 Opt-in Notification-hook wiring for faster "waiting" detection, hardened after review.
