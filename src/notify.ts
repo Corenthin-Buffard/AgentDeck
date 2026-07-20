@@ -9,9 +9,9 @@ type Reason = "waiting" | "done" | "error";
 
 function line(task: Task, reason: Reason): string {
   switch (reason) {
-    case "waiting": return `🟠 ${task.title} attend ta réponse (phase ${task.phase}).`;
-    case "done":    return `✅ ${task.title} terminé.`;
-    case "error":   return `🔴 ${task.title} — erreur : ${task.error ?? "inconnue"}`;
+    case "waiting": return `🟠 ${task.title} needs you (phase ${task.phase}).`;
+    case "done":    return `✅ ${task.title} done.`;
+    case "error":   return `🔴 ${task.title} — error: ${task.error ?? "unknown"}`;
   }
 }
 

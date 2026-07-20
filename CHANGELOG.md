@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.3.6] - 2026-07-20
+
+### Changed
+- **Dashboard + notifications translated to English.** Every user-facing string in the
+  Master Inbox (`public/index.html`) and the Slack/Telegram templates (`src/notify.ts`)
+  is now English (`Cruising / Needs you / Done`, the reply drawer, empty state, buttons,
+  alerts, relative times). Hardened via `/plan-eng-review` (Codex outside voice).
+
+### Added
+- **Reproducible demo-GIF harness** (`docs/demo/`) — boots the real dashboard, drives the
+  state timeline over the live WebSocket, captures with headless Chromium, and encodes the
+  GIF (deps isolated here; the root package stays dependency-free). The capture **fails on
+  any dashboard console error**, so it doubles as a UI-integrity check.
+- Regenerated `docs/demo.gif` in English.
+
 ## [0.1.3.5] - 2026-07-20
 
 ### Added

@@ -1,0 +1,14 @@
+{
+  "name": "agentdeck-demo",
+  "private": true,
+  "type": "module",
+  "description": "Reproducible harness that regenerates docs/demo.gif from the real AgentDeck dashboard. Deps live here, isolated from the root package (which stays dependency-free).",
+  "scripts": {
+    "gif": "bash run.sh"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0",
+    "gifenc": "^1.0.3",
+    "pngjs": "^7.0.0"
+  }
+}
