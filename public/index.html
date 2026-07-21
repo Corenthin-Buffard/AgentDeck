@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Per-session token injected by the daemon; the upload POST carries it as ?token=. -->
+<meta name="ad-token" content="__AD_TOKEN__">
 <title>AgentDeck · Master Inbox</title>
 <style>
   :root{
@@ -35,6 +37,14 @@
   .dot{width:7px;height:7px;border-radius:50%}
   .dot.ok{background:var(--ok)}.dot.done{background:var(--done)}
   .newbtn{font-family:var(--sans);font-weight:600;font-size:13px;cursor:pointer;padding:6px 13px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent)}
+  .newbtn:focus-visible,.projsel select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .actions{display:flex;gap:8px;align-items:center}
+  /* project switcher — a compact native select, never a card grid */
+  .projsel{display:inline-flex;align-items:center;gap:7px}
+  .projsel .cap{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.3px;color:var(--faint)}
+  .projsel select{font-family:var(--mono);font-size:12px;color:var(--text);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:5px 9px;cursor:pointer;max-width:220px}
+  /* per-row project tag: muted mono text, distinct from the semantic status .chip */
+  .proj{font-family:var(--mono);font-size:11px;color:var(--dim);white-space:nowrap}
   .lbl{font-family:var(--mono);font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--faint);margin:22px 2px 9px}
   .rows{display:flex;flex-direction:column;gap:8px}
   .row{position:relative;display:grid;grid-template-columns:3px 1fr auto;background:var(--surface);border:1px solid var(--line);border-radius:8px;overflow:hidden}
@@ -82,6 +92,16 @@
   .drawer textarea,.drawer input{width:100%;font-family:var(--mono);font-size:13px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:10px}
   .drawer textarea{min-height:90px;resize:vertical}
   .drawer .close{position:absolute;top:14px;right:16px;cursor:pointer;color:var(--faint);background:none;border:none;font-size:20px}
+  .drawer .field{display:flex;flex-direction:column;gap:6px}
+  .drawer select{width:100%;font-family:var(--mono);font-size:13px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 10px}
+  .drawer .err{color:var(--err);font-size:12.5px;font-family:var(--mono);line-height:1.4}
+  .prog{width:100%;height:6px;border-radius:3px;background:var(--line-soft);overflow:hidden}
+  .prog>i{display:block;height:100%;width:0;background:var(--accent);transition:width .12s linear}
+  /* toast — reuses the tokens; a path you copy, not an alert() to hand-retype */
+  .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(8px);max-width:min(560px,92vw);opacity:0;pointer-events:none;transition:opacity .16s,transform .16s;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px;display:flex;align-items:center;gap:12px;box-shadow:0 6px 24px rgba(0,0,0,.35);z-index:50}
+  .toast.on{opacity:1;pointer-events:auto;transform:translateX(-50%) translateY(0)}
+  .toast .path{font-family:var(--mono);font-size:12px;color:var(--dim);word-break:break-all;min-width:0}
+  .toast button{flex:none}
   @media(max-width:620px){.row{grid-template-columns:3px 1fr}.aside{grid-column:2;border-left:0;border-top:1px solid var(--line-soft);flex-direction:row;align-items:center;justify-content:space-between;min-width:0}.seg .pl{display:none}.seg.active .pl{display:block}}
 </style>
 </head>
@@ -92,9 +112,14 @@
 <div class="wrap">
   <header class="cmd">
     <span class="mark">Agent<b>Deck</b></span>
-    <span class="sub" id="conn">connecting…</span>
+    <label class="projsel"><span class="cap">Project</span>
+      <select id="proj" aria-label="Filter tasks by project" onchange="onProjectChange(this.value)"></select></label>
+    <span class="sub" id="conn" style="margin-left:auto">connecting…</span>
     <div class="pills" id="pills"></div>
-    <button class="newbtn" onclick="openNew()">+ New task</button>
+    <div class="actions">
+      <button class="newbtn" onclick="openNew()">+ New task</button>
+      <button class="newbtn" onclick="openUpload()">↑ Upload</button>
+    </div>
   </header>
   <div id="board"></div>
 </div>
@@ -105,10 +130,20 @@
   <div id="drawerBody"></div>
 </aside>
 
+<div class="toast" id="toast" role="status"></div>
+
 <script>
 const PHASES=["plan","run","review","qa","ship","done"];
+const AD_TOKEN=(document.querySelector('meta[name=ad-token]')||{}).content||"";
+// Every state-changing request carries the dashboard token so the daemon accepts
+// it (and a cross-origin page, which can't read this token, can't forge them).
+function authHeaders(extra){return Object.assign({"x-agentdeck-token":AD_TOKEN},extra||{});}
 let tasks=[];
+let projects=[];               // [{id,label}] from /api/projects
+let projectsReady=false;       // don't paint the board until we know the registry
+let currentProject=localStorage.getItem("agentdeck.project")||"all";
 let lastStatus={},announceSeeded=false;
+function projLabel(id){const p=projects.find(x=>x.id===id);return p?p.label:id;}
 // Append one node per message (aria-live announces added children) so a burst
 // of transitions never clobbers a prior announcement before it's read.
 function announce(msg){const el=document.getElementById("live");if(!el)return;const d=document.createElement("div");d.textContent=msg;el.appendChild(d);setTimeout(()=>d.remove(),6000);}
@@ -150,7 +185,8 @@ function rowHtml(t){
     <div class="rail"></div>
     <div class="body">
       <div class="toprow"><span class="name">${esc(t.title)}</span>
-        <span class="chip ${t.status}">${t.status==="waiting"?"Waiting for user":t.status}</span></div>
+        <span class="chip ${t.status}">${t.status==="waiting"?"Waiting for user":t.status}</span>
+        ${currentProject==="all"?`<span class="proj">▸ ${esc(projLabel(t.project))}</span>`:""}</div>
       <div class="meta"><span class="branch">⑂ ${esc(t.branch)}</span>
         <span>${esc(t.id)}</span>${t.error?`<span>${esc(t.error.slice(0,50))}</span>`:""}</div>
       ${t.status==="waiting"&&t.pendingQuestion?`<div class="qprev">${esc(preview(t.pendingQuestion))}</div>`:""}
@@ -166,19 +202,64 @@ function section(title,list){
   return `<div class="lbl">${title}</div><div class="rows">${list.map(safeRow).join("")}</div>`;
 }
 function render(){
-  const wait=tasks.filter(t=>t.status==="waiting"||t.status==="error");
-  const run=tasks.filter(t=>t.status==="running"||t.status==="resuming");
-  const done=tasks.filter(t=>t.status==="done"||t.status==="stopped");
-  const counts={waiting:tasks.filter(t=>t.status==="waiting").length,error:tasks.filter(t=>t.status==="error").length,
+  if(!projectsReady)return; // avoid a misleading "no projects" flash before the registry loads
+  const board=document.getElementById("board");
+  // Empty state 1: the registry itself is empty (all paths dropped at boot).
+  if(!projects.length){
+    document.getElementById("pills").innerHTML="";
+    board.innerHTML=`<div class="empty">No project configured.<br>Add a repo to <code>projects.json</code> in the data dir (or launch with <code>AGENTDECK_TARGET_REPO</code>), then reload.<br><br><button class="newbtn" onclick="location.reload()">Reload</button></div>`;
+    return;
+  }
+  // Filter to the selected project BEFORE splitting into sections and counting
+  // pills, so rows and counters always agree.
+  const shown=currentProject==="all"?tasks:tasks.filter(t=>t.project===currentProject);
+  const wait=shown.filter(t=>t.status==="waiting"||t.status==="error");
+  const run=shown.filter(t=>t.status==="running"||t.status==="resuming");
+  const done=shown.filter(t=>t.status==="done"||t.status==="stopped");
+  const counts={waiting:shown.filter(t=>t.status==="waiting").length,error:shown.filter(t=>t.status==="error").length,
     running:run.length,done:done.length};
   document.getElementById("pills").innerHTML=
     (counts.waiting?`<span class="pill wait"><span class="n">${counts.waiting}</span> waiting</span>`:"")+
     (counts.error?`<span class="pill err"><span class="n">${counts.error}</span> error</span>`:"")+
     `<span class="pill"><span class="dot ok"></span><span class="n">${counts.running}</span> running</span>`+
     `<span class="pill"><span class="dot done"></span><span class="n">${counts.done}</span> done</span>`;
-  const board=document.getElementById("board");
-  if(!tasks.length){board.innerHTML=`<div class="empty">No agents running yet.<br>Describe a task — AgentDeck creates the branch and worktree, then launches the agent and the gstack workflow.<br><br><button class="newbtn" onclick="openNew()">+ New task</button></div>`;return;}
+  if(!shown.length){
+    // Empty state 2: this project has no tasks yet (or, in "all", nothing anywhere).
+    board.innerHTML=currentProject==="all"
+      ? `<div class="empty">No agents running yet.<br>Describe a task — AgentDeck creates the branch and worktree, then launches the agent and the gstack workflow.<br><br><button class="newbtn" onclick="openNew()">+ New task</button></div>`
+      : `<div class="empty">No tasks in <b>${esc(projLabel(currentProject))}</b> yet.<br><br><button class="newbtn" onclick="openNew()">+ New task in ${esc(projLabel(currentProject))}</button></div>`;
+    return;
+  }
   board.innerHTML=section("Needs you",wait)+section("Cruising",run)+section("Done",done);
+}
+// Populate the header switcher from the registry; "all" + one option per project.
+function renderSwitcher(){
+  const sel=document.getElementById("proj");if(!sel)return;
+  if(!projects.length){sel.innerHTML=`<option>No project — see README</option>`;sel.disabled=true;return;}
+  sel.disabled=false;
+  sel.innerHTML=`<option value="all">All projects</option>`+projects.map(p=>`<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("");
+  sel.value=currentProject;
+}
+function onProjectChange(v){
+  currentProject=v;
+  if(v==="all")localStorage.removeItem("agentdeck.project");else localStorage.setItem("agentdeck.project",v);
+  render();
+}
+async function loadProjects(){
+  try{const d=await fetch("/api/projects").then(r=>r.json());projects=Array.isArray(d.projects)?d.projects:[];}
+  catch{projects=[];announce("Could not load projects.");}
+  // A persisted choice may point at a project that's gone — fall back to "all".
+  if(currentProject!=="all"&&!projects.some(p=>p.id===currentProject)){currentProject="all";localStorage.removeItem("agentdeck.project");}
+  projectsReady=true;
+  renderSwitcher();render();
+}
+// The project <select> for the New-task / Upload drawers. Omitted with a single
+// project (no redundant choice); returns "" so callers fall back to the default.
+function projectField(id,selected){
+  if(projects.length<2)return "";
+  const sel=selected&&selected!=="all"?selected:(projects[0]&&projects[0].id);
+  return `<div class="field"><label class="lbl" for="${id}">Project</label>
+    <select id="${id}">${projects.map(p=>`<option value="${esc(p.id)}"${p.id===sel?" selected":""}>${esc(p.label)}</option>`).join("")}</select></div>`;
 }
 
 // ── drawer ──
@@ -186,9 +267,11 @@ const drawer=document.getElementById("drawer"),scrim=document.getElementById("sc
 function showDrawer(html){document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
 function closeDrawer(){drawer.classList.remove("on");scrim.classList.remove("on");}
 function openNew(){
+  if(!projects.length){announce("No project configured.");return;}
   showDrawer(`<h2>New task</h2>
-    <label class="lbl">Title</label><input id="nt" placeholder="Billing rework">
-    <label class="lbl">Instructions for the agent</label>
+    ${projectField("ntproj",currentProject)}
+    <label class="lbl" for="nt">Title</label><input id="nt" placeholder="Billing rework">
+    <label class="lbl" for="np">Instructions for the agent</label>
     <textarea id="np" placeholder="Implement X following the gstack workflow…" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')createTask()"></textarea>
     <div class="hint">⌘/Ctrl + Enter to launch</div>
     <button class="btn primary" onclick="createTask()">Launch agent</button>`);
@@ -197,8 +280,69 @@ function openNew(){
 async function createTask(){
   const title=document.getElementById("nt").value.trim(),prompt=document.getElementById("np").value.trim();
   if(!title||!prompt)return;
-  const r=await fetch("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,prompt})});
+  // No project field means a single-project setup → let the server pick the default.
+  const psel=document.getElementById("ntproj");
+  const projectId=psel?psel.value:(currentProject!=="all"?currentProject:undefined);
+  const r=await fetch("/api/tasks",{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({title,prompt,projectId})});
   if(r.ok)closeDrawer();else alert("Error: "+(await r.json()).error);
+}
+// ── upload (local → VPS) ──
+const UPLOAD_MAX=25*1024*1024;
+function openUpload(){
+  if(!projects.length){announce("No project configured.");return;}
+  showDrawer(`<h2>Upload a file to the VPS</h2>
+    ${projectField("upproj",currentProject)}
+    <div class="field"><label class="lbl" for="upfile">File</label><input id="upfile" type="file"></div>
+    <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--dim);font-family:var(--mono)">
+      <input type="checkbox" id="upcookie" style="width:auto"> QA browse-state → the repo's <code>.gstack/browse-states/</code></label>
+    <div class="prog" id="upprog" hidden><i></i></div>
+    <div class="err" id="uperr" aria-live="polite"></div>
+    <div class="hint">Max 25 MB. Lands under <code>uploads/&lt;project&gt;/</code> on the VPS (or the browse-state dir).</div>
+    <button class="btn primary" id="upbtn" onclick="doUpload()">Upload</button>`);
+  setTimeout(()=>document.getElementById("upfile")?.focus(),50);
+}
+function doUpload(){
+  const err=document.getElementById("uperr");err.textContent="";
+  const fileEl=document.getElementById("upfile"),f=fileEl&&fileEl.files&&fileEl.files[0];
+  if(!f){err.textContent="Choose a file first.";return;}
+  if(f.size>UPLOAD_MAX){err.textContent=`File too large (max ${UPLOAD_MAX/1024/1024} MB).`;return;}
+  const psel=document.getElementById("upproj");
+  const projectId=psel?psel.value:(projects[0]&&projects[0].id);
+  const cookie=document.getElementById("upcookie");
+  const dest=cookie&&cookie.checked?".gstack/browse-states":"";
+  const fd=new FormData();fd.append("file",f);fd.append("project",projectId);fd.append("dest",dest);
+  const btn=document.getElementById("upbtn");btn.disabled=true;
+  const prog=document.getElementById("upprog");prog.hidden=false;const bar=prog.querySelector("i");bar.style.width="0%";
+  // XHR (not fetch) for a determinate upload progress bar.
+  const xhr=new XMLHttpRequest();
+  xhr.open("POST","/api/upload");
+  xhr.setRequestHeader("x-agentdeck-token",AD_TOKEN); // token in a header, not the URL (no cache/log leak)
+  xhr.upload.onprogress=(e)=>{if(e.lengthComputable)bar.style.width=Math.round(e.loaded/e.total*100)+"%";};
+  xhr.onload=()=>{
+    btn.disabled=false;prog.hidden=true;
+    let j={};try{j=JSON.parse(xhr.responseText);}catch{}
+    if(xhr.status>=200&&xhr.status<300&&j.path){closeDrawer();showToast(j.path);announce("Upload complete: "+j.path);}
+    else{err.textContent=j.error||`Upload failed (${xhr.status}).`;announce("Upload failed.");}
+  };
+  xhr.onerror=()=>{btn.disabled=false;prog.hidden=true;err.textContent="Network error.";announce("Upload failed.");};
+  xhr.send(fd);
+}
+// ── toast (upload result: a path you copy, not an alert to hand-retype) ──
+let lastToastPath="",toastTimer=null;
+function showToast(path){
+  lastToastPath=path;
+  const el=document.getElementById("toast");
+  el.innerHTML=`<span class="path">${esc(path)}</span>`
+    +`<button class="btn ghost" onclick="copyPath()">Copy path</button>`
+    +`<button class="btn ghost" onclick="hideToast()" aria-label="Dismiss">Dismiss</button>`;
+  el.classList.add("on");
+  clearTimeout(toastTimer);toastTimer=setTimeout(hideToast,9000);
+  setTimeout(()=>el.querySelector("button")?.focus(),20); // focusable per a11y
+}
+function hideToast(){document.getElementById("toast").classList.remove("on");}
+function copyPath(){
+  if(!navigator.clipboard){announce("Clipboard unavailable — path is in the toast.");return;}
+  navigator.clipboard.writeText(lastToastPath).then(()=>announce("Path copied."),()=>announce("Could not copy."));
 }
 function reply(id){
   const t=tasks.find(x=>x.id===id);if(!t)return;
@@ -212,7 +356,7 @@ function reply(id){
 }
 async function sendAnswer(id){
   const text=document.getElementById("ans").value.trim();if(!text)return;
-  const r=await fetch(`/api/tasks/${id}/answer`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
+  const r=await fetch(`/api/tasks/${id}/answer`,{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({text})});
   if(r.ok)closeDrawer();else alert("Error: "+(await r.json()).error);
 }
 async function openTask(id){
@@ -233,9 +377,9 @@ async function openTask(id){
       <button class="btn ghost" onclick="stop('${id}')">Pause</button>
       <button class="btn danger" onclick="del('${id}')">Delete</button></div>`);
 }
-async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST"});closeDrawer();}
+async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST",headers:authHeaders()});closeDrawer();}
 async function del(id){
-  const call=async(q)=>{try{return await (await fetch(`/api/tasks/${id}${q}`,{method:"DELETE"})).json();}catch{return{removed:false,reason:"request failed"};}};
+  const call=async(q)=>{try{return await (await fetch(`/api/tasks/${id}${q}`,{method:"DELETE",headers:authHeaders()})).json();}catch{return{removed:false,reason:"request failed"};}};
   // Try a safe removal first (refuses if the worktree holds the agent's uncommitted work).
   let j=await call("");
   if(j.removed){closeDrawer();return;}
@@ -260,7 +404,8 @@ function connect(){
   ws.onclose=()=>{document.getElementById("conn").textContent="reconnecting…";setTimeout(connect,1500);};
   ws.onmessage=(m)=>{const d=JSON.parse(m.data);if(d.type==="tasks"){announceTransitions(d.tasks);tasks=d.tasks;render();}};
 }
-document.addEventListener("keydown",(e)=>{if(e.key!=="Escape")return;const a=document.activeElement;if(a&&a.tagName==="TEXTAREA"&&a.value.trim())return;closeDrawer();});
+document.addEventListener("keydown",(e)=>{if(e.key!=="Escape")return;const a=document.activeElement;if(a&&a.tagName==="TEXTAREA"&&a.value.trim())return;hideToast();closeDrawer();});
+loadProjects();
 connect();
 setInterval(render,10000); // refresh relative times
 </script>

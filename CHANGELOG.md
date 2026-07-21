@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.2.0.0] - 2026-07-22
+
+### Added
+- **Drive many repos from one daemon.** Drop a `projects.json` (`[{ id, path, label? }]`)
+  in the data dir and one AgentDeck instance orchestrates several repositories. The dashboard
+  header gets a **Project** switcher (All projects / per-project), the choice is remembered
+  across reloads, and in the all-projects view each row carries a muted project tag. Every
+  task's branch and worktree land in that project's repo. Single-repo setups keep working
+  unchanged — with no `projects.json`, a `default` project is synthesized from
+  `AGENTDECK_TARGET_REPO`.
+- **Upload a local file to the VPS from the browser.** A new **Upload** button sends a file
+  over the tunnel (no more manual `scp`); it lands under `<dataDir>/uploads/<project>/` and a
+  toast gives you the absolute VPS path with a copy button. Determinate progress bar, clear
+  error states, 25 MB cap.
+- **Authenticated QA on the VPS.** Upload a gstack browse-state (`qa.json`) into a project's
+  `.gstack/browse-states/`, then the agent runs `$B state load qa` before the logged-in steps —
+  so the headless browser on the server can hit pages behind a login. (Whether a worktree agent
+  sees the main-repo copy is being verified in QA; see TODOS.)
+
+### Security
+- **All state-changing requests are token-gated (anti-CSRF).** Create/stop/delete/reply and
+  upload now require a per-session **dashboard token**, injected into the served HTML (with
+  `Cache-Control: no-store`) and sent as an `x-agentdeck-token` header. A cross-origin page
+  can't read that token, so it can't forge these even while your SSH tunnel is open — closing a
+  CSRF-to-localhost path that could otherwise launch a `--dangerously-skip-permissions` agent.
+  This dashboard token is **separate** from the agents' `0600` hook token, which is no longer
+  exposed in the page.
+- **Upload path containment hardened.** The destination is now realpath-checked against a
+  trusted base and any real `.git/` path is refused, so a symlinked directory component (e.g.
+  `.gstack/browse-states` → `.git/hooks`) can no longer redirect a write out of the target dir.
+  Filenames are reduced to a sanitized basename, project ids with path separators are rejected,
+  and writes are temp-then-renamed (no stranded temp files, no leaf-symlink follow).
+
+### Fixed
+- **A stale or unknown project no longer runs an agent in the wrong repo.** `POST /api/tasks`
+  with an unknown `projectId` returns 400 instead of silently falling back to the first project.
+- **Worktree cleanup works for bare repos.** Cleanup derives the repo from the worktree; it no
+  longer mis-derives a bare repo's path and leaks the worktree/branch.
+
 ## [0.1.3.11] - 2026-07-21
 
 ### Security

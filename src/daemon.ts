@@ -9,6 +9,19 @@ import { hookSettings } from "./hooks-config.ts";
 // survive SSH/browser disconnects (they live here, not on your laptop).
 
 mkdirSync(config.worktreesDir, { recursive: true });
+mkdirSync(config.uploadsDir, { recursive: true });
+
+// Boot-validate the project registry: drop any path that isn't a git repo so a
+// typo'd projects.json never silently routes a task into the wrong (or no) repo.
+// Runs here (not at config import) to keep config.ts pure and off the test path.
+config.projects = config.projects.filter((p) => {
+  const r = Bun.spawnSync(["git", "-C", p.path, "rev-parse", "--git-dir"]);
+  if (r.exitCode !== 0) { console.warn(`[projects] '${p.id}' is not a git repo, skipping: ${p.path}`); return false; }
+  return true;
+});
+if (!config.projects.length) {
+  console.error("[projects] no valid project — create-task will 400 until projects.json points at a git repo");
+}
 
 // Write the settings file that agents load via `claude --settings` so Claude
 // Code POSTs Notification/PreToolUse hook events back to us. Written before we

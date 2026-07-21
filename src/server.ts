@@ -1,14 +1,58 @@
 import type { ServerWebSocket } from "bun";
+import { mkdirSync, renameSync, realpathSync, rmSync } from "node:fs";
+import { basename, join, resolve, sep } from "node:path";
+import { randomUUID } from "node:crypto";
 // Embed the dashboard into the binary as a string so `bun build --compile`
 // yields a self-contained executable (no sibling public/ dir needed at runtime).
 import indexHtml from "../public/index.html" with { type: "text" };
-import { config } from "./config.ts";
+import { config, projectById } from "./config.ts";
 import { store } from "./db.ts";
 import { bus } from "./bus.ts";
 import { answer, stopTask } from "./agent.ts";
 import { createTask, removeTask, findBySession } from "./tasks.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
+
+const MAX_UPLOAD = 25 * 1024 * 1024; // 25MB app cap; maxRequestBodySize is the first curtain
+// The only `dest` the upload accepts beyond the per-project uploads dir: the
+// gstack browse-state convention, written into the project repo so an agent can
+// `$B state load`. Anything else is rejected (no arbitrary path into the repo).
+const BROWSE_STATES = ".gstack/browse-states";
+
+/** Escape a value for safe interpolation into an HTML attribute. */
+function escAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/**
+ * Resolve where an upload should land, or return null if the request tries to
+ * escape its root. `dest` empty → per-project uploads dir; `dest` === the
+ * browse-states convention → the project repo's browse-states dir. Returns the
+ * final `target` plus the trusted `base` it must stay under (uploadsDir or the
+ * repo). This does LEXICAL containment only — the caller must additionally
+ * realpath-check the created directory against `base`, because a symlinked
+ * directory component would pass a lexical check yet redirect the write out of
+ * the root (e.g. `.gstack/browse-states` → `.git/hooks`).
+ */
+function resolveUploadPath(project: { id: string; path: string }, dest: string, filename: string): { target: string; base: string } | null {
+  const safeName = basename(filename).replace(/[^\w.\-]/g, "_").replace(/^\.+/, "") || "upload";
+  const norm = dest.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  let root: string, base: string;
+  if (!norm) {
+    base = resolve(config.uploadsDir);
+    root = resolve(base, project.id);
+  } else if (norm === BROWSE_STATES) {
+    base = resolve(project.path);
+    root = resolve(base, BROWSE_STATES);
+  } else {
+    return null; // dest not on the whitelist
+  }
+  const target = resolve(root, safeName);
+  const withinRoot = target === root || target.startsWith(root + sep);
+  if (!withinRoot) return null;
+  if (target.split(sep).includes(".git")) return null; // never write into a .git dir
+  return { target, base };
+}
 
 const clients = new Set<ServerWebSocket<unknown>>();
 
@@ -23,9 +67,17 @@ function json(data: unknown, status = 200) {
 }
 
 export function startServer() {
+  // Serve the dashboard with the DASHBOARD token injected (never the hook token),
+  // so its write fetches can carry the x-agentdeck-token header. Computed once —
+  // fixed for the process. Function replacement so a `$` in a custom token isn't
+  // read as a $-pattern.
+  const dashboardHtml = indexHtml.replace("__AD_TOKEN__", () => escAttr(config.dashboardToken));
   const server = Bun.serve({
     hostname: config.host, // A3: localhost by default — do not expose the control API publicly
     port: config.port,
+    // First curtain on upload size: reject an over-large body before it's buffered
+    // into RAM (the 25MB app cap is the second curtain). ~26MB leaves headroom.
+    maxRequestBodySize: 26 * 1024 * 1024,
     async fetch(req, srv) {
       const url = new URL(req.url);
       const { pathname } = url;
@@ -34,15 +86,45 @@ export function startServer() {
         return srv.upgrade(req) ? undefined : new Response("upgrade failed", { status: 400 });
       }
 
+      // ── Auth gates (all WRITE endpoints; reads stay open on localhost) ───
+      // Hooks: AGENTS authenticate with the 0600 hook token via ?token=.
+      if (pathname.startsWith("/hooks/") && req.method === "POST" &&
+          url.searchParams.get("token") !== config.hookToken) {
+        return new Response(null, { status: 403 });
+      }
+      // Dashboard writes: the BROWSER authenticates with the dashboard token
+      // (injected into the served HTML) via the x-agentdeck-token header. Every
+      // one of these mutates state — create/kill/drive an agent (--dangerously-
+      // skip-permissions, RCE-class) or write a file into a repo. Gating them is
+      // anti-CSRF: a cross-origin page can't read the HTML to learn the token, so
+      // it can't forge these even with the tunnel open. Reads (GET) stay ungated.
+      const perTask = /^\/api\/tasks\/[^/]+/.test(pathname);
+      const isDashboardWrite =
+        (pathname === "/api/upload" && req.method === "POST") ||
+        (pathname === "/api/tasks" && req.method === "POST") ||
+        (perTask && (req.method === "DELETE" || req.method === "POST"));
+      if (isDashboardWrite && req.headers.get("x-agentdeck-token") !== config.dashboardToken) {
+        return new Response(null, { status: 403 });
+      }
+
       // ── REST API ──────────────────────────────────────────────────────
+      if (pathname === "/api/projects" && req.method === "GET") {
+        return json({ projects: config.projects.map((p) => ({ id: p.id, label: p.label })) });
+      }
       if (pathname === "/api/tasks" && req.method === "GET") {
         return json({ tasks: store.listTasks() });
       }
       if (pathname === "/api/tasks" && req.method === "POST") {
         const b = await req.json().catch(() => ({}));
         if (!b.title || !b.prompt) return json({ error: "title and prompt required" }, 400);
+        if (!config.projects.length) return json({ error: "no project configured — add one to projects.json" }, 400);
+        // A provided-but-unknown projectId (stale dashboard, typo) must NOT silently
+        // land the agent in the first repo — reject it, like /api/upload does.
+        if (b.projectId != null && b.projectId !== "" && !projectById(String(b.projectId))) {
+          return json({ error: "unknown project" }, 400);
+        }
         try {
-          const t = await createTask(String(b.title), String(b.prompt));
+          const t = await createTask(String(b.title), String(b.prompt), b.projectId ? String(b.projectId) : undefined);
           return json({ task: t });
         } catch (e: any) {
           return json({ error: `could not create task: ${e.message}` }, 500);
@@ -71,13 +153,46 @@ export function startServer() {
         }
       }
 
-      // ── Hooks (optional enhancement; stream detection also works alone) ──
-      // Both hook endpoints require the per-session token (query string). Without
-      // it any local process could POST a forged `waiting`; the secret lives only
-      // in the 0600 settings file the daemon hands to its own agents.
-      if (pathname.startsWith("/hooks/") && req.method === "POST" &&
-          url.searchParams.get("token") !== config.hookToken) {
-        return new Response(null, { status: 403 });
+      // ── Upload (local → VPS): multipart, token-gated at the top ─────────
+      if (pathname === "/api/upload" && req.method === "POST") {
+        const form = await req.formData().catch(() => null);
+        if (!form) return json({ error: "multipart form required" }, 400);
+        const file = form.get("file");
+        const projectId = String(form.get("project") ?? "");
+        const dest = String(form.get("dest") ?? "");
+        if (!(file instanceof File)) return json({ error: "file field required" }, 400);
+        const project = projectById(projectId);
+        if (!project) return json({ error: "unknown project" }, 400);
+        if (file.size > MAX_UPLOAD) return json({ error: `file too large (max ${MAX_UPLOAD / 1024 / 1024}MB)` }, 413);
+        const resolved = resolveUploadPath(project, dest, file.name);
+        if (!resolved) return json({ error: "destination not allowed" }, 400);
+        const { target, base } = resolved;
+        try {
+          const dir = target.slice(0, target.lastIndexOf(sep));
+          mkdirSync(dir, { recursive: true });
+          // Symlink defense: resolve symlinks in the *created* dir and re-check it
+          // is still inside the trusted base AND not inside any `.git`. A lexical
+          // check alone is bypassable by a symlinked directory component (e.g.
+          // `.gstack/browse-states` → `.git/hooks` → RCE on the next git op).
+          const realBase = realpathSync(base);
+          const realDir = realpathSync(dir);
+          if ((realDir !== realBase && !realDir.startsWith(realBase + sep)) || realDir.split(sep).includes(".git")) {
+            return json({ error: "destination not allowed" }, 400);
+          }
+          // Write to a temp name then rename over the target so a pre-placed
+          // symlink at `target` (the leaf) can't redirect the write either.
+          const tmp = join(dir, `.tmp-${randomUUID()}`);
+          try {
+            await Bun.write(tmp, file);
+            renameSync(tmp, target);
+          } catch (e) {
+            rmSync(tmp, { force: true }); // don't strand a temp file on failure
+            throw e;
+          }
+          return json({ path: target });
+        } catch (e: any) {
+          return json({ error: `upload failed: ${e.message}` }, 500);
+        }
       }
       if (pathname === "/hooks/notification" && req.method === "POST") {
         const b = await req.json().catch(() => ({}));
@@ -95,7 +210,9 @@ export function startServer() {
 
       // ── Dashboard ───────────────────────────────────────────────────────
       if (pathname === "/" || pathname === "/index.html") {
-        return new Response(indexHtml, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        // no-store: the HTML carries the per-session token, so it must never be
+        // written to a browser/proxy cache where it could be replayed.
+        return new Response(dashboardHtml, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
       }
       return new Response("not found", { status: 404 });
     },
@@ -105,6 +222,7 @@ export function startServer() {
       message() { /* dashboard is read + REST; ws is push-only */ },
     },
   });
-  console.log(`AgentDeck daemon on http://localhost:${server.port}  (target repo: ${config.targetRepo})`);
+  const projList = config.projects.map((p) => `${p.id}→${p.path}`).join(", ") || "(none)";
+  console.log(`AgentDeck daemon on http://localhost:${server.port}  (${config.projects.length} project(s): ${projList})`);
   return server;
 }

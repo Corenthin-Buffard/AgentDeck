@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { store } from "./db.ts";
+import { config, projectById } from "./config.ts";
 import { createWorktree, cleanupWorktree, type CleanupResult, type CleanupMode } from "./git.ts";
 import { launchTask, killExisting } from "./agent.ts";
 import { emitUpdate } from "./bus.ts";
@@ -9,14 +10,17 @@ function slugify(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "task";
 }
 
-/** 1 task = 1 branch = 1 worktree = 1 agent. taskId is the correlation key. */
-export async function createTask(title: string, prompt: string): Promise<Task> {
+/** 1 task = 1 branch = 1 worktree = 1 agent. taskId is the correlation key.
+ *  `projectId` picks the repo; omitted/unknown falls back to the first project. */
+export async function createTask(title: string, prompt: string, projectId?: string): Promise<Task> {
+  const project = projectById(projectId) ?? config.projects[0];
+  if (!project) throw new Error("no project configured — add one to projects.json");
   const id = "t_" + randomUUID().slice(0, 8);
   const branch = `agentdeck/${slugify(title)}-${id.slice(2)}`;
-  const worktree = await createWorktree(id, branch);
+  const worktree = await createWorktree(id, branch, project.path);
   const now = Date.now();
   const task: Task = {
-    id, title, prompt, branch, worktree, tmux: null, sessionId: null,
+    id, project: project.id, title, prompt, branch, worktree, tmux: null, sessionId: null,
     status: "running", phase: "unknown", pendingQuestion: null,
     lastActivity: now, createdAt: now, error: null,
   };

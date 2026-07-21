@@ -14,6 +14,7 @@ db.exec("PRAGMA busy_timeout = 5000;");
 db.exec(`
   CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
+    project TEXT,
     title TEXT NOT NULL,
     prompt TEXT NOT NULL,
     branch TEXT NOT NULL,
@@ -37,9 +38,31 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, ts);
 `);
 
+// The project a NULL row routes to — a pre-multi-project row, or the column the
+// migration just added. Resolved at READ time (rowToTask) against the LIVE,
+// boot-validated registry, so legacy rows follow the current first project
+// instead of being frozen to whatever loaded first (which boot-validation might
+// later drop). Never the literal 'default', which a hand-written registry need
+// not contain.
+const fallbackProject = () => config.projects[0]?.id ?? "default";
+
+// Migration: `CREATE TABLE IF NOT EXISTS` won't add a column to a pre-existing
+// tasks table (older builds had no `project`). Add it — that's all. We do NOT
+// backfill a stored value: rowToTask coalesces NULL → the live first project, so
+// there's no load-order coupling and no permanently-stale label. Exported so the
+// test exercises THIS code, not a hand-copied clone.
+export function migrateTasks(database: Database) {
+  const cols = database.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "project")) {
+    database.exec("ALTER TABLE tasks ADD COLUMN project TEXT");
+  }
+}
+migrateTasks(db);
+
 function rowToTask(r: any): Task {
   return {
-    id: r.id, title: r.title, prompt: r.prompt, branch: r.branch, worktree: r.worktree,
+    id: r.id, project: r.project ?? fallbackProject(), title: r.title, prompt: r.prompt,
+    branch: r.branch, worktree: r.worktree,
     tmux: r.tmux, sessionId: r.session_id, status: r.status, phase: r.phase,
     pendingQuestion: r.pending_question, lastActivity: r.last_activity,
     createdAt: r.created_at, error: r.error,
@@ -49,9 +72,9 @@ function rowToTask(r: any): Task {
 export const store = {
   insertTask(t: Task) {
     db.query(`INSERT INTO tasks
-      (id,title,prompt,branch,worktree,tmux,session_id,status,phase,pending_question,last_activity,created_at,error)
-      VALUES ($id,$title,$prompt,$branch,$worktree,$tmux,$sid,$status,$phase,$pq,$la,$ca,$err)`).run({
-      $id: t.id, $title: t.title, $prompt: t.prompt, $branch: t.branch, $worktree: t.worktree,
+      (id,project,title,prompt,branch,worktree,tmux,session_id,status,phase,pending_question,last_activity,created_at,error)
+      VALUES ($id,$project,$title,$prompt,$branch,$worktree,$tmux,$sid,$status,$phase,$pq,$la,$ca,$err)`).run({
+      $id: t.id, $project: t.project, $title: t.title, $prompt: t.prompt, $branch: t.branch, $worktree: t.worktree,
       $tmux: t.tmux, $sid: t.sessionId, $status: t.status, $phase: t.phase, $pq: t.pendingQuestion,
       $la: t.lastActivity, $ca: t.createdAt, $err: t.error,
     });

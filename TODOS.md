@@ -34,6 +34,12 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **Operational isolation (per-agent ports / RAM)** — **Priority: P4**
   Agents share the box; a runaway agent can starve others (port 3000, RAM, npm cache). Add per-agent port ranges + a memory cap when real contention shows up. (Not security — mono-user; it's about agents not stepping on each other.)
 
+- **Verify the QA-cookie upload actually reaches the agent** — **Priority: P2**
+  The browse-state upload lands in the **main** repo's `.gstack/browse-states/qa.json` (`server.ts` upload dest), but agents run in per-task **worktrees** (`config.worktreesDir/<taskId>`), which have their own working dir. A cookie state file is exactly the kind of thing a repo gitignores, and a fresh `git worktree` doesn't carry untracked/ignored files — so `$B state load qa` in the agent may not find it. Confirm end-to-end in `/qa` how gstack resolves the browse-state path inside a worktree; if it doesn't see the main-repo copy, either drop the file into the worktree instead, or document the absolute path the agent must load. (Review finding, 2026-07-21.)
+
+- **Split hook vs dashboard token is done; consider constant-time token compare** — **Priority: P4**
+  The write gates compare the per-session token with `!==` (`server.ts`). For a 128-bit random secret on localhost a timing side-channel isn't realistically exploitable, but `crypto.timingSafeEqual` over equal-length buffers is a cheap belt-and-suspenders if the daemon is ever exposed beyond localhost. (Review finding, 2026-07-21.)
+
 ## Distribution (OSS)
 
 - **Make the repo public** — **Priority: P2**

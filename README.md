@@ -11,7 +11,7 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 
 <p align="center"><sub>One agent flips to <code>waiting</code>, you answer in the drawer, and it resumes — live over WebSocket.</sub></p>
 
-> Status: **v0.1.3.4** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
+> Status: **v0.2.0.0** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
 
 ## Why this and not Claude Squad / Conductor / amux
 
@@ -133,11 +133,58 @@ bun run daemon
 bun run build     # → dist/agentdeck, the same self-contained binary CI ships
 ```
 
-Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees), `AGENTDECK_WORKTREES`, `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
+Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json`), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret agents use for hooks), `AGENTDECK_DASHBOARD_TOKEN` (per-session secret the browser uses for writes/uploads — injected into the served HTML), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
 
 ## Launch requirement
 
 For gstack's skills to resolve and run inside a headless agent, agents must be started with **`--dangerously-skip-permissions`** — `--permission-mode acceptEdits` isn't enough. AgentDeck sets this by default. Each agent is confined to its own git worktree on your own box, so the blast radius is that one task's branch; set `AGENTDECK_SKIP_PERMISSIONS=false` only for a supervised, hands-on debugging run.
+
+## Multiple projects (one daemon, many repos)
+
+One daemon can drive several repos. Drop a **`projects.json`** in the data dir
+(`~/.agentdeck` by default):
+
+```json
+[
+  { "id": "api", "path": "/srv/billing-api", "label": "Billing API" },
+  { "id": "web", "path": "/srv/web" }
+]
+```
+
+`id` is the routing key, `path` is the repo, `label` is what the dashboard shows
+(defaults to the folder name). The header **Project** switcher filters the board
+to one project or shows *All projects* (with a per-row tag); the choice is
+remembered across reloads. Each task's branch/worktree lands in its project's
+repo. Bad entries are skipped at boot with a warning; if there's no
+`projects.json`, a single `default` project is synthesized from
+`AGENTDECK_TARGET_REPO` — so existing single-repo setups keep working unchanged.
+
+## Upload files to the VPS
+
+The dashboard's **Upload** button sends a local file to the box (no more manual
+`scp`): it lands under `<dataDir>/uploads/<project>/` and the toast gives you the
+absolute VPS path to reference in a task (with a copy button). Uploads — and every
+other state-changing request (create/stop/delete/reply) — are gated by a
+per-session dashboard token (injected into the served HTML, sent as a header, so a
+cross-origin page can't forge them) and path-contained: capped at 25 MB, filename
+sanitized, symlinked directories rejected, no writing outside the target dir.
+
+## QA with authenticated cookies on the VPS
+
+The agent's browser on the VPS starts logged out, and gstack's cookie **capture**
+is local-only (it decrypts your real Chrome via the OS keychain, impossible on a
+headless server). But cookie **consumption** is portable, so:
+
+1. **Locally**, log in once and save the state:
+   `/setup-browser-cookies` (or a scripted login) → `$B state save qa` writes
+   `.gstack/browse-states/qa.json` (a plain array of Playwright cookies).
+2. **Upload** that JSON with the **Upload** button, ticking *QA browse-state* —
+   it's placed at your project repo's `.gstack/browse-states/qa.json`.
+3. **In the QA task**, the agent runs `$B state load qa` before the
+   authenticated steps.
+
+Alternative for a repeatable QA: a dedicated test account + scripted login, so
+there are no cookies to transfer at all.
 
 ## Layout
 
