@@ -52,6 +52,7 @@ export interface AgentDeckConfig {
   // Notification-hook wiring: launched agents POST hook events to the daemon.
   notificationHooks: boolean;    // wire the Notification/PreToolUse HTTP hooks
   hookBaseUrl: string;           // where agents POST hook events (the daemon)
+  hookToken: string;             // per-session secret; hook POSTs must carry ?token=
   agentSettingsPath: string;     // the generated `claude --settings` file
   maxConcurrentAgents: number;
   notify: {

@@ -17,19 +17,23 @@ export interface HookSettings {
   };
 }
 
-export function hookSettings(baseUrl: string): HookSettings {
+export function hookSettings(baseUrl: string, token: string): HookSettings {
+  // The token rides in the query string — Claude Code's `http` hook exposes only
+  // `url`/`timeout`/`async`, no custom headers. The daemon checks it and rejects
+  // any hook POST that doesn't carry the matching secret.
+  const q = `?token=${encodeURIComponent(token)}`;
   return {
     hooks: {
       Notification: [
         {
           matcher: "*",
-          hooks: [{ type: "http", url: `${baseUrl}/hooks/notification`, timeout: 10, async: true }],
+          hooks: [{ type: "http", url: `${baseUrl}/hooks/notification${q}`, timeout: 10, async: true }],
         },
       ],
       PreToolUse: [
         {
           matcher: "AskUserQuestion|mcp__.*__AskUserQuestion",
-          hooks: [{ type: "http", url: `${baseUrl}/hooks/pre-tool-use`, timeout: 30, async: false }],
+          hooks: [{ type: "http", url: `${baseUrl}/hooks/pre-tool-use${q}`, timeout: 30, async: false }],
         },
       ],
     },

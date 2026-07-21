@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { AgentDeckConfig } from "./types.ts";
 
 const home = homedir();
@@ -33,6 +34,12 @@ export const config: AgentDeckConfig = {
   // 127.0.0.1 even when host is 0.0.0.0.
   notificationHooks: process.env.AGENTDECK_HOOKS === "true",
   hookBaseUrl: process.env.AGENTDECK_HOOK_BASE_URL ?? `http://127.0.0.1:${port}`,
+  // Per-session shared secret. Agents carry it in the hook URL (?token=); the
+  // handlers reject anything else, so a local process can't forge a `waiting`
+  // without reading the (0600) settings file. Override to pin it across restarts.
+  // `||` (not `??`) on purpose: an empty AGENTDECK_HOOK_TOKEN must NOT disable the
+  // gate — a blank token would match a forged `?token=`, silently turning auth off.
+  hookToken: process.env.AGENTDECK_HOOK_TOKEN || randomUUID(),
   agentSettingsPath: join(dataDir, "agent-settings.json"),
 
   maxConcurrentAgents: Number(process.env.AGENTDECK_MAX_AGENTS ?? 4),

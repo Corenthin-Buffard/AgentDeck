@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { resumeTask } from "./agent.ts";
@@ -15,7 +15,13 @@ mkdirSync(config.worktreesDir, { recursive: true });
 // resume any in-flight agent below.
 if (config.notificationHooks) {
   try {
-    writeFileSync(config.agentSettingsPath, JSON.stringify(hookSettings(config.hookBaseUrl), null, 2));
+    // Remove any pre-existing (possibly loose-perm, e.g. 0644 from an older build)
+    // file first so the fresh create honors 0600 — writeFileSync's `mode` is
+    // ignored when the file already exists, which would leak the token for the
+    // write→chmod window. chmod stays as a belt-and-suspenders final state.
+    rmSync(config.agentSettingsPath, { force: true });
+    writeFileSync(config.agentSettingsPath, JSON.stringify(hookSettings(config.hookBaseUrl, config.hookToken), null, 2), { mode: 0o600 });
+    chmodSync(config.agentSettingsPath, 0o600);
     console.log(`[hooks] agents POST Notification/PreToolUse → ${config.hookBaseUrl}`);
   } catch (e) {
     config.notificationHooks = false; // degrade — never crash the daemon over an optional enhancement

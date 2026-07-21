@@ -1,6 +1,17 @@
 # Changelog
 
-## [0.1.3.10] - 2026-07-21
+## [0.1.3.11] - 2026-07-21
+
+### Security
+- **The hook endpoints now require a per-session token.** `/hooks/notification` and
+  `/hooks/pre-tool-use` were unauthenticated — any local process could POST a forged
+  `session_id` and flip a task to `waiting`. The daemon now generates a per-session secret
+  (`hookToken`, `randomUUID` or `AGENTDECK_HOOK_TOKEN`), bakes `?token=<secret>` into the hook
+  URLs in the generated settings file (Claude Code's `http` hook has no headers field), writes
+  that file `0600` so only the owner can read the secret, and rejects any `/hooks/*` POST whose
+  token doesn't match with **403**. The gate runs even when hooks are disabled. Forgery is now
+  restricted to the owner user (who already controls the box); the prose-heuristic detection is
+  unchanged. Hardened over two adversarial review rounds (empty-token footgun, write→chmod TOCTOU).
 
 ### Fixed
 - **The drawer diff is capped at 4000 chars.** `openTask()` rendered `df.diff` uncapped
