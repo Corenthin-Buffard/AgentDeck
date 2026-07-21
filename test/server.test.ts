@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../src/config.ts";
@@ -81,13 +81,57 @@ test("POST /api/tasks with an empty registry → 400", async () => {
   const server = startServer();
   try {
     const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken },
       body: JSON.stringify({ title: "x", prompt: "y" }),
     });
     expect(res.status).toBe(400);
     expect((await res.json()).error).toMatch(/no project/i);
   } finally {
     config.projects = savedProjects;
+    server.stop(true);
+  }
+});
+
+// The state-changing task endpoints require the dashboard token (anti-CSRF), but
+// reads stay open. The gate runs before the handler, so a missing token is 403
+// regardless of whether the task exists.
+test("state-changing task endpoints require the dashboard token; reads don't", async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const server = startServer();
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    // writes with no token → 403
+    expect((await fetch(`${base}/api/tasks`, { method: "POST", body: "{}" })).status).toBe(403);
+    expect((await fetch(`${base}/api/tasks/anything`, { method: "DELETE" })).status).toBe(403);
+    expect((await fetch(`${base}/api/tasks/anything/stop`, { method: "POST" })).status).toBe(403);
+    expect((await fetch(`${base}/api/tasks/anything/answer`, { method: "POST", body: "{}" })).status).toBe(403);
+    // wrong token → 403
+    expect((await fetch(`${base}/api/tasks`, { method: "POST", headers: { "x-agentdeck-token": "nope" }, body: "{}" })).status).toBe(403);
+    // reads stay open (no token) — GET /api/tasks, /api/projects
+    expect((await fetch(`${base}/api/tasks`)).status).toBe(200);
+    expect((await fetch(`${base}/api/projects`)).status).toBe(200);
+    // with the right token, the write passes the gate (then 400 for missing fields)
+    expect((await fetch(`${base}/api/tasks`, { method: "POST", headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken }, body: "{}" })).status).toBe(400);
+  } finally {
+    server.stop(true);
+  }
+});
+
+// A provided-but-unknown projectId must 400 (not silently run in the first repo).
+// Returns before createTask, so no real agent is spawned.
+test("POST /api/tasks with an unknown projectId → 400", async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const server = startServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks`, {
+      method: "POST", headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken },
+      body: JSON.stringify({ title: "x", prompt: "y", projectId: "no-such-project" }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/unknown project/i);
+  } finally {
     server.stop(true);
   }
 });
@@ -103,18 +147,21 @@ test("/api/upload: token-gated, contained, and writes under uploadsDir", async (
   const { startServer } = await import("../src/server.ts");
   const server = startServer();
   const base = `http://127.0.0.1:${server.port}`;
-  const tok = encodeURIComponent(config.hookToken);
-  const upload = (fields: Record<string, string>, withToken = true) => {
+  const dtok = config.dashboardToken; // browser token, sent as a header
+  const upload = (fields: Record<string, string>, token: string | null = dtok) => {
     const fd = new FormData();
     fd.append("file", new File(["hello vps\n"], "note.txt"));
     for (const [k, v] of Object.entries(fields)) fd.append(k, v);
-    return fetch(`${base}/api/upload${withToken ? `?token=${tok}` : ""}`, { method: "POST", body: fd });
+    const headers = token == null ? {} : { "x-agentdeck-token": token };
+    return fetch(`${base}/api/upload`, { method: "POST", headers, body: fd });
   };
   try {
     // no token → 403
-    expect((await upload({ project: projectId }, false)).status).toBe(403);
+    expect((await upload({ project: projectId }, null)).status).toBe(403);
     // wrong token → 403
-    expect((await fetch(`${base}/api/upload?token=nope`, { method: "POST", body: new FormData() })).status).toBe(403);
+    expect((await upload({ project: projectId }, "nope")).status).toBe(403);
+    // a query ?token= is NOT accepted for dashboard writes (header only) → 403
+    expect((await fetch(`${base}/api/upload?token=${encodeURIComponent(dtok)}`, { method: "POST", body: new FormData() })).status).toBe(403);
     // unknown project → 400
     expect((await upload({ project: "does-not-exist" })).status).toBe(400);
     // dest not on the whitelist → 400 (can't write arbitrary paths into the repo)
@@ -127,9 +174,85 @@ test("/api/upload: token-gated, contained, and writes under uploadsDir", async (
     expect(path.startsWith(join(uploads, projectId))).toBe(true);
     expect(existsSync(path)).toBe(true);
     expect(readFileSync(path, "utf8")).toBe("hello vps\n");
+
+    // a traversal FILENAME (not dest) is reduced to a contained basename
+    const fd = new FormData();
+    fd.append("file", new File(["x"], "../../../etc/passwd"));
+    fd.append("project", projectId);
+    const tr = await fetch(`${base}/api/upload`, { method: "POST", headers: { "x-agentdeck-token": dtok }, body: fd });
+    expect(tr.status).toBe(200);
+    const trPath = (await tr.json()).path;
+    expect(trPath.slice(0, trPath.lastIndexOf("/"))).toBe(join(uploads, projectId)); // dirname == uploads/<project>
   } finally {
     config.uploadsDir = savedUploads;
     rmSync(uploads, { recursive: true, force: true });
+    server.stop(true);
+  }
+});
+
+// The 25MB app cap → 413 (between the cap and the 26MB body curtain).
+test("/api/upload rejects an over-cap file with 413", async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const server = startServer();
+  try {
+    const fd = new FormData();
+    fd.append("file", new File([new Uint8Array(25 * 1024 * 1024 + 512 * 1024)], "big.bin")); // >25MB, <26MB
+    fd.append("project", config.projects[0].id);
+    const res = await fetch(`http://127.0.0.1:${server.port}/api/upload`, { method: "POST", headers: { "x-agentdeck-token": config.dashboardToken }, body: fd });
+    expect(res.status).toBe(413);
+  } finally {
+    server.stop(true);
+  }
+});
+
+// dest=.gstack/browse-states writes into the project repo (the cookies flow), and
+// a symlinked directory component is rejected by the realpath re-check (no escape
+// into ~/.ssh or the repo's own .git/hooks).
+test("/api/upload browse-states: lands in the repo, but symlinked dirs are rejected", async () => {
+  config.port = 0;
+  const savedPath = config.projects[0].path;
+  const savedUploads = config.uploadsDir;
+  const repo = mkdtempSync(join(tmpdir(), "agentdeck-proj-"));
+  const outside = mkdtempSync(join(tmpdir(), "agentdeck-outside-"));
+  config.projects[0].path = repo;
+  config.uploadsDir = mkdtempSync(join(tmpdir(), "agentdeck-up2-"));
+  const projectId = config.projects[0].id;
+  const { startServer } = await import("../src/server.ts");
+  const server = startServer();
+  const base = `http://127.0.0.1:${server.port}`;
+  const put = (name: string) => {
+    const fd = new FormData();
+    fd.append("file", new File(["[]\n"], name));
+    fd.append("project", projectId);
+    fd.append("dest", ".gstack/browse-states");
+    return fetch(`${base}/api/upload`, { method: "POST", headers: { "x-agentdeck-token": config.dashboardToken }, body: fd });
+  };
+  try {
+    // happy path → lands under <repo>/.gstack/browse-states/
+    const ok = await put("qa.json");
+    expect(ok.status).toBe(200);
+    const okPath = (await ok.json()).path;
+    expect(okPath.startsWith(join(repo, ".gstack/browse-states"))).toBe(true);
+    expect(existsSync(okPath)).toBe(true);
+
+    // now swap browse-states for a symlink pointing OUT of the repo → rejected
+    rmSync(join(repo, ".gstack/browse-states"), { recursive: true, force: true });
+    symlinkSync(outside, join(repo, ".gstack/browse-states"));
+    expect((await put("escape.json")).status).toBe(400);
+    expect(existsSync(join(outside, "escape.json"))).toBe(false); // nothing written outside
+
+    // and a symlink into the repo's own .git → also rejected
+    rmSync(join(repo, ".gstack/browse-states"), { force: true });
+    mkdirSync(join(repo, ".git/hooks"), { recursive: true });
+    symlinkSync(join(repo, ".git/hooks"), join(repo, ".gstack/browse-states"));
+    expect((await put("post-checkout")).status).toBe(400);
+    expect(existsSync(join(repo, ".git/hooks/post-checkout"))).toBe(false);
+  } finally {
+    config.projects[0].path = savedPath;
+    config.uploadsDir = savedUploads;
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
     server.stop(true);
   }
 });

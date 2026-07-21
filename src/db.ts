@@ -38,21 +38,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, ts);
 `);
 
-// The task the DB routes to when `project` is NULL — a pre-multi-project row, or
-// a column added by the migration below. Backfill/coalesce to the first
-// registered project so legacy tasks stay routable (never the literal 'default',
-// which a hand-written registry need not contain).
+// The project a NULL row routes to — a pre-multi-project row, or the column the
+// migration just added. Resolved at READ time (rowToTask) against the LIVE,
+// boot-validated registry, so legacy rows follow the current first project
+// instead of being frozen to whatever loaded first (which boot-validation might
+// later drop). Never the literal 'default', which a hand-written registry need
+// not contain.
 const fallbackProject = () => config.projects[0]?.id ?? "default";
 
 // Migration: `CREATE TABLE IF NOT EXISTS` won't add a column to a pre-existing
-// tasks table (older builds had no `project`). Add it, then backfill NULLs.
-{
-  const cols = db.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+// tasks table (older builds had no `project`). Add it — that's all. We do NOT
+// backfill a stored value: rowToTask coalesces NULL → the live first project, so
+// there's no load-order coupling and no permanently-stale label. Exported so the
+// test exercises THIS code, not a hand-copied clone.
+export function migrateTasks(database: Database) {
+  const cols = database.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "project")) {
-    db.exec("ALTER TABLE tasks ADD COLUMN project TEXT");
+    database.exec("ALTER TABLE tasks ADD COLUMN project TEXT");
   }
-  db.query("UPDATE tasks SET project = $p WHERE project IS NULL").run({ $p: fallbackProject() });
 }
+migrateTasks(db);
 
 function rowToTask(r: any): Task {
   return {

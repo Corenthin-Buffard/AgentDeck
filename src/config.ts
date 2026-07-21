@@ -37,6 +37,12 @@ export function loadProjects(dir: string, fallbackRepo: string): Project[] {
         console.warn(`[projects] skipping malformed entry: ${JSON.stringify(p)}`);
         continue;
       }
+      // The id is used as a path segment (uploads/<id>) and a DB value, so it must
+      // be a simple slug — reject separators / `..` so it can't escape uploadsDir.
+      if (/[/\\]|\.\./.test(p.id)) {
+        console.warn(`[projects] skipping id with path separators: '${p.id}'`);
+        continue;
+      }
       if (seen.has(p.id)) { console.warn(`[projects] duplicate id '${p.id}' — keeping the first`); continue; }
       seen.add(p.id);
       out.push({ id: p.id, path: p.path, label: (typeof p.label === "string" && p.label) ? p.label : (basename(p.path) || p.id) });
@@ -87,6 +93,11 @@ export const config: AgentDeckConfig = {
   // `||` (not `??`) on purpose: an empty AGENTDECK_HOOK_TOKEN must NOT disable the
   // gate — a blank token would match a forged `?token=`, silently turning auth off.
   hookToken: process.env.AGENTDECK_HOOK_TOKEN || randomUUID(),
+  // Distinct from hookToken so the agent↔daemon hook secret is NEVER emitted into
+  // the dashboard HTML. This one IS injected there (the browser needs it); keeping
+  // it separate means scraping the page can't forge hook events. `||` not `??`:
+  // an empty env override must not blank the secret and disable the gate.
+  dashboardToken: process.env.AGENTDECK_DASHBOARD_TOKEN || randomUUID(),
   agentSettingsPath: join(dataDir, "agent-settings.json"),
 
   maxConcurrentAgents: Number(process.env.AGENTDECK_MAX_AGENTS ?? 4),

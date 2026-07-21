@@ -133,7 +133,7 @@ bun run daemon
 bun run build     # → dist/agentdeck, the same self-contained binary CI ships
 ```
 
-Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json`), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret; also gates uploads), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
+Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json`), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret agents use for hooks), `AGENTDECK_DASHBOARD_TOKEN` (per-session secret the browser uses for writes/uploads — injected into the served HTML), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
 
 ## Launch requirement
 
@@ -163,9 +163,11 @@ repo. Bad entries are skipped at boot with a warning; if there's no
 
 The dashboard's **Upload** button sends a local file to the box (no more manual
 `scp`): it lands under `<dataDir>/uploads/<project>/` and the toast gives you the
-absolute VPS path to reference in a task (with a copy button). Uploads are
-token-gated (the same per-session secret as the hooks) and path-contained —
-capped at 25 MB, filename sanitized, no writing outside the target dir.
+absolute VPS path to reference in a task (with a copy button). Uploads — and every
+other state-changing request (create/stop/delete/reply) — are gated by a
+per-session dashboard token (injected into the served HTML, sent as a header, so a
+cross-origin page can't forge them) and path-contained: capped at 25 MB, filename
+sanitized, symlinked directories rejected, no writing outside the target dir.
 
 ## QA with authenticated cookies on the VPS
 

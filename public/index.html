@@ -135,6 +135,9 @@
 <script>
 const PHASES=["plan","run","review","qa","ship","done"];
 const AD_TOKEN=(document.querySelector('meta[name=ad-token]')||{}).content||"";
+// Every state-changing request carries the dashboard token so the daemon accepts
+// it (and a cross-origin page, which can't read this token, can't forge them).
+function authHeaders(extra){return Object.assign({"x-agentdeck-token":AD_TOKEN},extra||{});}
 let tasks=[];
 let projects=[];               // [{id,label}] from /api/projects
 let projectsReady=false;       // don't paint the board until we know the registry
@@ -280,7 +283,7 @@ async function createTask(){
   // No project field means a single-project setup → let the server pick the default.
   const psel=document.getElementById("ntproj");
   const projectId=psel?psel.value:(currentProject!=="all"?currentProject:undefined);
-  const r=await fetch("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,prompt,projectId})});
+  const r=await fetch("/api/tasks",{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({title,prompt,projectId})});
   if(r.ok)closeDrawer();else alert("Error: "+(await r.json()).error);
 }
 // ── upload (local → VPS) ──
@@ -312,7 +315,8 @@ function doUpload(){
   const prog=document.getElementById("upprog");prog.hidden=false;const bar=prog.querySelector("i");bar.style.width="0%";
   // XHR (not fetch) for a determinate upload progress bar.
   const xhr=new XMLHttpRequest();
-  xhr.open("POST","/api/upload?token="+encodeURIComponent(AD_TOKEN));
+  xhr.open("POST","/api/upload");
+  xhr.setRequestHeader("x-agentdeck-token",AD_TOKEN); // token in a header, not the URL (no cache/log leak)
   xhr.upload.onprogress=(e)=>{if(e.lengthComputable)bar.style.width=Math.round(e.loaded/e.total*100)+"%";};
   xhr.onload=()=>{
     btn.disabled=false;prog.hidden=true;
@@ -352,7 +356,7 @@ function reply(id){
 }
 async function sendAnswer(id){
   const text=document.getElementById("ans").value.trim();if(!text)return;
-  const r=await fetch(`/api/tasks/${id}/answer`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
+  const r=await fetch(`/api/tasks/${id}/answer`,{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({text})});
   if(r.ok)closeDrawer();else alert("Error: "+(await r.json()).error);
 }
 async function openTask(id){
@@ -373,9 +377,9 @@ async function openTask(id){
       <button class="btn ghost" onclick="stop('${id}')">Pause</button>
       <button class="btn danger" onclick="del('${id}')">Delete</button></div>`);
 }
-async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST"});closeDrawer();}
+async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST",headers:authHeaders()});closeDrawer();}
 async function del(id){
-  const call=async(q)=>{try{return await (await fetch(`/api/tasks/${id}${q}`,{method:"DELETE"})).json();}catch{return{removed:false,reason:"request failed"};}};
+  const call=async(q)=>{try{return await (await fetch(`/api/tasks/${id}${q}`,{method:"DELETE",headers:authHeaders()})).json();}catch{return{removed:false,reason:"request failed"};}};
   // Try a safe removal first (refuses if the worktree holds the agent's uncommitted work).
   let j=await call("");
   if(j.removed){closeDrawer();return;}

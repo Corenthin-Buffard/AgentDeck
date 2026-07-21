@@ -58,6 +58,18 @@ describe("loadProjects", () => {
     });
   });
 
+  test("ids with path separators or `..` are skipped (can't escape uploadsDir)", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, "projects.json"), JSON.stringify([
+        { id: "../evil", path: "/srv/a" },
+        { id: "a/b", path: "/srv/b" },
+        { id: "/tmp/out", path: "/srv/c" },
+        { id: "ok", path: "/srv/d" },
+      ]));
+      expect(loadProjects(dir, REPO)).toEqual([{ id: "ok", path: "/srv/d", label: "d" }]);
+    });
+  });
+
   test("duplicate ids → first wins, no ambiguous routing", () => {
     withDir((dir) => {
       writeFileSync(join(dir, "projects.json"), JSON.stringify([

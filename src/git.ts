@@ -1,4 +1,4 @@
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { config } from "./config.ts";
 
 // Thin, honest wrappers around git. Isolation invariant: 1 task = 1 branch =
@@ -34,7 +34,11 @@ async function repoRootOf(worktree: string): Promise<string> {
   let r = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], worktree);
   if (!r.ok) r = await git(["rev-parse", "--git-common-dir"], worktree);
   if (!r.ok) return worktree; // not a worktree we can resolve — operate in place
-  return dirname(resolve(worktree, r.out)); // <repo>/.git → <repo>
+  const commonDir = resolve(worktree, r.out);
+  // Non-bare repo: common dir is `<repo>/.git` → strip to `<repo>`. Bare repo:
+  // common dir IS the repo (e.g. `/srv/x.git`) → use it as-is; blindly dirname'ing
+  // would hand cleanup the parent dir and leak the worktree/branch.
+  return basename(commonDir) === ".git" ? dirname(commonDir) : commonDir;
 }
 
 /** Create branch + worktree for a task in `repoPath`. Returns the worktree path. */
