@@ -34,8 +34,8 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **Operational isolation (per-agent ports / RAM)** — **Priority: P4**
   Agents share the box; a runaway agent can starve others (port 3000, RAM, npm cache). Add per-agent port ranges + a memory cap when real contention shows up. (Not security — mono-user; it's about agents not stepping on each other.)
 
-- **Tighten `/api/upload` containment to the intended dir, not just the repo** — **Priority: P3**
-  The upload realpath check (`server.ts`) confirms the write lands under the project repo and not under `.git/`, but a pre-placed symlink at `<repo>/.gstack/browse-states` pointing WITHIN the repo (e.g. → `src/`) still passes — a token-holder + symlink-planter could drop a sanitized-filename file into another repo dir. Pre-existing (v0.2.0.0); needs a token AND local symlink access. Tighten: require the resolved dir to be under `resolve(<repo>/.gstack)` (or that no path component is a symlink), so a within-repo redirect is rejected too. (Codex review, 2026-07-22.)
+- **[FIXED — pending ship] `/api/upload` containment tightened to the intended dir** — **Priority: P3**
+  The realpath check confirmed the write was under the repo and not `.git/`, but a pre-placed symlink at `<repo>/.gstack/browse-states` → `src/` still passed. Fixed on `fix/upload-containment`: the check now requires `realpathSync(root)` to EQUAL the canonical `realpath(base)+subpath`, so ANY symlinked path component is rejected — out-of-repo, `.git/`, and within-repo redirects alike. Test covers the `→ src/` case. (Codex review, 2026-07-22.)
 
 - **Split hook vs dashboard token is done; consider constant-time token compare** — **Priority: P4**
   The write gates compare the per-session token with `!==` (`server.ts`). For a 128-bit random secret on localhost a timing side-channel isn't realistically exploitable, but `crypto.timingSafeEqual` over equal-length buffers is a cheap belt-and-suspenders if the daemon is ever exposed beyond localhost. (Review finding, 2026-07-21.)
