@@ -1,4 +1,5 @@
 import { basename, dirname, join, resolve } from "node:path";
+import { mkdirSync, symlinkSync, lstatSync } from "node:fs";
 import { config } from "./config.ts";
 
 // Thin, honest wrappers around git. Isolation invariant: 1 task = 1 branch =
@@ -41,12 +42,35 @@ async function repoRootOf(worktree: string): Promise<string> {
   return basename(commonDir) === ".git" ? dirname(commonDir) : commonDir;
 }
 
+/**
+ * Share the project's gstack browse-states (uploaded QA cookies) into a task's
+ * worktree. `$B state load <name>` resolves via git-toplevel + `.gstack/browse-states/`,
+ * which for a worktree is the WORKTREE root — and a fresh worktree carries no
+ * `.gstack/` — so without this a cookie state uploaded to the MAIN repo is invisible
+ * to the agent (QA would run logged-out). A symlink to the live shared dir fixes it
+ * without committing cookies or changing the upload path. Best-effort: cookies are
+ * optional, so a failure here never blocks the task.
+ */
+function linkBrowseStates(worktree: string, repoPath: string): void {
+  try {
+    const shared = join(repoPath, ".gstack", "browse-states");
+    const link = join(worktree, ".gstack", "browse-states");
+    if (lstatSync(link, { throwIfNoEntry: false })) return; // already present (tracked?) — don't clobber
+    mkdirSync(shared, { recursive: true });               // so uploads + the link agree on the path
+    mkdirSync(join(worktree, ".gstack"), { recursive: true });
+    symlinkSync(shared, link);                             // absolute target → robust wherever the worktree lives
+  } catch (e) {
+    console.warn(`[worktree] could not link browse-states into ${worktree}: ${(e as Error).message}`);
+  }
+}
+
 /** Create branch + worktree for a task in `repoPath`. Returns the worktree path. */
 export async function createWorktree(taskId: string, branch: string, repoPath = config.targetRepo): Promise<string> {
   const base = await baseBranch(repoPath);
   const path = join(config.worktreesDir, taskId);
   const r = await git(["worktree", "add", "-b", branch, path, base], repoPath);
   if (!r.ok) throw new Error(`git worktree add failed: ${r.err || r.out}`);
+  linkBrowseStates(path, repoPath); // so an uploaded QA cookie state reaches the agent
   return path;
 }
 

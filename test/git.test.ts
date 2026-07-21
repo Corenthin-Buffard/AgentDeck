@@ -1,5 +1,5 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync, lstatSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -143,5 +143,23 @@ describe("multi-project worktree routing", () => {
     expect(show.status).toBe(0);
     expect(show.stdout).toContain("work");
     g2(["branch", "-D", "agentdeck/multi"]);
+  });
+
+  // QA-cookie delivery: `$B state load qa` resolves .gstack/browse-states via
+  // git-toplevel (= the worktree root), so an uploaded state in the MAIN repo is
+  // invisible unless the worktree links to it. createWorktree symlinks it in.
+  test("createWorktree links the project's browse-states into the worktree", async () => {
+    // simulate the AgentDeck upload: a cookie state in the MAIN repo
+    mkdirSync(join(REPO2, ".gstack", "browse-states"), { recursive: true });
+    writeFileSync(join(REPO2, ".gstack", "browse-states", "qa.json"), '{"cookies":[],"pages":[]}');
+    const wt = await createWorktree("t_cookie", "agentdeck/cookie", REPO2);
+    const seen = join(wt, ".gstack", "browse-states", "qa.json");
+    // the worktree resolves the uploaded state through the link…
+    expect(existsSync(seen)).toBe(true);
+    expect(readFileSync(seen, "utf8")).toContain("cookies");
+    // …and it's a symlink (a live view of the shared dir), not a stale copy
+    expect(lstatSync(join(wt, ".gstack", "browse-states")).isSymbolicLink()).toBe(true);
+    g2(["worktree", "remove", "--force", wt]);
+    g2(["branch", "-D", "agentdeck/cookie"]);
   });
 });
