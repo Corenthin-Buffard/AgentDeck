@@ -1,5 +1,5 @@
 import { basename, dirname, join, resolve } from "node:path";
-import { mkdirSync, symlinkSync, lstatSync } from "node:fs";
+import { mkdirSync, symlinkSync, lstatSync, readFileSync, appendFileSync } from "node:fs";
 import { config } from "./config.ts";
 
 // Thin, honest wrappers around git. Isolation invariant: 1 task = 1 branch =
@@ -43,6 +43,25 @@ async function repoRootOf(worktree: string): Promise<string> {
 }
 
 /**
+ * Ignore `.gstack/` in this repo's worktrees via the repo's LOCAL `info/exclude`
+ * (never the tracked `.gitignore`). The browse-states symlink below is untracked,
+ * and a managed repo won't ignore `.gstack/` on its own — without this the worktree
+ * goes dirty (`?? .gstack/`), which strands `safe` cleanup and makes a `commit`
+ * cleanup's `git add -A` commit the symlink into the user's project branch.
+ * `info/exclude` is local + uncommitted + unshared, so nothing lands in their tree.
+ * Idempotent; best-effort.
+ */
+async function excludeGstack(worktree: string): Promise<void> {
+  const r = await git(["rev-parse", "--git-path", "info/exclude"], worktree);
+  if (!r.ok) return;
+  const p = resolve(worktree, r.out);
+  let cur = "";
+  try { cur = readFileSync(p, "utf8"); } catch { /* no exclude file yet */ }
+  if (/^\.gstack\/$/m.test(cur)) return; // already excluded
+  appendFileSync(p, (cur && !cur.endsWith("\n") ? "\n" : "") + ".gstack/\n");
+}
+
+/**
  * Share the project's gstack browse-states (uploaded QA cookies) into a task's
  * worktree. `$B state load <name>` resolves via git-toplevel + `.gstack/browse-states/`,
  * which for a worktree is the WORKTREE root — and a fresh worktree carries no
@@ -51,14 +70,16 @@ async function repoRootOf(worktree: string): Promise<string> {
  * without committing cookies or changing the upload path. Best-effort: cookies are
  * optional, so a failure here never blocks the task.
  */
-function linkBrowseStates(worktree: string, repoPath: string): void {
+async function linkBrowseStates(worktree: string, repoPath: string): Promise<void> {
   try {
-    const shared = join(repoPath, ".gstack", "browse-states");
+    const repo = resolve(repoPath);                       // absolute → the symlink target is absolute even if projects.json used a relative path
+    const shared = join(repo, ".gstack", "browse-states");
     const link = join(worktree, ".gstack", "browse-states");
+    await excludeGstack(worktree);                        // keep the untracked symlink from dirtying the managed repo
     if (lstatSync(link, { throwIfNoEntry: false })) return; // already present (tracked?) — don't clobber
     mkdirSync(shared, { recursive: true });               // so uploads + the link agree on the path
     mkdirSync(join(worktree, ".gstack"), { recursive: true });
-    symlinkSync(shared, link);                             // absolute target → robust wherever the worktree lives
+    symlinkSync(shared, link);
   } catch (e) {
     console.warn(`[worktree] could not link browse-states into ${worktree}: ${(e as Error).message}`);
   }
@@ -70,7 +91,7 @@ export async function createWorktree(taskId: string, branch: string, repoPath = 
   const path = join(config.worktreesDir, taskId);
   const r = await git(["worktree", "add", "-b", branch, path, base], repoPath);
   if (!r.ok) throw new Error(`git worktree add failed: ${r.err || r.out}`);
-  linkBrowseStates(path, repoPath); // so an uploaded QA cookie state reaches the agent
+  await linkBrowseStates(path, repoPath); // so an uploaded QA cookie state reaches the agent (and doesn't dirty the repo)
   return path;
 }
 

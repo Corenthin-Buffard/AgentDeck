@@ -1,7 +1,7 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync, lstatSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync, lstatSync, mkdirSync, readlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, isAbsolute } from "node:path";
 import { spawnSync } from "node:child_process";
 import { config } from "../src/config.ts";
 import { cleanupWorktree, createWorktree } from "../src/git.ts";
@@ -153,12 +153,18 @@ describe("multi-project worktree routing", () => {
     mkdirSync(join(REPO2, ".gstack", "browse-states"), { recursive: true });
     writeFileSync(join(REPO2, ".gstack", "browse-states", "qa.json"), '{"cookies":[],"pages":[]}');
     const wt = await createWorktree("t_cookie", "agentdeck/cookie", REPO2);
-    const seen = join(wt, ".gstack", "browse-states", "qa.json");
+    const linkPath = join(wt, ".gstack", "browse-states");
+    const seen = join(linkPath, "qa.json");
     // the worktree resolves the uploaded state through the link…
     expect(existsSync(seen)).toBe(true);
     expect(readFileSync(seen, "utf8")).toContain("cookies");
-    // …and it's a symlink (a live view of the shared dir), not a stale copy
-    expect(lstatSync(join(wt, ".gstack", "browse-states")).isSymbolicLink()).toBe(true);
+    // …it's a symlink (a live view of the shared dir), not a stale copy…
+    expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+    // …with an ABSOLUTE target (robust even if projects.json used a relative path)…
+    expect(isAbsolute(readlinkSync(linkPath))).toBe(true);
+    // …and it does NOT dirty the managed repo: info/exclude ignores .gstack/, so
+    // `safe` cleanup still works and a `commit` cleanup won't commit the symlink.
+    expect(g2(["status", "--porcelain"], wt).stdout.trim()).toBe("");
     g2(["worktree", "remove", "--force", wt]);
     g2(["branch", "-D", "agentdeck/cookie"]);
   });
