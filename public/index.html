@@ -219,9 +219,14 @@ async function openTask(id){
   const t=tasks.find(x=>x.id===id);
   const ev=await fetch(`/api/tasks/${id}/events`).then(r=>r.json()).catch(()=>({events:[]}));
   const df=await fetch(`/api/tasks/${id}/diff`).then(r=>r.json()).catch(()=>({diff:""}));
+  // Cap the diff so a task touching many files can't bloat the drawer DOM (events
+  // are already capped below). The full diff lives in the worktree.
+  const diff=df.diff||"";
+  const DIFF_CAP=4000;
+  const diffShown=diff.length>DIFF_CAP?diff.slice(0,DIFF_CAP)+`\n… ${diff.length-DIFF_CAP} more chars truncated (see the worktree)`:diff;
   showDrawer(`<h2>${esc(t.title)}</h2>
     <div class="meta"><span class="branch">⑂ ${esc(t.branch)}</span><span>phase ${t.phase}</span><span>${t.status}</span></div>
-    <label class="lbl">Diff</label><div class="q">${esc(df.diff||"(no changes)")}</div>
+    <label class="lbl">Diff</label><div class="q">${esc(diffShown||"(no changes)")}</div>
     <label class="lbl">Recent events</label>
     <div class="q">${ev.events.slice(-40).map(e=>`${new Date(e.ts).toLocaleTimeString()} · ${e.kind} · ${esc(String(e.data)).slice(0,120)}`).join("\n")||"(none)"}</div>
     <div style="display:flex;gap:8px">

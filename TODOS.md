@@ -9,8 +9,8 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **`resuming` state visual (DT2)** — **Priority: P3**
   The daemon sets `status: "resuming"` on restart (A2). The dashboard renders it with a generic chip; give it a distinct, non-alarming indicator (spinner, not error-red) so a daemon restart doesn't look like a failure.
 
-- **Cap / slice the diff in the drawer** — **Priority: P3**
-  `openTask()` renders `df.diff` with no length cap (unlike events/pendingQuestion). A task with a large diff bloats the DOM. Slice it (e.g. first ~4KB) with a "…truncated" note. (Adversarial review F5.)
+- **Escape the remaining `openTask` interpolations** — **Priority: P4**
+  `openTask()` interpolates `${t.phase}`, `${t.status}`, and `${id}` into the drawer HTML without `esc()`. Low risk today (all daemon-generated: fixed status/phase enums, `id` = `t_`+uuid — not user input), so it's defense-in-depth, not a live hole. Wrap them in `esc()` for consistency with the rest of the render. (Adversarial review, 2026-07-21.)
 
 - **Density at scale (DT3)** — **Priority: P4**
   With 20-40 agents, the flat list gets long. Make the "Cruising" section a compact, collapsible strip; virtualize if needed. Keep the attention hierarchy (waiting/error pinned).
@@ -67,5 +67,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **v0.1.3.7** (2026-07-20) — P2 **browser e2e proven** with a real agent: click "New task" → daemon spawns `claude` → it asks in prose → dashboard flips to `waiting` (WebSocket) → reply in the drawer → `claude --resume` → done → artifact (`color.txt`=`blue`), verified 3× incl. a self-contained run. Committed a reproducible harness at `docs/e2e/`. Surfaced a P3: "Clean up" dead-ends on done tasks with artifacts (dirty worktree).
 - **v0.1.3.8** (2026-07-20) — P2 **full gstack loop proven**: a real agent ran `/plan-eng-review` through the daemon — scope-gate `AskUserQuestion` → prose → `waiting` → answer → `claude --resume` → the complete four-section eng review. This run exposed a detection bug (a long skill turn that ends on a decision brief was mis-marked `done`, stranding the agent); fixed `looksLikeQuestion` with a structural decision-brief check + tail-display of the question, hardened over two adversarial rounds (19 `detect.ts` tests).
 - **v0.1.3.9** (2026-07-21) — P3 **"Clean up" dead-end fixed**: `cleanupWorktree` gained `safe`/`commit`/`force` modes so a done task's dirty worktree isn't a dead-end — commit preserves the agent's work on the branch, force discards. Hardened over two adversarial rounds (kill the live agent before a destructive cleanup; deterministic commit identity; structured `dirty` flag; guarded dashboard fetches). 5 `git.ts` integration tests.
+- **v0.1.3.10** (2026-07-21) — P3 **drawer diff capped** at 4000 chars (+ "…truncated" note) so a task touching many files can't bloat the drawer DOM; `esc()` still wraps the sliced string. Surfaced a P4 (escape the remaining `openTask` interpolations).
 - **A1** — proven: gstack skill runs headless, asks in prose, `resume` continues.
 - **A1b** — proven: gstack runs headless with `--dangerously-skip-permissions`; the launch config is the key.
