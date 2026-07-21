@@ -37,6 +37,9 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **[FIXED — pending ship] The QA-cookie upload now reaches the agent** — **Priority: P2**
   Confirmed the bug in `/qa` (2026-07-22): `$B state load qa` resolves `.gstack/browse-states/` via git-toplevel (= the worktree root), and a fresh worktree carries no `.gstack/`, so the state uploaded to the **main** repo was invisible — `State not found`. Fixed on `fix/qa-cookie-worktree`: `createWorktree` symlinks `<worktree>/.gstack/browse-states` → `<repo>/.gstack/browse-states`, so the agent's `$B state load qa` resolves to the shared, live dir (proven end-to-end: `State loaded: 1 cookies`). Upload path unchanged; cookies never committed. Will move to Completed at ship.
 
+- **Tighten `/api/upload` containment to the intended dir, not just the repo** — **Priority: P3**
+  The upload realpath check (`server.ts`) confirms the write lands under the project repo and not under `.git/`, but a pre-placed symlink at `<repo>/.gstack/browse-states` pointing WITHIN the repo (e.g. → `src/`) still passes — a token-holder + symlink-planter could drop a sanitized-filename file into another repo dir. Pre-existing (v0.2.0.0); needs a token AND local symlink access. Tighten: require the resolved dir to be under `resolve(<repo>/.gstack)` (or that no path component is a symlink), so a within-repo redirect is rejected too. (Codex review, 2026-07-22.)
+
 - **Split hook vs dashboard token is done; consider constant-time token compare** — **Priority: P4**
   The write gates compare the per-session token with `!==` (`server.ts`). For a 128-bit random secret on localhost a timing side-channel isn't realistically exploitable, but `crypto.timingSafeEqual` over equal-length buffers is a cheap belt-and-suspenders if the daemon is ever exposed beyond localhost. (Review finding, 2026-07-21.)
 
