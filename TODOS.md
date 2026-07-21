@@ -34,9 +34,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **Operational isolation (per-agent ports / RAM)** — **Priority: P4**
   Agents share the box; a runaway agent can starve others (port 3000, RAM, npm cache). Add per-agent port ranges + a memory cap when real contention shows up. (Not security — mono-user; it's about agents not stepping on each other.)
 
-- **[FIXED — pending ship] The QA-cookie upload now reaches the agent** — **Priority: P2**
-  Confirmed the bug in `/qa` (2026-07-22): `$B state load qa` resolves `.gstack/browse-states/` via git-toplevel (= the worktree root), and a fresh worktree carries no `.gstack/`, so the state uploaded to the **main** repo was invisible — `State not found`. Fixed on `fix/qa-cookie-worktree`: `createWorktree` symlinks `<worktree>/.gstack/browse-states` → `<repo>/.gstack/browse-states`, so the agent's `$B state load qa` resolves to the shared, live dir (proven end-to-end: `State loaded: 1 cookies`). Upload path unchanged; cookies never committed. Will move to Completed at ship.
-
 - **Tighten `/api/upload` containment to the intended dir, not just the repo** — **Priority: P3**
   The upload realpath check (`server.ts`) confirms the write lands under the project repo and not under `.git/`, but a pre-placed symlink at `<repo>/.gstack/browse-states` pointing WITHIN the repo (e.g. → `src/`) still passes — a token-holder + symlink-planter could drop a sanitized-filename file into another repo dir. Pre-existing (v0.2.0.0); needs a token AND local symlink access. Tighten: require the resolved dir to be under `resolve(<repo>/.gstack)` (or that no path component is a symlink), so a within-repo redirect is rejected too. (Codex review, 2026-07-22.)
 
@@ -63,6 +60,7 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Completed
 
+- **v0.2.0.1** (2026-07-22) — **QA cookies reach the agent.** `/qa` confirmed the v0.2.0.0 cookie flow didn't deliver: `$B state load qa` resolves `.gstack/browse-states/` via git-toplevel (the worktree root, which carries no `.gstack/`), so a state uploaded to the main repo was invisible (`State not found`). `createWorktree` now symlinks the worktree's `.gstack/browse-states` to the project repo's shared dir (proven end-to-end: `State loaded`), with an absolute target and `.gstack/` in each managed repo's local `info/exclude` so the untracked symlink never dirties the repo or gets committed by a cleanup. Codex adversarial caught the dirtiness/commit gap before ship. Surfaced a P3 (tighten upload containment to the intended dir).
 - **v0.1.0.0** (2026-07-19) — Daemon v0: worktree lifecycle, headless agent supervisor (Path A, prose + `claude --resume`), SQLite/WAL state, gstack phase mapping, Slack/Telegram notify, Master Inbox dashboard. A1 spike proving the prose+resume mechanic.
 - **v0.1.1.0** (2026-07-19) — Reply-drawer polish, a11y (`aria-live`), pending-question preview, keyboard submit; extracted `looksLikeQuestion` to a pure module; 15 unit tests.
 - **v0.1.2.0** (2026-07-20) — Opt-in Notification-hook wiring; hardened after review (one-live-child-per-task, opt-in default, guarded settings write).

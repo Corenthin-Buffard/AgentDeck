@@ -1,6 +1,19 @@
 # Changelog
 
-## [0.2.0.0] - 2026-07-22
+## [0.2.0.1] - 2026-07-22
+
+### Fixed
+- **QA cookies now actually reach the agent.** `/qa` confirmed the v0.2.0.0 cookie flow
+  didn't work: an uploaded browse-state lands in the main repo's `.gstack/browse-states/`,
+  but agents run in per-task worktrees and `$B state load qa` resolves that path via
+  git-toplevel (the worktree root, which carries no `.gstack/`) — so the agent found nothing
+  and QA ran logged-out. `createWorktree` now symlinks the worktree's
+  `.gstack/browse-states` to the project repo's shared dir, so `$B state load qa` sees the
+  uploaded state (proven end-to-end: `State not found` → `State loaded`). The symlink target
+  is absolute (works with a relative `projects.json` path), and `.gstack/` is added to each
+  managed repo's local `info/exclude` — so the untracked symlink never dirties the repo, never
+  strands "Clean up", and can't be committed into your project branch by a cleanup. Upload path
+  unchanged; cookies are never committed.
 
 ### Added
 - **Drive many repos from one daemon.** Drop a `projects.json` (`[{ id, path, label? }]`)
