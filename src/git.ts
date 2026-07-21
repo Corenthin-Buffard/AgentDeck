@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { config } from "./config.ts";
 
 // Thin, honest wrappers around git. Isolation invariant: 1 task = 1 branch =
@@ -14,20 +14,34 @@ async function git(args: string[], cwd = config.targetRepo): Promise<{ ok: boole
   return { ok: code === 0, out: out.trim(), err: err.trim() };
 }
 
-export async function baseBranch(): Promise<string> {
-  const head = await git(["symbolic-ref", "refs/remotes/origin/HEAD"]);
+export async function baseBranch(cwd = config.targetRepo): Promise<string> {
+  const head = await git(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd);
   if (head.ok) return head.out.replace("refs/remotes/origin/", "");
   for (const b of ["main", "master"]) {
-    if ((await git(["rev-parse", "--verify", b])).ok) return b;
+    if ((await git(["rev-parse", "--verify", b], cwd)).ok) return b;
   }
   return "main";
 }
 
-/** Create branch + worktree for a task. Returns the worktree path. */
-export async function createWorktree(taskId: string, branch: string): Promise<string> {
-  const base = await baseBranch();
+/**
+ * Given any worktree, return its main repo root — derived from the worktree
+ * itself (`--git-common-dir`), not the registry. That keeps cleanup/diff
+ * self-sufficient: they work even after the project is removed from projects.json.
+ */
+async function repoRootOf(worktree: string): Promise<string> {
+  // --path-format=absolute (git 2.31+) so the common dir isn't relative to cwd;
+  // fall back to plain + resolve() for older git.
+  let r = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], worktree);
+  if (!r.ok) r = await git(["rev-parse", "--git-common-dir"], worktree);
+  if (!r.ok) return worktree; // not a worktree we can resolve — operate in place
+  return dirname(resolve(worktree, r.out)); // <repo>/.git → <repo>
+}
+
+/** Create branch + worktree for a task in `repoPath`. Returns the worktree path. */
+export async function createWorktree(taskId: string, branch: string, repoPath = config.targetRepo): Promise<string> {
+  const base = await baseBranch(repoPath);
   const path = join(config.worktreesDir, taskId);
-  const r = await git(["worktree", "add", "-b", branch, path, base]);
+  const r = await git(["worktree", "add", "-b", branch, path, base], repoPath);
   if (!r.ok) throw new Error(`git worktree add failed: ${r.err || r.out}`);
   return path;
 }
@@ -71,11 +85,14 @@ export async function cleanupWorktree(
     if (!ci.ok) return { removed: false, reason: `could not commit work: ${ci.err || ci.out}` };
   }
 
+  // `worktree remove` / `branch` must run from the main repo, not the worktree
+  // being removed. Derive it from the worktree so we don't depend on the registry.
+  const repo = await repoRootOf(worktree);
   const force = mode === "force";
-  const rm = await git(["worktree", "remove", ...(force ? ["--force"] : []), worktree]);
+  const rm = await git(["worktree", "remove", ...(force ? ["--force"] : []), worktree], repo);
   if (!rm.ok) return { removed: false, reason: `worktree remove refused: ${rm.err}` };
 
-  const del = await git(["branch", force ? "-D" : "-d", branch]); // -d refuses unmerged
+  const del = await git(["branch", force ? "-D" : "-d", branch], repo); // -d refuses unmerged
   if (!del.ok) {
     // Expected in `commit` mode: the branch now has unmerged work, so we keep it.
     const kept = mode === "commit"
@@ -87,7 +104,9 @@ export async function cleanupWorktree(
 }
 
 export async function diffStat(worktree: string): Promise<string> {
-  const base = await baseBranch();
+  // A worktree shares the repo's refs, so base + diff resolve in the worktree cwd
+  // — no need to know which registry project it belongs to.
+  const base = await baseBranch(worktree);
   const tracked = await git(["diff", "--stat", base], worktree);
   // `git diff` ignores untracked files, so a brand-new file an agent just wrote
   // is invisible. Surface them from `git status`. Use -z (NUL-separated, no

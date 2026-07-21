@@ -12,8 +12,17 @@ export type Status =
   | "resuming"   // daemon restarted / reconnecting (A2)
   | "stopped";   // suspended by the user
 
+/** A registered repo an agent can operate on. The registry (projects.json, or a
+ *  synthesized `default`) replaces the old single targetRepo. */
+export interface Project {
+  id: string;              // stable routing key (DB column, dashboard filter)
+  path: string;            // absolute path to the git repo
+  label: string;           // human name shown in the dashboard (defaults to basename)
+}
+
 export interface Task {
   id: string;              // AgentDeck-generated taskId, propagated everywhere (NOT the branch)
+  project: string;         // Project.id this task's branch/worktree lives in
   title: string;
   prompt: string;          // the initial instruction handed to the agent
   branch: string;
@@ -40,8 +49,10 @@ export interface AgentDeckConfig {
   dataDir: string;
   host: string;            // bind address — 127.0.0.1 by default (A3: localhost + SSH tunnel)
   port: number;
-  targetRepo: string;      // the repo whose branches/worktrees agents operate on
+  targetRepo: string;      // legacy single-repo default; seeds the `default` project
+  projects: Project[];     // the project registry — what agents can operate on
   worktreesDir: string;
+  uploadsDir: string;      // local→VPS uploads land here (per-project subdir)
   claudeBin: string;
   // ── A1b (proven): the launch config that makes agents run gstack headlessly ──
   // The spike proved gstack only resolves + runs unattended with permissions
