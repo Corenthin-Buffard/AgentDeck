@@ -28,9 +28,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Security / hardening
 
-- **Shared-secret token on the hook endpoint (A3 / T5)** — **Priority: P3**
-  `/hooks/notification` is unauthenticated. Localhost-bound so low risk today, but if hooks get enabled/exposed, any local process could forge a `waiting`. Add a per-session token written into the settings file and checked in the handler. (Deferred with A3.)
-
 - **Pin release-workflow actions to commit SHAs** — **Priority: P4**
   `.github/workflows/release.yml` runs three actions (`actions/checkout@v4`, `oven-sh/setup-bun@v2`, `softprops/action-gh-release@v2`) pinned to mutable major tags in a `contents: write` job. Supply-chain-hardened choice is a full commit SHA for each (add Dependabot to bump them). Major-tag pinning is fine for now; revisit if the repo gets more contributors. (Review finding, 2026-07-20.)
 
@@ -68,5 +65,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **v0.1.3.8** (2026-07-20) — P2 **full gstack loop proven**: a real agent ran `/plan-eng-review` through the daemon — scope-gate `AskUserQuestion` → prose → `waiting` → answer → `claude --resume` → the complete four-section eng review. This run exposed a detection bug (a long skill turn that ends on a decision brief was mis-marked `done`, stranding the agent); fixed `looksLikeQuestion` with a structural decision-brief check + tail-display of the question, hardened over two adversarial rounds (19 `detect.ts` tests).
 - **v0.1.3.9** (2026-07-21) — P3 **"Clean up" dead-end fixed**: `cleanupWorktree` gained `safe`/`commit`/`force` modes so a done task's dirty worktree isn't a dead-end — commit preserves the agent's work on the branch, force discards. Hardened over two adversarial rounds (kill the live agent before a destructive cleanup; deterministic commit identity; structured `dirty` flag; guarded dashboard fetches). 5 `git.ts` integration tests.
 - **v0.1.3.10** (2026-07-21) — P3 **drawer diff capped** at 4000 chars (+ "…truncated" note) so a task touching many files can't bloat the drawer DOM; `esc()` still wraps the sliced string. Surfaced a P4 (escape the remaining `openTask` interpolations).
+- **v0.1.3.11** (2026-07-21) — P3 **hook endpoints authenticated** (A3/T5): a per-session `hookToken` in the hook URL (`?token=`), settings file written `0600`, both `/hooks/*` POSTs 403 without the matching secret. Hardened over two adversarial rounds (empty-token-disables-gate footgun via `??`→`||`; write→chmod TOCTOU via `rmSync` first).
 - **A1** — proven: gstack skill runs headless, asks in prose, `resume` continues.
 - **A1b** — proven: gstack runs headless with `--dangerously-skip-permissions`; the launch config is the key.
