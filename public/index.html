@@ -229,7 +229,24 @@ async function openTask(id){
       <button class="btn danger" onclick="del('${id}')">Delete</button></div>`);
 }
 async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST"});closeDrawer();}
-async function del(id){if(!confirm("Delete worktree + branch?"))return;const r=await fetch(`/api/tasks/${id}`,{method:"DELETE"});const j=await r.json();if(!j.removed)alert(j.reason||"refused");closeDrawer();}
+async function del(id){
+  const call=async(q)=>{try{return await (await fetch(`/api/tasks/${id}${q}`,{method:"DELETE"})).json();}catch{return{removed:false,reason:"request failed"};}};
+  // Try a safe removal first (refuses if the worktree holds the agent's uncommitted work).
+  let j=await call("");
+  if(j.removed){closeDrawer();return;}
+  if(!j.dirty){alert(j.reason||"refused");return;}
+  // The worktree has the agent's work and nothing else holds it. Offer a path forward.
+  if(confirm("This task's worktree has the agent's uncommitted work.\n\nOK: commit it to the branch, then remove the worktree (work is kept on the branch).\nCancel: choose to discard instead.")){
+    j=await call("?mode=commit");
+    if(j.removed){closeDrawer();alert(j.reason||"Committed to the branch and cleaned up.");return;}
+    alert((j.reason||"commit failed")+"\n\nYou can still discard it instead.");
+    // fall through to the discard offer
+  }
+  if(confirm("Discard this task and force-remove it?\n\nThis permanently deletes the worktree AND the branch — including any committed-but-unmerged work, not just the uncommitted changes.")){
+    j=await call("?mode=force");
+    if(j.removed)closeDrawer();else alert(j.reason||"refused");
+  }
+}
 
 // ── live ──
 function connect(){

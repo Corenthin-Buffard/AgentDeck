@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { store } from "./db.ts";
-import { createWorktree, cleanupWorktree, type CleanupResult } from "./git.ts";
-import { launchTask } from "./agent.ts";
+import { createWorktree, cleanupWorktree, type CleanupResult, type CleanupMode } from "./git.ts";
+import { launchTask, killExisting } from "./agent.ts";
 import { emitUpdate } from "./bus.ts";
 import type { Task } from "./types.ts";
 
@@ -26,10 +26,14 @@ export async function createTask(title: string, prompt: string): Promise<Task> {
   return task;
 }
 
-export async function removeTask(id: string): Promise<CleanupResult> {
+export async function removeTask(id: string, mode: CleanupMode = "safe"): Promise<CleanupResult> {
   const t = store.getTask(id);
   if (!t) return { removed: false, reason: "not found" };
-  const res = await cleanupWorktree(t.worktree, t.branch);
+  // commit/force will destroy the worktree — stop any live agent first so we don't
+  // orphan the child in the running map (leaking a concurrency slot) or race its
+  // writes. safe mode refuses a dirty worktree, so it never reaches removal.
+  if (mode !== "safe") killExisting(id);
+  const res = await cleanupWorktree(t.worktree, t.branch, mode);
   if (res.removed) { store.deleteTask(id); }
   emitUpdate(id);
   return res;

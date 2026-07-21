@@ -2,8 +2,10 @@ import { join } from "node:path";
 import { config } from "./config.ts";
 
 // Thin, honest wrappers around git. Isolation invariant: 1 task = 1 branch =
-// 1 worktree, never shared. Cleanup NEVER force-deletes (eng-review finding):
-// a dirty or unmerged worktree is surfaced, not destroyed.
+// 1 worktree, never shared. Cleanup never force-deletes BY DEFAULT (eng-review
+// finding): a dirty or unmerged worktree is surfaced, not destroyed. The caller
+// can opt into "commit" (save the agent's work onto the branch, then remove) or
+// "force" (discard) — both are explicit, never the default.
 
 async function git(args: string[], cwd = config.targetRepo): Promise<{ ok: boolean; out: string; err: string }> {
   const p = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -30,18 +32,57 @@ export async function createWorktree(taskId: string, branch: string): Promise<st
   return path;
 }
 
-export interface CleanupResult { removed: boolean; reason?: string }
+export interface CleanupResult { removed: boolean; reason?: string; dirty?: boolean }
 
-/** Remove worktree + branch. Refuses (does not force) if dirty or unmerged. */
-export async function cleanupWorktree(worktree: string, branch: string): Promise<CleanupResult> {
+// safe   — refuse a dirty worktree (default; nothing is destroyed).
+// commit — stage + commit the agent's work onto the branch, then remove the
+//          worktree. The branch is kept (it now holds the work).
+// force  — remove the worktree and delete the branch, discarding the work.
+export type CleanupMode = "safe" | "commit" | "force";
+
+/**
+ * Remove worktree + branch. A done task's worktree is normally dirty (the agent's
+ * artifact lives there uncommitted, and nothing else holds it), so `safe` refuses
+ * it. `commit` preserves that work on the branch first; `force` discards it. Both
+ * non-safe modes are explicit caller opt-ins, never the default.
+ */
+export async function cleanupWorktree(
+  worktree: string,
+  branch: string,
+  mode: CleanupMode = "safe",
+): Promise<CleanupResult> {
   const status = await git(["status", "--porcelain"], worktree);
-  if (status.ok && status.out.length > 0) {
-    return { removed: false, reason: "worktree is dirty — needs review before removal" };
+  const dirty = status.ok && status.out.length > 0;
+
+  if (dirty && mode === "safe") {
+    // `dirty: true` lets callers offer commit/discard without matching this string.
+    return { removed: false, dirty: true, reason: "worktree is dirty — needs review before removal" };
   }
-  const rm = await git(["worktree", "remove", worktree]); // no --force
+  if (dirty && mode === "commit") {
+    const add = await git(["add", "-A"], worktree);
+    if (!add.ok) return { removed: false, reason: `could not stage work: ${add.err || add.out}` };
+    // Supply an identity so the save works even in a repo with no user.name/email
+    // configured (fresh VPS, locked-down CI) and never lands a bogus user@host author.
+    const ci = await git(
+      ["-c", "user.name=AgentDeck", "-c", "user.email=agentdeck@localhost",
+        "commit", "-m", "agentdeck: save task work before cleanup"],
+      worktree,
+    );
+    if (!ci.ok) return { removed: false, reason: `could not commit work: ${ci.err || ci.out}` };
+  }
+
+  const force = mode === "force";
+  const rm = await git(["worktree", "remove", ...(force ? ["--force"] : []), worktree]);
   if (!rm.ok) return { removed: false, reason: `worktree remove refused: ${rm.err}` };
-  const del = await git(["branch", "-d", branch]); // -d refuses unmerged; never -D
-  if (!del.ok) return { removed: true, reason: `worktree removed, but branch kept (unmerged): ${del.err}` };
+
+  const del = await git(["branch", force ? "-D" : "-d", branch]); // -d refuses unmerged
+  if (!del.ok) {
+    // Expected in `commit` mode: the branch now has unmerged work, so we keep it.
+    const kept = mode === "commit"
+      ? `worktree removed; the agent's work is saved on branch ${branch}`
+      : `worktree removed, but branch kept (unmerged): ${del.err}`;
+    return { removed: true, reason: kept };
+  }
   return { removed: true };
 }
 

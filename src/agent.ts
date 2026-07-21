@@ -32,7 +32,7 @@ function schedule(spawnFn: () => void): void { waitQueue.push(spawnFn); pump(); 
 // Notification-driven `waiting` fires mid-turn) must NOT spawn a second
 // `claude --resume` on the same session — kill the old one first. Removing it
 // from `running` here means its exit handler (identity-guarded) becomes a no-op.
-function killExisting(taskId: string): void {
+export function killExisting(taskId: string): void {
   const c = running.get(taskId);
   if (c) { running.delete(taskId); try { c.kill("SIGTERM"); } catch { /* already gone */ } }
 }
