@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0.2] - 2026-07-22
+
+### Security
+- **Upload destinations are now pinned to the exact intended dir.** The `/api/upload`
+  path check confirmed the write landed under the project repo and not under `.git/`,
+  but a pre-placed symlink at `<repo>/.gstack/browse-states` pointing elsewhere *within*
+  the repo (e.g. → `src/`) still slipped through — a token-holder with local symlink
+  access could drop a file into another repo dir. The check now requires the resolved
+  directory to EQUAL the canonical `realpath(trusted base) + literal subpath`, so any
+  symlinked path component is rejected: out of the repo, into `.git/`, or to another
+  in-repo dir alike. (A residual TOCTOU race remains, inherent to pathname-based writes;
+  tracked in TODOS for a future fd-based write.)
+
 ## [0.2.0.1] - 2026-07-22
 
 ### Fixed
