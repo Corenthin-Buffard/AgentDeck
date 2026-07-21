@@ -72,6 +72,13 @@ export function startServer() {
       }
 
       // ── Hooks (optional enhancement; stream detection also works alone) ──
+      // Both hook endpoints require the per-session token (query string). Without
+      // it any local process could POST a forged `waiting`; the secret lives only
+      // in the 0600 settings file the daemon hands to its own agents.
+      if (pathname.startsWith("/hooks/") && req.method === "POST" &&
+          url.searchParams.get("token") !== config.hookToken) {
+        return new Response(null, { status: 403 });
+      }
       if (pathname === "/hooks/notification" && req.method === "POST") {
         const b = await req.json().catch(() => ({}));
         const t = b?.session_id ? findBySession(b.session_id) : undefined;
