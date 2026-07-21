@@ -1,6 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import { mkdirSync, renameSync, realpathSync, rmSync } from "node:fs";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 // Embed the dashboard into the binary as a string so `bun build --compile`
 // yields a self-contained executable (no sibling public/ dir needed at runtime).
@@ -28,13 +28,14 @@ function escAttr(s: string): string {
  * Resolve where an upload should land, or return null if the request tries to
  * escape its root. `dest` empty → per-project uploads dir; `dest` === the
  * browse-states convention → the project repo's browse-states dir. Returns the
- * final `target` plus the trusted `base` it must stay under (uploadsDir or the
- * repo). This does LEXICAL containment only — the caller must additionally
- * realpath-check the created directory against `base`, because a symlinked
- * directory component would pass a lexical check yet redirect the write out of
- * the root (e.g. `.gstack/browse-states` → `.git/hooks`).
+ * final `target`, the trusted `base` (uploadsDir or the repo — operator-configured,
+ * so we trust symlinks in it), and the intended `root` dir the file must land in.
+ * This does LEXICAL containment only — the caller must additionally realpath-check
+ * that `root` is exactly the canonical `base`+subpath, because a symlinked
+ * directory component would pass a lexical check yet redirect the write elsewhere
+ * (out of the repo, into `.git/`, or to another dir like `src/`).
  */
-function resolveUploadPath(project: { id: string; path: string }, dest: string, filename: string): { target: string; base: string } | null {
+function resolveUploadPath(project: { id: string; path: string }, dest: string, filename: string): { target: string; base: string; root: string } | null {
   const safeName = basename(filename).replace(/[^\w.\-]/g, "_").replace(/^\.+/, "") || "upload";
   const norm = dest.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
   let root: string, base: string;
@@ -51,7 +52,7 @@ function resolveUploadPath(project: { id: string; path: string }, dest: string, 
   const withinRoot = target === root || target.startsWith(root + sep);
   if (!withinRoot) return null;
   if (target.split(sep).includes(".git")) return null; // never write into a .git dir
-  return { target, base };
+  return { target, base, root };
 }
 
 const clients = new Set<ServerWebSocket<unknown>>();
@@ -166,22 +167,22 @@ export function startServer() {
         if (file.size > MAX_UPLOAD) return json({ error: `file too large (max ${MAX_UPLOAD / 1024 / 1024}MB)` }, 413);
         const resolved = resolveUploadPath(project, dest, file.name);
         if (!resolved) return json({ error: "destination not allowed" }, 400);
-        const { target, base } = resolved;
+        const { target, base, root } = resolved;
         try {
-          const dir = target.slice(0, target.lastIndexOf(sep));
-          mkdirSync(dir, { recursive: true });
-          // Symlink defense: resolve symlinks in the *created* dir and re-check it
-          // is still inside the trusted base AND not inside any `.git`. A lexical
-          // check alone is bypassable by a symlinked directory component (e.g.
-          // `.gstack/browse-states` → `.git/hooks` → RCE on the next git op).
-          const realBase = realpathSync(base);
-          const realDir = realpathSync(dir);
-          if ((realDir !== realBase && !realDir.startsWith(realBase + sep)) || realDir.split(sep).includes(".git")) {
+          mkdirSync(root, { recursive: true });
+          // Symlink defense: after resolving symlinks, the created dir must BE the
+          // canonical intended dir — realpath of the trusted base (operator-configured)
+          // plus the LITERAL subpath. Any symlinked component makes realpath differ,
+          // which rejects every redirect: out of the repo, into `.git/`, or to another
+          // in-repo dir like `src/`. A lexical check alone (or an under-base check) is
+          // bypassable by a pre-placed symlink at `.gstack/browse-states`.
+          const expected = join(realpathSync(base), relative(base, root));
+          if (realpathSync(root) !== expected) {
             return json({ error: "destination not allowed" }, 400);
           }
           // Write to a temp name then rename over the target so a pre-placed
           // symlink at `target` (the leaf) can't redirect the write either.
-          const tmp = join(dir, `.tmp-${randomUUID()}`);
+          const tmp = join(root, `.tmp-${randomUUID()}`);
           try {
             await Bun.write(tmp, file);
             renameSync(tmp, target);

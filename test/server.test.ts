@@ -248,6 +248,14 @@ test("/api/upload browse-states: lands in the repo, but symlinked dirs are rejec
     symlinkSync(join(repo, ".git/hooks"), join(repo, ".gstack/browse-states"));
     expect((await put("post-checkout")).status).toBe(400);
     expect(existsSync(join(repo, ".git/hooks/post-checkout"))).toBe(false);
+
+    // and a WITHIN-repo redirect (→ src/) → also rejected (the P3 hardening:
+    // "under the repo and not .git" used to pass this; exact-dir match rejects it)
+    rmSync(join(repo, ".gstack/browse-states"), { force: true });
+    mkdirSync(join(repo, "src"), { recursive: true });
+    symlinkSync(join(repo, "src"), join(repo, ".gstack/browse-states"));
+    expect((await put("payload.js")).status).toBe(400);
+    expect(existsSync(join(repo, "src/payload.js"))).toBe(false); // no in-repo overwrite
   } finally {
     config.projects[0].path = savedPath;
     config.uploadsDir = savedUploads;
