@@ -52,7 +52,11 @@ export function startServer() {
       if (m) {
         const [, id, action] = m;
         if (!store.getTask(id)) return json({ error: "not found" }, 404);
-        if (req.method === "DELETE") return json(await removeTask(id));
+        if (req.method === "DELETE") {
+          const q = url.searchParams.get("mode");
+          const mode = q === "commit" || q === "force" ? q : "safe";
+          return json(await removeTask(id, mode));
+        }
         if (action === "answer" && req.method === "POST") {
           const b = await req.json().catch(() => ({}));
           if (!b.text) return json({ error: "text required" }, 400);

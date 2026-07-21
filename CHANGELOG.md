@@ -1,6 +1,26 @@
 # Changelog
 
-## [0.1.3.8] - 2026-07-20
+## [0.1.3.9] - 2026-07-21
+
+### Fixed
+- **"Clean up" no longer dead-ends on a done task.** A done task's worktree is always dirty
+  (the agent's artifact lives there uncommitted, and nothing else holds it), so
+  `cleanupWorktree` safely refused it and the dashboard button just alerted with no way
+  forward. `cleanupWorktree` now takes a `mode`: `safe` (default, refuse — nothing destroyed),
+  **`commit`** (stage + commit the agent's work onto the branch, then remove the worktree —
+  work preserved and PR-able later), or `force` (discard worktree + branch). The dashboard's
+  "Clean up" / "Delete" tries `safe`, then on a dirty worktree offers **commit** (recommended)
+  or a **discard** escape. `DELETE /api/tasks/:id?mode=commit|force` drives it (validated;
+  defaults to `safe`). The `commit` uses a deterministic `AgentDeck` git identity so it works
+  even in a repo with none configured.
+
+### Hardened (review)
+- **Cleaning up a running task stops its agent first.** `commit`/`force` now `killExisting`
+  the live `claude` child before removing the worktree, so it can't be orphaned in the
+  concurrency pool or race the `git commit`. Plus: guarded dashboard fetches, a structured
+  `dirty` flag (no message-string coupling), a commit-failure → discard fallback, and honest
+  discard copy (it deletes committed-but-unmerged branch work too). 5 `git.ts` integration
+  tests cover all three modes; hardened over two adversarial review rounds.
 
 ### Fixed
 - **A heavy gstack skill no longer strands as `done` when it stops to ask.** The daemon
