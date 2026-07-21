@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3.10] - 2026-07-21
+
+### Fixed
+- **The drawer diff is capped at 4000 chars.** `openTask()` rendered `df.diff` uncapped
+  (events were already capped), so a task touching many files bloated the drawer DOM. It now
+  slices to 4000 chars with a "… N more chars truncated (see the worktree)" note. `esc()` still
+  wraps the sliced string (slice-then-escape, so nothing is half-escaped).
+
 ## [0.1.3.9] - 2026-07-21
 
 ### Fixed
