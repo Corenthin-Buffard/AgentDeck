@@ -4,6 +4,12 @@
   "type": "module",
   "private": true,
   "description": "AgentDeck — self-hosted, gstack-native orchestrator for parallel Claude Code agents. Air-traffic-control board for your VPS.",
+  "license": "MIT",
+  "author": "Corenthin Buffard",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Corenthin-Buffard/AgentDeck.git"
+  },
   "scripts": {
     "test": "bun test",
     "build": "bun build src/daemon.ts --compile --outfile dist/agentdeck",

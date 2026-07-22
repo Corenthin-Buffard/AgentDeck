@@ -43,7 +43,7 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 ## Distribution (OSS)
 
 - **Make the repo public** — **Priority: P2**
-  The release + binaries work, but the repo is private, so the README's anonymous `curl .../releases/latest/download/...` install URL 404s. `gh repo edit Corenthin-Buffard/AgentDeck --visibility public` unblocks distribution. README + LICENSE (MIT) are public-ready, the codebase is fully rebranded to AgentDeck (no `gorch` left), and no secrets are tracked. Deliberately deferred (2026-07-20).
+  The release pipeline + binaries are ready; flipping visibility to public (`gh repo edit Corenthin-Buffard/AgentDeck --visibility public`) unblocks the README's anonymous `curl .../releases/latest/download/...` install URL. README + LICENSE (MIT) are public-ready, the codebase is fully rebranded to AgentDeck, and no secrets are tracked in the tree or history.
 
 ## Notifications
 
