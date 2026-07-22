@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.2.1.0] - 2026-07-22
+
+### Added
+- **Plan-review tracking on the dashboard.** Each task card now shows which of the three gstack
+  plan reviews — CEO / Design / Eng — its branch has been through, as calm monochrome marks under
+  the plan segment: `○` not run, `✓` clean, `⚠` ran-with-issues, trailing `*` = the review predates
+  current HEAD. Eng is emphasized (it's the one that gates `/ship`). The daemon auto-detects this by
+  reading the branch's gstack review log (`gstack-review-read`, run in the task's worktree) at each
+  turn-end and once on (re)attach — no clicking, no manual state. Hover or screen-reader carries the
+  detail (e.g. "Eng review: 13 issues, 0 unresolved"). The reader resolves from `PATH` first
+  (override with `AGENTDECK_REVIEW_READ_BIN`); if it's missing the daemon logs once at boot and the
+  marks simply stay `○`.
+
+### Internal
+- New `plan_reviews` column on `tasks`, added by an additive migration (independent of the `project`
+  column, so a DB at any prior schema upgrades cleanly). Detection is best-effort and bounded — a 4s
+  timeout+kill on the reader, an in-flight guard so at most one reader runs per task, and writes only
+  on a clean, complete read (a killed or non-`clean`-exit reader never clobbers good marks). Short-SHA
+  staleness compares by prefix so `git`'s auto-growing short hash doesn't flag the same commit stale.
+  Pre-landing review (Claude + Codex, cross-model) hardened all of the above before merge.
+
 ## [0.2.0.2] - 2026-07-22
 
 ### Security
