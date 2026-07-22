@@ -3,6 +3,7 @@ import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { resumeTask } from "./agent.ts";
 import { startServer } from "./server.ts";
+import { startAutoCleanSweep } from "./cleanup.ts";
 import { hookSettings } from "./hooks-config.ts";
 
 // AgentDeck daemon entry. Runs as a systemd --user service on the VPS so agents
@@ -60,3 +61,8 @@ for (const t of store.listTasks()) {
 }
 
 startServer();
+
+// Opt-in: periodically drop merged done tasks (worktree + branch + row). No-op
+// unless AGENTDECK_AUTO_CLEAN_MERGED=true. Started after the server so a slow
+// first sweep never delays the daemon coming up.
+startAutoCleanSweep();

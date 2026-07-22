@@ -77,6 +77,9 @@ export const config: AgentDeckConfig = {
   // to "never checks" rather than crashing).
   reviewReadBin: process.env.AGENTDECK_REVIEW_READ_BIN
     ?? (Bun.which("gstack-review-read") ?? join(home, ".claude/skills/gstack/bin/gstack-review-read")),
+  // Auto-clean a done task's worktree + branch + row once its branch is merged.
+  // OFF by default — it's a silent destructive sweep, so the operator opts in.
+  autoCleanMerged: process.env.AGENTDECK_AUTO_CLEAN_MERGED === "true",
 
   // ── A1b launch config (PROVEN by the spike) ─────────────────────────────
   // gstack skills only resolve + run in a headless agent when permissions are
