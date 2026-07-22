@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { spawnSync } from "node:child_process";
 import { config } from "../src/config.ts";
-import { cleanupWorktree, createWorktree } from "../src/git.ts";
+import { cleanupWorktree, createWorktree, isBranchMerged } from "../src/git.ts";
 
 // cleanupWorktree runs git in config.targetRepo. Point it at a throwaway repo for
 // this file, then restore — `config` is a shared singleton, so leaving it changed
@@ -93,6 +93,112 @@ describe("cleanupWorktree", () => {
     const r = await cleanupWorktree(wt, branch, "safe");
     expect(r.removed).toBe(true);
     expect(branchExists(branch)).toBe(false); // merged (== base) → -d succeeds
+  });
+
+  // "merged" is the auto-clean mode: the caller has PROVEN the branch merged, so it
+  // force-deletes the branch (squash-safe) — but still refuses a dirty/unreadable
+  // worktree so a surprise uncommitted artifact is never nuked.
+  test("merged mode removes a clean worktree and force-deletes the branch", async () => {
+    const wt = join(WTS, "merged-clean");
+    const branch = "agentdeck/merged-clean";
+    g(["worktree", "add", "-b", branch, wt, "HEAD"]); // clean
+    const r = await cleanupWorktree(wt, branch, "merged");
+    expect(r.removed).toBe(true);
+    expect(branchExists(branch)).toBe(false);
+  });
+
+  test("merged mode REFUSES a dirty worktree — preserves unexpected work", async () => {
+    const { wt, branch } = dirtyWorktree("merged-dirty");
+    const r = await cleanupWorktree(wt, branch, "merged");
+    expect(r.removed).toBe(false);
+    expect(r.reason).toMatch(/dirty/);
+    expect(branchExists(branch)).toBe(true); // preserved
+    g(["worktree", "remove", "--force", wt]);
+    g(["branch", "-D", branch]);
+  });
+
+  test("merged mode REFUSES when git status can't be read (fail-safe, not 'clean')", async () => {
+    // A dir that isn't a git worktree → `git status` errors. The older modes read
+    // that as clean (dirty=false); merged must refuse instead.
+    const bogus = join(WTS, "not-a-worktree");
+    mkdirSync(bogus, { recursive: true });
+    const r = await cleanupWorktree(bogus, "agentdeck/none", "merged");
+    expect(r.removed).toBe(false);
+    expect(r.reason).toMatch(/could not read|status/i);
+  });
+
+  // The sweep passes the exact SHA isBranchMerged proved, and the branch delete is a
+  // compare-and-swap: a branch that moved since the proof is never force-deleted.
+  test("merged mode with a matching expectedSha removes via compare-and-swap", async () => {
+    const wt = join(WTS, "merged-cas");
+    const branch = "agentdeck/merged-cas";
+    g(["worktree", "add", "-b", branch, wt, "HEAD"]);
+    const sha = g(["rev-parse", branch]).stdout.trim();
+    const r = await cleanupWorktree(wt, branch, "merged", sha);
+    expect(r.removed).toBe(true);
+    expect(branchExists(branch)).toBe(false);
+  });
+
+  test("merged mode REFUSES when the branch moved since the proof (stale expectedSha)", async () => {
+    const wt = join(WTS, "merged-moved");
+    const branch = "agentdeck/merged-moved";
+    g(["worktree", "add", "-b", branch, wt, "HEAD"]);
+    const stale = "0".repeat(40); // never the real tip
+    const r = await cleanupWorktree(wt, branch, "merged", stale);
+    expect(r.removed).toBe(false);
+    expect(r.reason).toMatch(/moved/);
+    expect(branchExists(branch)).toBe(true); // preserved, nothing removed
+    g(["worktree", "remove", "--force", wt]);
+    g(["branch", "-D", branch]);
+  });
+});
+
+// isBranchMerged is gh-PROVEN ONLY (a merged PR whose head == the local tip) — there
+// is deliberately NO git --is-ancestor fallback (it can't tell a merged branch from a
+// zero-commit one, and this triggers a destructive delete). In this suite the origin
+// is a local bare repo (not GitHub), so `gh` can't resolve it → the tests assert the
+// fail-safe: being an ancestor of origin/base is NOT enough; without a PR → null.
+// The positive gh path (headRefOid == tip) is verified live against the real repo.
+describe("isBranchMerged (gh-proven only, fail-safe)", () => {
+  const ORIGIN = mkdtempSync(join(tmpdir(), "agentdeck-origin-"));
+  const REPO3 = mkdtempSync(join(tmpdir(), "agentdeck-merged-repo-"));
+  const g3 = (args: string[], cwd = REPO3) => spawnSync("git", args, { cwd, encoding: "utf8" });
+
+  beforeAll(() => {
+    spawnSync("git", ["init", "--bare", "-b", "main", ORIGIN], { encoding: "utf8" });
+    spawnSync("git", ["clone", "-q", ORIGIN, REPO3], { encoding: "utf8" });
+    g3(["config", "user.email", "t@test.local"]);
+    g3(["config", "user.name", "t"]);
+    writeFileSync(join(REPO3, "README.md"), "# base\n");
+    g3(["add", "-A"]); g3(["commit", "-qm", "init"]);
+    g3(["push", "-q", "-u", "origin", "main"]);
+    // a branch that IS an ancestor of origin/main (would fool a --is-ancestor fallback)
+    g3(["checkout", "-q", "-b", "agentdeck/merged"]);
+    writeFileSync(join(REPO3, "m.txt"), "m\n");
+    g3(["add", "-A"]); g3(["commit", "-qm", "merged work"]);
+    g3(["checkout", "-q", "main"]);
+    g3(["merge", "-q", "--no-ff", "-m", "merge", "agentdeck/merged"]);
+    g3(["push", "-q", "origin", "main"]);
+    // an OPEN (unmerged) branch
+    g3(["checkout", "-q", "-b", "agentdeck/open"]);
+    writeFileSync(join(REPO3, "o.txt"), "o\n");
+    g3(["add", "-A"]); g3(["commit", "-qm", "open work"]);
+    g3(["checkout", "-q", "main"]);
+  });
+  afterAll(() => {
+    rmSync(ORIGIN, { recursive: true, force: true });
+    rmSync(REPO3, { recursive: true, force: true });
+  });
+
+  test("an ancestor-of-base branch with NO GitHub PR → null (fallback removed, fail-safe)", async () => {
+    // agentdeck/merged is an ancestor of origin/main, but there is no merged PR → null.
+    expect(await isBranchMerged(REPO3, "main", "agentdeck/merged")).toBeNull();
+  });
+  test("an unmerged branch → null", async () => {
+    expect(await isBranchMerged(REPO3, "main", "agentdeck/open")).toBeNull();
+  });
+  test("a nonexistent branch → null (rev-parse fails)", async () => {
+    expect(await isBranchMerged(REPO3, "main", "agentdeck/ghost")).toBeNull();
   });
 });
 

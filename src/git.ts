@@ -29,7 +29,7 @@ export async function baseBranch(cwd = config.targetRepo): Promise<string> {
  * itself (`--git-common-dir`), not the registry. That keeps cleanup/diff
  * self-sufficient: they work even after the project is removed from projects.json.
  */
-async function repoRootOf(worktree: string): Promise<string> {
+export async function repoRootOf(worktree: string): Promise<string> {
   // --path-format=absolute (git 2.31+) so the common dir isn't relative to cwd;
   // fall back to plain + resolve() for older git.
   let r = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], worktree);
@@ -101,7 +101,10 @@ export interface CleanupResult { removed: boolean; reason?: string; dirty?: bool
 // commit — stage + commit the agent's work onto the branch, then remove the
 //          worktree. The branch is kept (it now holds the work).
 // force  — remove the worktree and delete the branch, discarding the work.
-export type CleanupMode = "safe" | "commit" | "force";
+// merged — the caller has PROVEN the branch is merged (see isBranchMerged). Remove
+//          the worktree + force-delete the branch, but REFUSE a dirty worktree or an
+//          unreadable status (fail-safe): auto-clean must never nuke unexpected work.
+export type CleanupMode = "safe" | "commit" | "force" | "merged";
 
 /**
  * Remove worktree + branch. A done task's worktree is normally dirty (the agent's
@@ -113,10 +116,26 @@ export async function cleanupWorktree(
   worktree: string,
   branch: string,
   mode: CleanupMode = "safe",
+  expectedSha?: string, // merged mode: the exact tip that was proven merged (CAS guard)
 ): Promise<CleanupResult> {
   const status = await git(["status", "--porcelain"], worktree);
   const dirty = status.ok && status.out.length > 0;
 
+  // merged: fail safe on a dirty worktree OR an unreadable status. `!status.ok`
+  // (git status errored) must NOT read as clean — that's the bug the older modes
+  // carry (`dirty` is false when the command fails); auto-clean refuses instead.
+  if (mode === "merged" && (!status.ok || dirty)) {
+    return { removed: false, dirty, reason: !status.ok ? "could not read worktree status — refusing auto-clean" : "worktree is dirty — refusing auto-clean" };
+  }
+  // merged CAS pre-check: the branch must still be the EXACT commit isBranchMerged
+  // proved was merged. If it advanced since (a commit landed after the proof), skip
+  // — force-deleting now would discard commits that were never in the merged PR.
+  if (mode === "merged" && expectedSha) {
+    const cur = await git(["rev-parse", branch], worktree);
+    if (!cur.ok || cur.out !== expectedSha) {
+      return { removed: false, reason: "branch moved since the merge proof — kept for review" };
+    }
+  }
   if (dirty && mode === "safe") {
     // `dirty: true` lets callers offer commit/discard without matching this string.
     return { removed: false, dirty: true, reason: "worktree is dirty — needs review before removal" };
@@ -138,10 +157,23 @@ export async function cleanupWorktree(
   // being removed. Derive it from the worktree so we don't depend on the registry.
   const repo = await repoRootOf(worktree);
   const force = mode === "force";
+  // merged is clean (checked above), so its worktree needs no --force. Only `force` does.
   const rm = await git(["worktree", "remove", ...(force ? ["--force"] : []), worktree], repo);
   if (!rm.ok) return { removed: false, reason: `worktree remove refused: ${rm.err}` };
 
-  const del = await git(["branch", force ? "-D" : "-d", branch], repo); // -d refuses unmerged
+  // merged with a proven SHA: delete via an ATOMIC compare-and-swap on the ref
+  // (`update-ref -d <ref> <oldvalue>` only deletes if it STILL points there). If a
+  // commit landed in the tiny window since the pre-check, the CAS fails and the
+  // branch (with that commit) survives — committed work is never lost.
+  if (mode === "merged" && expectedSha) {
+    const del = await git(["update-ref", "-d", `refs/heads/${branch}`, expectedSha], repo);
+    if (!del.ok) return { removed: true, reason: `worktree removed; branch kept (moved since merge proof): ${del.err}` };
+    return { removed: true };
+  }
+
+  // `force` (and `merged` without a proven SHA, a path the sweep never takes) `-D`.
+  const forceDelete = force || mode === "merged";
+  const del = await git(["branch", forceDelete ? "-D" : "-d", branch], repo); // -d refuses unmerged
   if (!del.ok) {
     // Expected in `commit` mode: the branch now has unmerged work, so we keep it.
     const kept = mode === "commit"
@@ -173,4 +205,55 @@ export async function diffStat(worktree: string): Promise<string> {
     parts.push(`untracked: ${all.slice(0, CAP).join(", ")}${more}`);
   }
   return parts.join("\n"); // "" when empty → the dashboard shows its own localized fallback
+}
+
+// ── Auto-clean: is a task's branch merged? ───────────────────────────────────
+// gh / git-fetch touch the network, so bound them with a timeout+kill (same shape
+// as agent.ts refreshPlanReviews) — a hung reader must never wedge the sweep.
+const NET_TIMEOUT_MS = 8000;
+async function bounded(cmd: string[], cwd: string, timeoutMs = NET_TIMEOUT_MS): Promise<{ ok: boolean; out: string }> {
+  let p: Bun.Subprocess<"ignore", "pipe", "ignore">;
+  try {
+    p = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "ignore" });
+  } catch { return { ok: false, out: "" }; } // bin missing / spawn error → "no signal"
+  let killed = false;
+  const kill = () => { killed = true; try { p.kill("SIGKILL"); } catch { /* already gone */ } };
+  const timer = setTimeout(kill, timeoutMs);
+  try {
+    // Hard-bound BOTH the read and the reap. SIGKILL can't be ignored, but a
+    // grandchild could still hold stdout open past the parent's death — so race
+    // the read against a deadline too. bounded() ALWAYS resolves, so a hung git/gh
+    // can never wedge the sweep's `sweeping` flag (which would disable auto-clean).
+    const out = await Promise.race([
+      new Response(p.stdout).text(),
+      new Promise<string>((r) => setTimeout(() => { kill(); r(""); }, timeoutMs + 2000)),
+    ]);
+    const code = await Promise.race([p.exited, new Promise<number>((r) => setTimeout(() => r(-1), 1000))]);
+    return { ok: !killed && code === 0, out: out.trim() };
+  } catch { return { ok: false, out: "" }; }
+  finally { clearTimeout(timer); }
+}
+
+/**
+ * Is `<branch>` merged into `<base>` via a GitHub PR? Returns the exact commit SHA
+ * that was proven merged (so the caller can delete via a compare-and-swap), or null.
+ *
+ * gh-PROVEN ONLY: a MERGED PR — filtered to THIS base (`--base`) so a PR merged into
+ * staging/release doesn't count — whose head commit (`headRefOid`) IS the local tip
+ * (`git rev-parse <branch>`). That proves THIS exact branch shipped into THIS base.
+ * We deliberately do NOT fall back to `git --is-ancestor`: it can't tell a genuinely
+ * ff-merged branch from a `done` task that committed nothing (tip already in base),
+ * and this triggers a destructive delete of the task's only record — so on no PR,
+ * no gh, or any doubt we return null and auto-clean never fires.
+ */
+export async function isBranchMerged(repo: string, base: string, branch: string): Promise<string | null> {
+  const local = await git(["rev-parse", branch], repo);
+  if (!local.ok || !local.out) return null;
+  const localSha = local.out;
+  const gh = await bounded(
+    ["gh", "pr", "list", "--head", branch, "--base", base, "--state", "merged", "--json", "headRefOid", "--jq", ".[].headRefOid"],
+    repo,
+  );
+  if (gh.ok && gh.out && gh.out.split("\n").some((s) => s.trim() === localSha)) return localSha;
+  return null;
 }

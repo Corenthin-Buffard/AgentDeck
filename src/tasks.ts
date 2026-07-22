@@ -31,14 +31,16 @@ export async function createTask(title: string, prompt: string, projectId?: stri
   return task;
 }
 
-export async function removeTask(id: string, mode: CleanupMode = "safe"): Promise<CleanupResult> {
+export async function removeTask(id: string, mode: CleanupMode = "safe", expectedSha?: string): Promise<CleanupResult> {
   const t = store.getTask(id);
   if (!t) return { removed: false, reason: "not found" };
-  // commit/force will destroy the worktree — stop any live agent first so we don't
-  // orphan the child in the running map (leaking a concurrency slot) or race its
-  // writes. safe mode refuses a dirty worktree, so it never reaches removal.
+  // commit/force/merged will destroy the worktree — stop any live agent first so we
+  // don't orphan the child in the running map (leaking a concurrency slot) or race
+  // its writes. safe mode refuses a dirty worktree, so it never reaches removal.
   if (mode !== "safe") killExisting(id);
-  const res = await cleanupWorktree(t.worktree, t.branch, mode);
+  // expectedSha is the merged-mode CAS guard (only delete the branch if it still
+  // points where isBranchMerged proved it was merged).
+  const res = await cleanupWorktree(t.worktree, t.branch, mode, expectedSha);
   if (res.removed) { store.deleteTask(id); }
   emitUpdate(id);
   return res;

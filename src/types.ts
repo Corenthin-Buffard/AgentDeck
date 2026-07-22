@@ -71,6 +71,7 @@ export interface AgentDeckConfig {
   uploadsDir: string;      // local→VPS uploads land here (per-project subdir)
   claudeBin: string;
   reviewReadBin: string;   // gstack-review-read — reads a branch's plan-review log (best-effort; may be absent)
+  autoCleanMerged: boolean; // opt-in: periodically drop worktree+branch+row for done tasks whose branch is merged
   // ── A1b (proven): the launch config that makes agents run gstack headlessly ──
   // The spike proved gstack only resolves + runs unattended with permissions
   // fully skipped. Default true. Set false only for a hands-on debugging run.
