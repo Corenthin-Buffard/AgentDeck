@@ -26,3 +26,10 @@ export function mergePhase(current: Phase, next: Phase): Phase {
   if (current === "unknown") return next;
   return ORDER.indexOf(next) >= ORDER.indexOf(current) ? next : current;
 }
+
+/** True while a task is early enough (unknown/plan/run/review) that polling its
+ *  plan-review log is still meaningful. Past `review` (qa/ship/done) the plan is
+ *  locked, so we stop re-reading. `unknown` (index -1) passes naturally. */
+export function canStillReview(phase: Phase): boolean {
+  return ORDER.indexOf(phase) <= ORDER.indexOf("review");
+}

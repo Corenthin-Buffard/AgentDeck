@@ -70,6 +70,13 @@ export const config: AgentDeckConfig = {
   worktreesDir: process.env.AGENTDECK_WORKTREES ?? join(dataDir, "worktrees"),
   uploadsDir: process.env.AGENTDECK_UPLOADS ?? join(dataDir, "uploads"),
   claudeBin: process.env.AGENTDECK_CLAUDE_BIN ?? "claude",
+  // gstack's plan-review-log reader. Resolve from PATH first (survives a systemd
+  // service, a different user, a packaged install) and only then fall back to the
+  // stock ~/.claude location — never hard-code one machine's layout. daemon.ts
+  // boot-logs once if the resolved path is missing (plan-review tracking degrades
+  // to "never checks" rather than crashing).
+  reviewReadBin: process.env.AGENTDECK_REVIEW_READ_BIN
+    ?? (Bun.which("gstack-review-read") ?? join(home, ".claude/skills/gstack/bin/gstack-review-read")),
 
   // ── A1b launch config (PROVEN by the spike) ─────────────────────────────
   // gstack skills only resolve + run in a headless agent when permissions are

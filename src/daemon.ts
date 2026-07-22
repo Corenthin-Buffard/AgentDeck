@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from "node:fs";
 import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { resumeTask } from "./agent.ts";
@@ -21,6 +21,14 @@ config.projects = config.projects.filter((p) => {
 });
 if (!config.projects.length) {
   console.error("[projects] no valid project — create-task will 400 until projects.json points at a git repo");
+}
+
+// Plan-review tracking reads a branch's gstack review log via this binary. If it's
+// not where we resolved it, log ONCE at boot so "the CEO/Design/Eng marks never
+// tick" is an explained degradation, not a silent mystery. Not fatal — the marks
+// just stay ○ and everything else runs.
+if (!existsSync(config.reviewReadBin)) {
+  console.warn(`[plan-reviews] gstack-review-read not found (${config.reviewReadBin}) — review tracking disabled (set AGENTDECK_REVIEW_READ_BIN)`);
 }
 
 // Write the settings file that agents load via `claude --settings` so Claude

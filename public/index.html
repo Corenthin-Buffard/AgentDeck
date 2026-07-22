@@ -73,6 +73,17 @@
   .row.waiting .seg.active .bar{background:var(--wait)}.row.error .seg.active .bar{background:var(--err)}
   .seg .pl{font-family:var(--mono);font-size:9.5px;letter-spacing:.3px;text-transform:uppercase;color:var(--faint);margin-top:5px;text-align:center;white-space:nowrap}
   .seg.active .pl{color:var(--text);font-weight:600}
+  /* Plan-review marks: a calm, monochrome CEO/Design/Eng row under the plan
+     segment. Glyph SHAPE carries state (○ not-run, ✓ clean, ⚠ not-clean, trailing
+     * = stale) so it reads without color; --dim/--faint (never the status colors
+     --ok/--wait fill) keeps it quiet. A sibling of .pl, NOT a .pl, so the <620px
+     rule that hides inactive .pl labels leaves these visible. */
+  .seg .rvw{display:flex;flex-wrap:wrap;gap:0 7px;justify-content:center;margin-top:4px;font-family:var(--mono);font-size:9px;letter-spacing:.2px;line-height:1.6}
+  .rvw .rv{white-space:nowrap;color:var(--dim);font-weight:400}
+  .rvw .rv b{font-weight:700;margin-left:1px}
+  .rvw .rv.none{color:var(--faint)}
+  .rvw .rv.notclean b{color:var(--wait)}   /* a discreet warn tint on the glyph only, not the whole chip */
+  .rvw .rv.eng{font-weight:600}            /* Eng emphasized — the required one that gates /ship */
   .aside{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:8px;padding:13px 16px;border-left:1px solid var(--line-soft);min-width:150px}
   .ago{font-family:var(--mono);font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
   .row.waiting .ago{color:var(--wait)}.row.error .ago{color:var(--err)}
@@ -167,11 +178,38 @@ function esc(s){return (s||"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;","
 // with a "?", strip common markdown, truncate.
 function preview(text,max){max=max||120;const lines=(text||"").split("\n").map(s=>s.trim()).filter(Boolean);let q=lines.slice().reverse().find(l=>l.includes("?"))||lines[lines.length-1]||"";q=q.replace(/[*_`#>]/g,"").trim();return q.length>max?q.slice(0,max-1).trimEnd()+"…":q;}
 
+// ── plan-review marks (CEO/Design/Eng) ──
+// Auto-detected from the branch's gstack review log by the daemon; rendered under
+// the plan segment. Order CEO · Design · Eng, Eng emphasized (it gates /ship).
+const RVW=[["ceo","CEO"],["design","Design"],["eng","Eng"]];
+function reviewTitle(label,s){
+  if(!s)return `${label} review: not run`;
+  const base=s.status==="clean"?"clean":(s.detail||"ran (not clean)");
+  const extra=s.status==="clean"&&s.detail?` — ${s.detail}`:"";
+  return `${label} review: ${base}${extra}${s.stale?" (stale vs current HEAD)":""}`;
+}
+function reviewMarks(t){
+  const pr=t.planReviews||{};
+  const any=pr.ceo||pr.design||pr.eng;
+  // Show in the plan phase (a reminder of what's left) OR once any review has run;
+  // otherwise nothing — no noise on a task that never planned.
+  if(t.phase!=="plan"&&!any)return "";
+  return `<div class="rvw" role="group" aria-label="Plan reviews">`+RVW.map(([k,label])=>{
+    const s=pr[k];
+    const glyph=(!s?"○":s.status==="clean"?"✓":"⚠")+(s&&s.stale?"*":"");
+    const cls="rv "+(k==="eng"?"eng ":"")+(!s?"none":s.status==="clean"?"clean":"notclean");
+    const title=reviewTitle(label,s);
+    // title (hover) AND aria-label (keyboard/touch/SR) both carry the detail — a
+    // title alone isn't accessible. The visible label+glyph carry the base state.
+    return `<span class="${cls}" title="${esc(title)}" aria-label="${esc(title)}">${esc(label)}<b>${esc(glyph)}</b></span>`;
+  }).join("")+`</div>`;
+}
 function phaseBar(t){
   const idx=PHASES.indexOf(t.phase);
   return `<div class="phases">`+PHASES.map((p,i)=>{
     const cls=i<idx?"done":i===idx?"active":"";
-    return `<div class="seg ${cls}"><div class="bar"></div><div class="pl">${p}</div></div>`;
+    // Marks live inside the first (plan) seg as a sibling of .pl.
+    return `<div class="seg ${cls}"><div class="bar"></div><div class="pl">${p}</div>${i===0?reviewMarks(t):""}</div>`;
   }).join("")+`</div>`;
 }
 function actions(t){

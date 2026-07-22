@@ -3,6 +3,21 @@
 /** The 6 gstack pipeline phases, plus 'unknown' before we've observed one. */
 export type Phase = "plan" | "run" | "review" | "qa" | "ship" | "done" | "unknown";
 
+/** One gstack plan-review's observed state, from the branch's review log.
+ *  `null` (the field's other inhabitant) means the review never ran. */
+export type PlanReviewState = {
+  status: "clean" | "not-clean"; // "not-clean" = ran without a "clean" status (issues, or a tool failure/abort)
+  stale: boolean;                // the review's commit ≠ the worktree's current HEAD
+  detail?: string;              // human-readable summary from the log, e.g. "13 issues, 0 unresolved" (title + aria-label)
+} | null;
+
+/** The three plan-phase reviews AgentDeck surfaces on a card. */
+export interface PlanReviews {
+  ceo: PlanReviewState;    // /plan-ceo-review    — scope & strategy
+  design: PlanReviewState; // /plan-design-review — UI/UX
+  eng: PlanReviewState;    // /plan-eng-review    — architecture (the required one, gates /ship)
+}
+
 /** Coarse agent status that drives the Master Inbox attention hierarchy. */
 export type Status =
   | "running"    // cruising on its own
@@ -35,6 +50,7 @@ export interface Task {
   lastActivity: number;    // epoch ms
   createdAt: number;
   error: string | null;
+  planReviews: PlanReviews; // which plan reviews ran on this branch (auto-detected from the gstack log)
 }
 
 export interface AgentEvent {
@@ -54,6 +70,7 @@ export interface AgentDeckConfig {
   worktreesDir: string;
   uploadsDir: string;      // local→VPS uploads land here (per-project subdir)
   claudeBin: string;
+  reviewReadBin: string;   // gstack-review-read — reads a branch's plan-review log (best-effort; may be absent)
   // ── A1b (proven): the launch config that makes agents run gstack headlessly ──
   // The spike proved gstack only resolves + runs unattended with permissions
   // fully skipped. Default true. Set false only for a hands-on debugging run.

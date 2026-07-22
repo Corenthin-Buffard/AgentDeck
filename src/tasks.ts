@@ -23,6 +23,7 @@ export async function createTask(title: string, prompt: string, projectId?: stri
     id, project: project.id, title, prompt, branch, worktree, tmux: null, sessionId: null,
     status: "running", phase: "unknown", pendingQuestion: null,
     lastActivity: now, createdAt: now, error: null,
+    planReviews: { ceo: null, design: null, eng: null },
   };
   store.insertTask(task);
   emitUpdate(id);
