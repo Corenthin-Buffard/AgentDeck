@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.2.0] - 2026-07-22
+
+### Added
+- **Auto-clean merged tasks (opt-in).** Set `AGENTDECK_AUTO_CLEAN_MERGED=true` and a periodic
+  sweep (30s after boot, then every 5 min) drops a `done` task's worktree + branch + dashboard
+  row once its branch is **proven merged** — no more manual "Clean up" on every shipped task.
+  "Merged" is proven ONLY by a merged GitHub PR (`gh pr list --head <branch> --base <base>
+  --state merged`) whose head commit equals the local tip, so a squash merge is detected where
+  plain git can't. Off by default (it's a silent destructive sweep). `done` only — a `stopped`
+  task is a deliberate pause and is never touched.
+
+### Internal
+- Safety-first by construction: the sweep only ever removes a task whose work is provably in the
+  base. Detection returns the exact proven SHA and the branch is deleted via an atomic
+  compare-and-swap (`git update-ref -d refs/heads/<b> <sha>`), so a commit landing after the proof
+  is never force-deleted. The cleanup refuses a dirty or unreadable worktree, an in-flight guard
+  prevents overlapping sweeps, `gh`/subprocess calls are bounded (SIGKILL + hard read deadline so a
+  hung child can't wedge the sweep), and an anti-race re-check runs before the destructive step.
+  Cross-model pre-landing review (Claude + Codex) drove the SHA compare-and-swap, the base filter,
+  and dropping the unsafe `git --is-ancestor` fallback (it couldn't tell a merged branch from a
+  zero-commit one). New `test/cleanup.test.ts` + `test/git.test.ts` cases (86 tests).
+
 ## [0.2.1.0] - 2026-07-22
 
 ### Added
