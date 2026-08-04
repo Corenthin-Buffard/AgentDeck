@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.2.3.0] - 2026-08-04
+
+### Added
+- **The dashboard says what it is, and where it is.** The header is now two rows: a brand row
+  carrying a deck glyph, the AgentDeck wordmark (a real page heading, so screen readers announce
+  it) and a line telling you which deployment this tab points at and whether the link is alive —
+  the one fact nothing else on screen carried when you keep several SSH tunnels open. Controls sit
+  on their own row below. The browser tab finally has an icon, so AgentDeck is findable among ten
+  others.
+- **The connection indicator tells three states apart.** `live` in green, `reconnecting…` in
+  amber, and `daemon unreachable` in red once it has really given up (and it now backs off instead
+  of hammering every 1.5s while claiming otherwise). Restarting the daemon reads as a restart, not
+  as a failure, and the board recovers on its own with no page reload.
+- **`DESIGN.md`** at the repo root: the colour tokens with their roles, the contrast floors with
+  measured ratios, the mono-as-identity decision, the header layout invariants, and the interaction
+  states. Written because the approved brand lockup had been designed once and then quietly lost.
+
+### Fixed
+- **The live feed no longer leaks your board to any website you happen to have open.** WebSockets
+  are not covered by the browser's same-origin policy, so any page could open `/ws` and receive the
+  full task snapshot pushed on connect — titles, prompts, branch names, errors, pending questions.
+  The upgrade is now gated on the dashboard token (sent as a subprotocol, never in the URL, so it
+  can't land in proxy logs) plus an Origin check.
+- **Text you couldn't read is now readable.** `--faint` measured 4.10:1 in dark and 2.80:1 in light
+  — under the 4.5:1 floor for text and under even the 3.0:1 floor for interface elements — and it
+  coloured section labels, metadata, timestamps and empty states. `--done` shipped with the exact
+  same value and coloured the finished/stopped/resuming chips at 3.13:1. Both raised; every text
+  colour now clears 4.5:1 in both themes.
+- **The header is usable on a phone.** Its two controls measured 29px and 28px against a 44px
+  minimum; they now meet it below 620px, and the bar no longer wraps unpredictably (two competing
+  auto-margins were splitting the free space instead of pushing the status to the right).
+
+### Internal
+- The dashboard token is persisted (0600, `O_EXCL`/`O_NOFOLLOW`, shape-checked) instead of being
+  regenerated per process. Once the token also gated `/ws`, a per-process secret meant an open
+  dashboard could never reconnect after a restart — it 403'd forever until you reloaded. Caught by
+  the new end-to-end test, not by hand.
+- New `docs/e2e/conn-states-e2e.mjs`: a browser proof of the connection state machine that costs no
+  agent turn. It found the reconnect regression above on its first run. New assertions lock the
+  brand lockup, the favicon and the contrast tokens, so the "designed once, silently dropped"
+  failure mode that motivated this release can't repeat (89 tests).
+- Cross-model pre-landing review (Claude + Codex) surfaced the WebSocket exposure, the `--done`
+  contrast twin, an invalid `<h1>`-inside-`<span>` lockup, a hard-coded `ws://` that breaks behind
+  an HTTPS proxy, and the token-file symlink handling. A DNS-rebinding vector on the ungated read
+  endpoints predates this release and is tracked as P1.
+
 ## [0.2.2.0] - 2026-07-22
 
 ### Added
