@@ -92,7 +92,11 @@
   .chip.error{color:var(--err);background:color-mix(in srgb,var(--err) 20%,transparent)}
   .chip.done,.chip.stopped,.chip.resuming{color:var(--done);background:color-mix(in srgb,var(--done) 16%,transparent)}
   .meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px;font-family:var(--mono);font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
-  .meta .branch{color:var(--dim)}
+  /* An SVG, not a character. This used to be U+2442 (OCR FORK), which almost no
+     installed font carries — most Linux boxes rendered a .notdef box on every
+     task row, including in the README's demo GIF. */
+  .meta .branch{color:var(--dim);display:inline-flex;align-items:center;gap:5px}
+  .branch svg{flex:none}
   .qprev{margin-top:8px;font-size:13px;line-height:1.45;color:var(--wait);border-left:2px solid var(--wait);padding-left:9px}
   .hint{font-family:var(--mono);font-size:11px;color:var(--dim)}
   .phases{display:flex;gap:4px;margin-top:11px}
@@ -195,6 +199,12 @@
 
 <script>
 const PHASES=["plan","run","review","qa","ship","done"];
+// Branch mark. Drawn, not typed: the previous U+2442 character depends on a font
+// that most systems don't ship, so it degraded to an empty box next to every
+// branch name. Inherits currentColor, so it follows .branch in both themes.
+const BRANCH_ICON=`<svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true">`
+  +`<path d="M3.5 10V4M3.5 7h2.5a2 2 0 0 0 2-2V4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>`
+  +`<circle cx="3.5" cy="2.6" r="1.4" fill="currentColor"/><circle cx="8" cy="2.6" r="1.4" fill="currentColor"/></svg>`;
 const AD_TOKEN=(document.querySelector('meta[name=ad-token]')||{}).content||"";
 // Every state-changing request carries the dashboard token so the daemon accepts
 // it (and a cross-origin page, which can't read this token, can't forge them).
@@ -275,7 +285,7 @@ function rowHtml(t){
       <div class="toprow"><span class="name">${esc(t.title)}</span>
         <span class="chip ${t.status}">${t.status==="waiting"?"Waiting for user":t.status}</span>
         ${currentProject==="all"?`<span class="proj">▸ ${esc(projLabel(t.project))}</span>`:""}</div>
-      <div class="meta"><span class="branch">⑂ ${esc(t.branch)}</span>
+      <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span>
         <span>${esc(t.id)}</span>${t.error?`<span>${esc(t.error.slice(0,50))}</span>`:""}</div>
       ${t.status==="waiting"&&t.pendingQuestion?`<div class="qprev">${esc(preview(t.pendingQuestion))}</div>`:""}
       ${phaseBar(t)}
@@ -457,7 +467,7 @@ async function openTask(id){
   const DIFF_CAP=4000;
   const diffShown=diff.length>DIFF_CAP?diff.slice(0,DIFF_CAP)+`\n… ${diff.length-DIFF_CAP} more chars truncated (see the worktree)`:diff;
   showDrawer(`<h2>${esc(t.title)}</h2>
-    <div class="meta"><span class="branch">⑂ ${esc(t.branch)}</span><span>phase ${t.phase}</span><span>${t.status}</span></div>
+    <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span><span>phase ${t.phase}</span><span>${t.status}</span></div>
     <label class="lbl">Diff</label><div class="q">${esc(diffShown||"(no changes)")}</div>
     <label class="lbl">Recent events</label>
     <div class="q">${ev.events.slice(-40).map(e=>`${new Date(e.ts).toLocaleTimeString()} · ${e.kind} · ${esc(String(e.data)).slice(0,120)}`).join("\n")||"(none)"}</div>

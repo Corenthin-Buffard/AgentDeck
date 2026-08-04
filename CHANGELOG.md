@@ -31,6 +31,9 @@
 - **The header is usable on a phone.** Its two controls measured 29px and 28px against a 44px
   minimum; they now meet it below 620px, and the bar no longer wraps unpredictably (two competing
   auto-margins were splitting the free space instead of pushing the status to the right).
+- **The empty box next to every branch name is gone.** The branch mark was `U+2442`, a character
+  almost no installed font carries, so most Linux systems drew a `.notdef` box on every task row —
+  including in the README's demo GIF. It's now a drawn icon that doesn't depend on your fonts.
 
 ### Internal
 - The dashboard token is persisted (0600, `O_EXCL`/`O_NOFOLLOW`, shape-checked) instead of being
