@@ -10,6 +10,7 @@ import { store } from "./db.ts";
 import { bus } from "./bus.ts";
 import { answer, stopTask } from "./agent.ts";
 import { createTask, removeTask, findBySession } from "./tasks.ts";
+import { parseDecisionBrief } from "./detect.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
 
@@ -123,8 +124,31 @@ export function isLoopbackBind(host: string): boolean {
   return name !== null && (LOOPBACK_NAMES.has(name) || IPV4_LOOPBACK.test(name));
 }
 
+/**
+ * Tasks as the dashboard sees them: the stored row, plus the decision brief
+ * parsed out of a waiting agent's question so the reply drawer can offer the
+ * options as buttons instead of making you retype a letter off a wall of prose.
+ *
+ * DERIVED, never persisted. It's a view of `pendingQuestion`, so re-parsing on
+ * every send costs nothing measurable and means a parser improvement applies to
+ * agents that are already waiting, with no migration and nothing to backfill.
+ */
+export function withBriefs<T extends { status: string; pendingQuestion?: string | null }>(tasks: T[]) {
+  return tasks.map((t) => {
+    // Only a WAITING agent is asking anything. Parsing a running or done task's
+    // last message would put clickable answers under a question nobody asked.
+    if (t.status !== "waiting" || !t.pendingQuestion) return t;
+    const brief = parseDecisionBrief(t.pendingQuestion);
+    return brief ? { ...t, brief } : t;
+  });
+}
+
+function tasksForClient() {
+  return withBriefs(store.listTasks());
+}
+
 function broadcast() {
-  const payload = JSON.stringify({ type: "tasks", tasks: store.listTasks() });
+  const payload = JSON.stringify({ type: "tasks", tasks: tasksForClient() });
   for (const ws of clients) { try { ws.send(payload); } catch { /* dropped */ } }
 }
 bus.on("update", broadcast);
@@ -220,7 +244,7 @@ export function startServer() {
         return json({ projects: config.projects.map((p) => ({ id: p.id, label: p.label })) });
       }
       if (pathname === "/api/tasks" && req.method === "GET") {
-        return json({ tasks: store.listTasks() });
+        return json({ tasks: tasksForClient() });
       }
       if (pathname === "/api/tasks" && req.method === "POST") {
         const b = await req.json().catch(() => ({}));
@@ -325,7 +349,7 @@ export function startServer() {
       return new Response("not found", { status: 404 });
     },
     websocket: {
-      open(ws) { clients.add(ws); ws.send(JSON.stringify({ type: "tasks", tasks: store.listTasks() })); },
+      open(ws) { clients.add(ws); ws.send(JSON.stringify({ type: "tasks", tasks: tasksForClient() })); },
       close(ws) { clients.delete(ws); },
       message() { /* dashboard is read + REST; ws is push-only */ },
     },

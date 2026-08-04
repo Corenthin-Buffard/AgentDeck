@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -454,4 +454,43 @@ test("/api/upload browse-states: lands in the repo, but symlinked dirs are rejec
     rmSync(outside, { recursive: true, force: true });
     server.stop(true);
   }
+});
+
+// The dashboard payload carries the parsed brief so the reply drawer can offer
+// the agent's options as buttons. Derived, never persisted — so the seam worth
+// testing is the mapping, not the DB.
+describe("withBriefs", () => {
+  const BRIEF =
+    "A) Ship as-is\nB) Add the test (recommended)\n" +
+    "Completeness: A=4/10, B=9/10\nNet: one test closes the gap.";
+
+  test("attaches the options for a waiting agent", async () => {
+    const { withBriefs } = await import("../src/server.ts");
+    const [t] = withBriefs([{ status: "waiting", pendingQuestion: BRIEF }]) as any[];
+    expect(t.brief.options.map((o: any) => o.letter)).toEqual(["A", "B"]);
+    expect(t.brief.options[1].recommended).toBe(true);
+  });
+
+  // A running or done task's last message is not an open question. Parsing it
+  // would put clickable answers under something nobody asked.
+  test("ignores every status except waiting", async () => {
+    const { withBriefs } = await import("../src/server.ts");
+    for (const status of ["running", "done", "error", "stopped", "resuming"]) {
+      const [t] = withBriefs([{ status, pendingQuestion: BRIEF }]) as any[];
+      expect(t.brief).toBeUndefined();
+    }
+  });
+
+  test("leaves a waiting agent whose question isn't a brief untouched", async () => {
+    const { withBriefs } = await import("../src/server.ts");
+    // The demo's own question: numbered, no brief markers. Free text, no buttons.
+    const [t] = withBriefs([{ status: "waiting", pendingQuestion: "Which one for the MVP? Reply 1 or 2." }]) as any[];
+    expect(t.brief).toBeUndefined();
+  });
+
+  test("survives a waiting agent with no question text", async () => {
+    const { withBriefs } = await import("../src/server.ts");
+    expect(withBriefs([{ status: "waiting", pendingQuestion: null }])[0]).toHaveProperty("status", "waiting");
+    expect((withBriefs([{ status: "waiting", pendingQuestion: null }])[0] as any).brief).toBeUndefined();
+  });
 });
