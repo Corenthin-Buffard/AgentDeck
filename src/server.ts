@@ -56,6 +56,9 @@ function resolveUploadPath(project: { id: string; path: string }, dest: string, 
 }
 
 const clients = new Set<ServerWebSocket<unknown>>();
+// Subprotocol name the client offers alongside the token. Echoed on the 101 so
+// the browser accepts the handshake; kept in sync with public/index.html.
+const WS_PROTOCOL = "agentdeck.v1";
 
 function broadcast() {
   const payload = JSON.stringify({ type: "tasks", tasks: store.listTasks() });
@@ -83,8 +86,34 @@ export function startServer() {
       const url = new URL(req.url);
       const { pathname } = url;
 
+      // WebSockets are NOT covered by the same-origin policy. The "reads stay
+      // open on localhost" reasoning below does NOT extend here: CORS stops a
+      // cross-origin page from READING an HTTP response, but a WebSocket hands
+      // it the bytes directly — and we push the full task snapshot on open
+      // (titles, prompts, branches, errors, pending questions). So any page the
+      // user happens to have open could slurp the board. Gate the upgrade on the
+      // same dashboard token as the writes, and reject a foreign Origin outright.
+      // A non-browser client sends no Origin; it still needs the token.
       if (pathname === "/ws") {
-        return srv.upgrade(req) ? undefined : new Response("upgrade failed", { status: 400 });
+        const origin = req.headers.get("origin");
+        if (origin) {
+          let sameHost = false;
+          try { sameHost = new URL(origin).host === url.host; } catch { sameHost = false; }
+          if (!sameHost) return new Response(null, { status: 403 });
+        }
+        // The token rides in Sec-WebSocket-Protocol, not the query string: URLs
+        // land in proxy and access logs, which would turn log access into
+        // permanent dashboard access. Same reasoning as /api/upload, which puts
+        // it in a header for exactly this reason.
+        const offered = (req.headers.get("sec-websocket-protocol") ?? "").split(",").map((s) => s.trim());
+        if (!offered.includes(config.dashboardToken)) {
+          return new Response(null, { status: 403 });
+        }
+        // Echo the NAME, never the secret: the 101 response is not a place to
+        // reflect a credential back. A browser closes the socket unless we
+        // select one of the protocols it offered.
+        return srv.upgrade(req, { headers: { "Sec-WebSocket-Protocol": WS_PROTOCOL } })
+          ? undefined : new Response("upgrade failed", { status: 400 });
       }
 
       // ── Auth gates (all WRITE endpoints; reads stay open on localhost) ───
