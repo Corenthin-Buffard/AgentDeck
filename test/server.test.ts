@@ -48,6 +48,108 @@ test('GET "/" serves the AgentDeck brand lockup in the body', async () => {
   }
 });
 
+// DNS rebinding: a page on a domain that resolves to 127.0.0.1 talks to this
+// daemon from the user's own browser, same-origin. Reads are ungated by design,
+// so GET /api/tasks would hand it the whole board. The /ws Origin check cannot
+// stop it — Origin and url.host both come from the attacker-controlled Host
+// header. Every route is gated on a recognised Host, ahead of routing.
+test("rejects every route when the Host header isn't ours", async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const server = startServer();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const evil = { host: "evil.example" };
+
+    // The reads are the actual leak — they must 403 too, not just the writes.
+    expect((await fetch(`${base}/api/tasks`, { headers: evil })).status).toBe(403);
+    expect((await fetch(`${base}/api/projects`, { headers: evil })).status).toBe(403);
+    expect((await fetch(`${base}/`, { headers: evil })).status).toBe(403);
+    expect((await fetch(`${base}/ws`, { headers: evil })).status).toBe(403);
+
+    // A rebound page holding a valid token is still refused: the Host runs first.
+    const withToken = await fetch(`${base}/ws`, {
+      headers: { ...evil, "sec-websocket-protocol": `agentdeck.v1, ${config.dashboardToken}` },
+    });
+    expect(withToken.status).toBe(403);
+
+    // The board is never disclosed — not even an empty task list.
+    expect(await (await fetch(`${base}/api/tasks`, { headers: evil })).text()).not.toContain("tasks");
+
+    // A MALFORMED Host must 403, not 500. The gate has to run before
+    // `new URL(req.url)`: Bun builds that URL from the Host header, so a
+    // malformed one makes the constructor throw, and Bun's fallback error page
+    // answers 500 with the attacker's Host echoed back plus an internal path.
+    // The unit test on allowedHost() passes either way — only this one catches it.
+    for (const bad of ["[::1]evil.com", "localhost:443:evil", "localhost:any"]) {
+      const res = await fetch(`${base}/api/tasks`, { headers: { host: bad } });
+      expect(res.status).toBe(403);
+      const body = await res.text();
+      expect(body).not.toContain("evil");       // no echo of what was sent
+      expect(body).not.toContain("bunfs");      // no internal path
+    }
+  } finally {
+    server.stop(true);
+  }
+});
+
+// The documented way in is an SSH tunnel, and the local port can differ from the
+// daemon's (`ssh -L 9000:127.0.0.1:8787` → the browser sends `localhost:9000`).
+// So the gate compares NAMES and ignores the port; getting this wrong would lock
+// every tunnelled user out.
+test("accepts loopback names on any port, and configured proxy hosts", async () => {
+  const { allowedHost } = await import("../src/server.ts");
+
+  expect(allowedHost("localhost:9000")).toBe(true);   // tunnel on a different port
+  expect(allowedHost("127.0.0.1:8787")).toBe(true);
+  expect(allowedHost("localhost")).toBe(true);        // no port at all
+  expect(allowedHost("[::1]:8787")).toBe(true);       // bracketed IPv6
+  expect(allowedHost("LocalHost:8787")).toBe(true);   // Host is case-insensitive
+  expect(allowedHost("localhost.")).toBe(true);       // absolute form of the same name
+  expect(allowedHost("127.0.0.2:8787")).toBe(true);   // all of 127/8 is loopback
+
+  expect(allowedHost("evil.example")).toBe(false);
+  expect(allowedHost("localhost.evil.example")).toBe(false); // suffix trick
+  expect(allowedHost("[::1")).toBe(false);            // malformed bracket fails closed
+  expect(allowedHost("")).toBe(false);
+  expect(allowedHost(null)).toBe(false);
+
+  // A proxy hostname only passes once it is explicitly allowed.
+  expect(allowedHost("agentdeck.example.com")).toBe(false);
+  config.allowedHosts.push("agentdeck.example.com");
+  try {
+    expect(allowedHost("agentdeck.example.com:443")).toBe(true);
+  } finally {
+    config.allowedHosts.pop();
+  }
+
+  // An operator who writes the port into the env var must still match. The
+  // allowlist goes through the same parser as the request Host.
+  config.allowedHosts.push("proxy.example.com:443");
+  try {
+    expect(allowedHost("proxy.example.com")).toBe(true);
+    expect(allowedHost("proxy.example.com:8443")).toBe(true);
+  } finally {
+    config.allowedHosts.pop();
+  }
+});
+
+// "Ignore the port" must not decay into "ignore any suffix after a trusted
+// name". The first implementation took everything before the first `:` (or
+// between the brackets) and discarded the rest, so a loopback prefix with junk
+// glued on sailed through. Every case here passed as loopback before the fix.
+test("a trusted name with a junk suffix must not pass as loopback", async () => {
+  const { allowedHost } = await import("../src/server.ts");
+
+  expect(allowedHost("[::1]evil.com")).toBe(false);      // suffix after the bracket
+  expect(allowedHost("[::1]x:443")).toBe(false);         // suffix plus a port
+  expect(allowedHost("[::1]@evil.example")).toBe(false); // userinfo after the bracket
+  expect(allowedHost("localhost:any")).toBe(false);      // port isn't numeric
+  expect(allowedHost("localhost:443:evil")).toBe(false); // second colon
+  expect(allowedHost("localhost:")).toBe(false);         // empty port
+  expect(allowedHost("user@localhost")).toBe(false);     // userinfo before the name
+});
+
 // DESIGN.md Rule 3: any text colour clears 4.5:1, so --faint (4.10:1 dark,
 // 2.80:1 light) is non-text only. That rule was violated the same day it was
 // written — --done shipped with --faint's exact hex and coloured .chip.done at

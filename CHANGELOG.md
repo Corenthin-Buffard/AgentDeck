@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.2.3.1] - 2026-08-04
+
+### Fixed
+- **A website you visit can no longer read your board.** If a hostile page's domain resolves to
+  `127.0.0.1` (DNS rebinding), the browser treats the daemon as same-origin and the page reaches it
+  directly. Reads are open on localhost by design, so `GET /api/tasks` handed over every task title,
+  prompt, branch, error and pending question. The `/ws` gate shipped in 0.2.3.0 could not stop this:
+  it compared `Origin` against `url.host`, and both come from the attacker-controlled `Host` header,
+  so they validated each other. Every route is now checked against a recognised `Host` **before
+  routing** — reads included, since the reads were the leak.
+
+  Nothing changes for the documented setup. Loopback names are accepted on **any** port, so
+  `ssh -L 9000:127.0.0.1:8787` keeps working even though the browser sends `localhost:9000` while the
+  daemon listens on 8787. `localhost.` and every `127.x.x.x` address count as loopback too. Behind a
+  reverse proxy, set `AGENTDECK_ALLOWED_HOSTS` to the hostname your proxy sends — with or without a
+  port, both match; without it, only loopback Hosts are accepted and the boot log says so.
+
+### Internal
+- The Host parser refuses anything that isn't a bare name plus an optional numeric port. "Ignore the
+  port" must not decay into "ignore any suffix after a trusted name": the first cut discarded
+  everything after the first `:` (or after `]`), so `[::1]evil.com`, `[::1]@evil.example` and
+  `localhost:443:evil` all passed as loopback. Found by cross-model review, each case now locked by a
+  test.
+- The check runs ahead of `new URL(req.url)`, not merely ahead of routing. Bun builds that URL from
+  the Host header, so a malformed Host made the constructor throw and Bun's fallback error page
+  answered **500 with the attacker's Host echoed back**, an internal path and a stack frame. Reading
+  the header directly needs no parsing and cannot throw. The unit test passed either way — only the
+  integration test catches this one.
+
 ## [0.2.3.0] - 2026-08-04
 
 ### Added

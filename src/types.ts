@@ -65,6 +65,7 @@ export interface AgentDeckConfig {
   dataDir: string;
   host: string;            // bind address — 127.0.0.1 by default (A3: localhost + SSH tunnel)
   port: number;
+  allowedHosts: string[];  // extra Host header names (reverse proxy); loopback always allowed
   targetRepo: string;      // legacy single-repo default; seeds the `default` project
   projects: Project[];     // the project registry — what agents can operate on
   worktreesDir: string;

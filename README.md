@@ -171,8 +171,12 @@ capped at 25 MB, filename sanitized, symlinked directories rejected, no writing
 outside the target dir. The **live WebSocket is gated on the same token** (sent as
 a subprotocol, never in the URL) plus an `Origin` check: WebSockets are not covered
 by the same-origin policy, so without that gate any page you had open could read
-the board. Note that plain `GET` reads stay open on localhost by design, which a
-DNS-rebinding page can still reach — tracked as P1 in `TODOS.md`.
+the board. **Every route** — reads included — is also gated on a recognised `Host`
+header: a hostile page whose domain resolves to `127.0.0.1` (DNS rebinding) reaches
+the daemon from your own browser, and the reads are what it would harvest. Loopback
+names are accepted on any port, so an `ssh -L 9000:127.0.0.1:8787` tunnel works
+unchanged. Behind a reverse proxy, set `AGENTDECK_ALLOWED_HOSTS` to the hostname
+your proxy sends, or the daemon rejects everything and says so at boot.
 
 ## QA with authenticated cookies on the VPS
 

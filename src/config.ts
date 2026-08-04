@@ -124,6 +124,12 @@ export const config: AgentDeckConfig = {
   // A3: bind localhost only. Reach the dashboard via SSH tunnel, not public exposure.
   // Override with AGENTDECK_HOST=0.0.0.0 ONLY behind a reverse proxy + auth (V2).
   host: process.env.AGENTDECK_HOST ?? "127.0.0.1",
+  // Extra hostnames accepted in the `Host` header, on top of the loopback names.
+  // Needed only behind a reverse proxy, where the browser sends YOUR domain.
+  // Names only — the port is deliberately ignored, so `ssh -L 9000:127.0.0.1:8787`
+  // (a different local port) keeps working. See allowedHost() in server.ts.
+  allowedHosts: (process.env.AGENTDECK_ALLOWED_HOSTS ?? "")
+    .split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
   port,
   // Legacy single-repo default (still honored via AGENTDECK_TARGET_REPO). It now
   // just seeds the synthesized `default` project when there's no projects.json.
