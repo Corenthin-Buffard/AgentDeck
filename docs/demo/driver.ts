@@ -11,7 +11,11 @@ import { store } from "../../src/db.ts";
 import { bus } from "../../src/bus.ts";
 import type { Task, Status, Phase } from "../../src/types.ts";
 
-startServer(); // dashboard on AGENTDECK_PORT
+// Held so the capture can take the dashboard DOWN and bring it back UP. The GIF
+// shows the real connection states, which means the server has to really stop —
+// faking them by poking setConn() from the page would make the animation a
+// mockup, which is exactly what this harness exists to avoid.
+let dash = startServer(); // dashboard on AGENTDECK_PORT
 
 const now = Date.now();
 function mk(id: string, title: string, branch: string, status: Status, phase: Phase, agoSec: number, extra: Partial<Task> = {}): Task {
@@ -61,7 +65,14 @@ function done() {
   bump();
 }
 
-const routes: Record<string, () => void> = { seed, waiting, resume, done };
+// Kill the dashboard listener. `stop(true)` closes in-flight sockets too, so the
+// browser sees a real WebSocket close and walks its own reconnect path.
+function down() { dash.stop(true); }
+function up() { dash = startServer(); }
+
+const routes: Record<string, () => void> = { seed, waiting, resume, done, down, up };
+// The control port is a SEPARATE server on purpose: it has to survive `down()`,
+// otherwise the capture would have no way to bring the dashboard back.
 Bun.serve({
   hostname: "127.0.0.1",
   port: Number(process.env.DEMO_CTRL_PORT ?? 9099),
