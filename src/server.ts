@@ -71,21 +71,56 @@ const WS_PROTOCOL = "agentdeck.v1";
 // So decide up front which Host values are ours. Compare NAMES, ignore the port:
 // `ssh -L 9000:127.0.0.1:8787` makes the browser send `localhost:9000` while we
 // listen on 8787, and that tunnel is the documented way in.
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
-export function allowedHost(hostHeader: string | null | undefined): boolean {
-  if (!hostHeader) return false; // HTTP/1.1 requires Host; absent = not something we serve
+const LOOPBACK_NAMES = new Set(["localhost", "::1", "0:0:0:0:0:0:0:1"]);
+// All of 127.0.0.0/8 is loopback and unreachable from off-box, so `127.0.0.2` is
+// as safe as `127.0.0.1`. Rebinding doesn't gain anything here: the browser sends
+// the ATTACKER'S domain in Host, never the address it resolved to.
+const IPV4_LOOPBACK = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+/**
+ * The bare host NAME from a `Host` header, or null if it isn't a plain host.
+ *
+ * Parsing strictly matters more than it looks. An earlier version took
+ * everything before the first `:` (or between the brackets) and threw the rest
+ * away, which is not "ignore the port" — it's "ignore any suffix glued onto a
+ * trusted name". `[::1]evil.com`, `[::1]@evil.example` and `localhost:443:evil`
+ * all passed as loopback. So: after the name, the ONLY thing allowed is a
+ * numeric port. Anything else fails closed.
+ */
+export function hostName(hostHeader: string | null | undefined): string | null {
+  if (!hostHeader) return null; // HTTP/1.1 requires Host; absent = not something we serve
   const raw = hostHeader.trim().toLowerCase();
-  // Strip the port. IPv6 literals are bracketed: `[::1]:8787` -> `::1`.
-  let name: string;
+  let name: string, rest: string;
   if (raw.startsWith("[")) {
     const end = raw.indexOf("]");
-    if (end === -1) return false; // malformed bracket — fail closed
+    if (end === -1) return null; // unterminated bracket
     name = raw.slice(1, end);
+    rest = raw.slice(end + 1);
   } else {
-    name = raw.split(":")[0];
+    const colon = raw.indexOf(":");
+    name = colon === -1 ? raw : raw.slice(0, colon);
+    rest = colon === -1 ? "" : raw.slice(colon);
   }
-  if (!name) return false;
-  return LOOPBACK_HOSTS.has(name) || config.allowedHosts.includes(name);
+  if (rest !== "" && !/^:\d+$/.test(rest)) return null;
+  // `localhost.` is the absolute form of `localhost` and resolves identically,
+  // so a browser sending it must not be locked out.
+  if (name.endsWith(".")) name = name.slice(0, -1);
+  return name || null;
+}
+
+export function allowedHost(hostHeader: string | null | undefined): boolean {
+  const name = hostName(hostHeader);
+  if (name === null) return false;
+  if (LOOPBACK_NAMES.has(name) || IPV4_LOOPBACK.test(name)) return true;
+  // Run configured entries through the SAME parser, so an operator who writes
+  // `AGENTDECK_ALLOWED_HOSTS=example.com:443` isn't silently never matched.
+  return config.allowedHosts.some((h) => hostName(h) === name);
+}
+
+/** Loopback bind address? Used for the boot warning, so `127.0.0.2` doesn't warn. */
+export function isLoopbackBind(host: string): boolean {
+  const name = hostName(host);
+  return name !== null && (LOOPBACK_NAMES.has(name) || IPV4_LOOPBACK.test(name));
 }
 
 function broadcast() {
@@ -111,18 +146,23 @@ export function startServer() {
     // into RAM (the 25MB app cap is the second curtain). ~26MB leaves headroom.
     maxRequestBodySize: 26 * 1024 * 1024,
     async fetch(req, srv) {
-      const url = new URL(req.url);
-      const { pathname } = url;
-
-      // FIRST, before any routing: reject a Host we don't recognise. This has to
-      // run ahead of the read routes, because the reads are the leak — a rebound
-      // page reading /api/tasks never touches an auth gate.
+      // FIRST — ahead of `new URL(req.url)`, not just ahead of routing. Bun
+      // builds req.url from the Host header, so a malformed Host makes the URL
+      // constructor throw, and Bun's fallback error page answers with a 500 that
+      // echoes the attacker's Host back plus an internal path and a stack frame.
+      // Reading the header directly needs no parsing and cannot throw.
+      //
+      // Ahead of routing matters too: the reads are the leak — a rebound page
+      // fetching /api/tasks never touches an auth gate.
       if (!allowedHost(req.headers.get("host"))) {
         return new Response(
           "host not allowed — set AGENTDECK_ALLOWED_HOSTS if you serve this behind a reverse proxy\n",
           { status: 403 },
         );
       }
+
+      const url = new URL(req.url);
+      const { pathname } = url;
 
       // WebSockets are NOT covered by the same-origin policy. The "reads stay
       // open on localhost" reasoning below does NOT extend here: CORS stops a

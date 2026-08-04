@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from "node:fs
 import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { resumeTask } from "./agent.ts";
-import { startServer } from "./server.ts";
+import { startServer, isLoopbackBind } from "./server.ts";
 import { startAutoCleanSweep } from "./cleanup.ts";
 import { hookSettings } from "./hooks-config.ts";
 
@@ -28,16 +28,16 @@ if (!config.projects.length) {
 // not where we resolved it, log ONCE at boot so "the CEO/Design/Eng marks never
 // tick" is an explained degradation, not a silent mystery. Not fatal — the marks
 // just stay ○ and everything else runs.
-// Bound off-loopback with no allowlist: the browser will send the proxy's
-// hostname, we only know the loopback names, so EVERY request 403s. Fail closed
-// (rebinding is exactly what the gate exists for) but say so at boot, so the
-// operator reads one line here instead of debugging blanket 403s.
-if (!["127.0.0.1", "localhost", "::1"].includes(config.host) && !config.allowedHosts.length) {
-  console.warn(`[host-gate] bound to ${config.host} but AGENTDECK_ALLOWED_HOSTS is empty — every request will be rejected. Set it to the hostname your proxy sends, e.g. AGENTDECK_ALLOWED_HOSTS=agentdeck.example.com`);
-}
-
 if (!existsSync(config.reviewReadBin)) {
   console.warn(`[plan-reviews] gstack-review-read not found (${config.reviewReadBin}) — review tracking disabled (set AGENTDECK_REVIEW_READ_BIN)`);
+}
+
+// Bound off-loopback with no allowlist. Loopback Hosts still work, so this is
+// not "nothing works" — but a browser reaching the box by its LAN/public address
+// or through a proxy sends THAT hostname, and the rebinding gate rejects it. Say
+// so at boot rather than leaving the operator to debug selective 403s.
+if (!isLoopbackBind(config.host) && !config.allowedHosts.length) {
+  console.warn(`[host-gate] bound to ${config.host} with an empty AGENTDECK_ALLOWED_HOSTS — only loopback Hosts (localhost, 127.x.x.x, [::1]) are accepted. Requests carrying any other Host are rejected; set AGENTDECK_ALLOWED_HOSTS=your.domain to allow them.`);
 }
 
 // Write the settings file that agents load via `claude --settings` so Claude

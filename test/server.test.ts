@@ -75,6 +75,19 @@ test("rejects every route when the Host header isn't ours", async () => {
 
     // The board is never disclosed — not even an empty task list.
     expect(await (await fetch(`${base}/api/tasks`, { headers: evil })).text()).not.toContain("tasks");
+
+    // A MALFORMED Host must 403, not 500. The gate has to run before
+    // `new URL(req.url)`: Bun builds that URL from the Host header, so a
+    // malformed one makes the constructor throw, and Bun's fallback error page
+    // answers 500 with the attacker's Host echoed back plus an internal path.
+    // The unit test on allowedHost() passes either way — only this one catches it.
+    for (const bad of ["[::1]evil.com", "localhost:443:evil", "localhost:any"]) {
+      const res = await fetch(`${base}/api/tasks`, { headers: { host: bad } });
+      expect(res.status).toBe(403);
+      const body = await res.text();
+      expect(body).not.toContain("evil");       // no echo of what was sent
+      expect(body).not.toContain("bunfs");      // no internal path
+    }
   } finally {
     server.stop(true);
   }
@@ -92,6 +105,8 @@ test("accepts loopback names on any port, and configured proxy hosts", async () 
   expect(allowedHost("localhost")).toBe(true);        // no port at all
   expect(allowedHost("[::1]:8787")).toBe(true);       // bracketed IPv6
   expect(allowedHost("LocalHost:8787")).toBe(true);   // Host is case-insensitive
+  expect(allowedHost("localhost.")).toBe(true);       // absolute form of the same name
+  expect(allowedHost("127.0.0.2:8787")).toBe(true);   // all of 127/8 is loopback
 
   expect(allowedHost("evil.example")).toBe(false);
   expect(allowedHost("localhost.evil.example")).toBe(false); // suffix trick
@@ -107,6 +122,32 @@ test("accepts loopback names on any port, and configured proxy hosts", async () 
   } finally {
     config.allowedHosts.pop();
   }
+
+  // An operator who writes the port into the env var must still match. The
+  // allowlist goes through the same parser as the request Host.
+  config.allowedHosts.push("proxy.example.com:443");
+  try {
+    expect(allowedHost("proxy.example.com")).toBe(true);
+    expect(allowedHost("proxy.example.com:8443")).toBe(true);
+  } finally {
+    config.allowedHosts.pop();
+  }
+});
+
+// "Ignore the port" must not decay into "ignore any suffix after a trusted
+// name". The first implementation took everything before the first `:` (or
+// between the brackets) and discarded the rest, so a loopback prefix with junk
+// glued on sailed through. Every case here passed as loopback before the fix.
+test("a trusted name with a junk suffix must not pass as loopback", async () => {
+  const { allowedHost } = await import("../src/server.ts");
+
+  expect(allowedHost("[::1]evil.com")).toBe(false);      // suffix after the bracket
+  expect(allowedHost("[::1]x:443")).toBe(false);         // suffix plus a port
+  expect(allowedHost("[::1]@evil.example")).toBe(false); // userinfo after the bracket
+  expect(allowedHost("localhost:any")).toBe(false);      // port isn't numeric
+  expect(allowedHost("localhost:443:evil")).toBe(false); // second colon
+  expect(allowedHost("localhost:")).toBe(false);         // empty port
+  expect(allowedHost("user@localhost")).toBe(false);     // userinfo before the name
 });
 
 // DESIGN.md Rule 3: any text colour clears 4.5:1, so --faint (4.10:1 dark,
