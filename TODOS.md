@@ -7,7 +7,7 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 ## Dashboard / UI
 
 - **`resuming` state visual (DT2)** — **Priority: P3**
-  The daemon sets `status: "resuming"` on restart (A2). The dashboard renders it with a generic chip; give it a distinct, non-alarming indicator (spinner, not error-red) so a daemon restart doesn't look like a failure.
+  The daemon sets `status: "resuming"` on restart (A2). The dashboard renders it with a generic chip; give it a distinct, non-alarming indicator (spinner, not error-red) so a daemon restart doesn't look like a failure. Partially addressed in v0.2.3.0: the CONNECTION indicator now has three distinct states (live / reconnecting in amber / unreachable in red), so a restart no longer reads as a failure. The per-task `resuming` chip is still generic — that half remains open.
 
 - **Escape the remaining `openTask` interpolations** — **Priority: P4**
   `openTask()` interpolates `${t.phase}`, `${t.status}`, and `${id}` into the drawer HTML without `esc()`. Low risk today (all daemon-generated: fixed status/phase enums, `id` = `t_`+uuid — not user input), so it's defense-in-depth, not a live hole. Wrap them in `esc()` for consistency with the rest of the render. (Adversarial review, 2026-07-21.)
@@ -27,6 +27,9 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
   Today a daemon crash pauses agents until it resumes (Path A2-A). The V2 option: agents as detached processes that keep running while the daemon is down, reconnecting to the stream on restart. Only worth it if daemon crashes become a real problem.
 
 ## Security / hardening
+
+- **DNS-rebinding: gate every route on an allowed `Host`** — **Priority: P1**
+  A hostile page whose domain resolves to `127.0.0.1` reaches the daemon with `Host: evil.com`, and reads are ungated by design, so `GET /api/tasks` hands it the whole board (titles, prompts, branches, errors, pending questions). Verified against a running daemon: `curl -H 'Host: evil.com' /api/tasks` → `200` with a body. The `/ws` Origin check added in v0.2.3.0 does NOT close this — it compares `Origin` against `url.host`, which Bun derives from the same attacker-controlled `Host` header, so the two validate each other. Fix: reject any request whose `Host` isn't an expected value (`127.0.0.1:<port>`, `localhost:<port>`, or an explicit allowlist for the reverse-proxy deployment) before routing, covering `/`, `/api/*` and `/ws`. Deliberately deferred from v0.2.3.0: it predates that branch and changes the "reads stay open on localhost" contract, which deserves its own PR. Surfaced by Codex during pre-landing review.
 
 - **Pin release-workflow actions to commit SHAs** — **Priority: P4**
   `.github/workflows/release.yml` runs three actions (`actions/checkout@v4`, `oven-sh/setup-bun@v2`, `softprops/action-gh-release@v2`) pinned to mutable major tags in a `contents: write` job. Supply-chain-hardened choice is a full commit SHA for each (add Dependabot to bump them). Major-tag pinning is fine for now; revisit if the repo gets more contributors. (Review finding, 2026-07-20.)
@@ -55,8 +58,11 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Design system
 
-- **Formalize DESIGN.md (DT5)** — **Priority: P4**
-  The Master Inbox mockup defined the tokens (colors, mono-identity type, attention hierarchy). Lift them into a `DESIGN.md` (or run `/design-consultation`) so future UI stays consistent.
+- ~~**Formalize DESIGN.md (DT5)**~~ — **DONE** (2026-08-04)
+  `DESIGN.md` ships at the repo root: tokens with their roles, the three color rules, the mono-as-identity decision, the two-row header invariants, interaction states, and the a11y floors. Written after the design review that found the approved brand lockup had been dropped during implementation — the failure mode DT5 existed to prevent.
+
+- **Reply drawer renders AskUserQuestion payloads** — **Priority: P3**
+  The drawer takes free text. When an agent's question is a gstack decision brief (options, recommendation, multi-select), the dashboard shows it as prose and the user retypes a letter. Rendering the structured payload would make the human-in-loop moment a first-class UI instead of a text box. (Design review 2026-07-19; density at scale is already tracked under Dashboard / UI.)
 
 ## Completed
 
