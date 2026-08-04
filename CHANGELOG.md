@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.2.4.0] - 2026-08-04
+
+### Added
+- **Answering an agent is now a click, not a transcription job.** When an agent stops on a gstack
+  decision brief, the reply drawer lists its options — letter, label, and which one it recommends —
+  instead of leaving you to read a wall of prose and retype `B`. On a phone, where the whole
+  human-in-loop promise lives, that is the difference between answering and postponing.
+
+  Clicking an option **fills your reply; it does not send it.** The brief stays on screen above, the
+  text stays editable so you can still add a sentence, and Send is unchanged. That is deliberate:
+  headless Claude Code has no structured question tool, so gstack asks in prose and the dashboard
+  parses it — and a parser reading prose is sometimes wrong. Keeping a confirmation step means a
+  wrong guess is visible and costs nothing, rather than being dispatched to an agent running with
+  skipped permissions.
+
+  Nothing changes for a question that isn't a brief: no buttons, same free-text box as before.
+
+### Internal
+- `parseDecisionBrief` sits next to the existing detector in `src/detect.ts` and reuses its
+  `BRIEF_MARKER` guard, so a finished review that merely bullets its findings `A) … B) …` never turns
+  into clickable answers. It also refuses fewer than two options and any gap in the letters — real
+  briefs are A, B, C…, so a gap means it latched onto prose that only looks like a list. It handles
+  the three shapes gstack actually emits: plain lines, markdown bullets, and the bold inline
+  split-chain buckets (`**A) Include**, **B) Defer**`), which a line-based pass would swallow whole.
+- The parsed brief is derived per send and never persisted, so a parser improvement applies to
+  agents that are already waiting — no migration, nothing to backfill.
+
 ## [0.2.3.1] - 2026-08-04
 
 ### Fixed
