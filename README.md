@@ -36,6 +36,16 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
 
 **The human-in-loop mechanic (proven):** in headless mode Claude Code has no AskUserQuestion tool, so the agent asks in **prose** and the turn ends. AgentDeck reads the question, notifies you (Slack/Telegram), and when you reply in the dashboard it injects the answer as a new `claude --resume <sessionId>` turn. That same `resume` is also how agents survive a daemon restart — injection and durability are one operation.
 
+**A daemon restart is not an outage.** Rebuilding or restarting drops every open
+dashboard's WebSocket. The board says so in three distinct states rather than
+freezing on stale data, and it recovers on its own — no page reload, because the
+dashboard token is persisted across restarts.
+
+<p align="center">
+  <img src="docs/demo-conn.gif" width="820"
+       alt="The dashboard header: live in green, then reconnecting in amber when the daemon stops, then daemon unreachable in red, then back to live on its own once it returns.">
+</p>
+
 **How "waiting" is detected:** a headless agent can't interrupt mid-turn — under `claude -p`, Claude Code's `Notification` hook doesn't fire (only `Stop` does, which is redundant with the turn-end `result` event). So when a turn ends, the daemon reads the `result` and decides waiting-vs-done from the prose. The prose heuristic is the signal.
 
 The `Notification`-hook wiring still ships but is **off by default** (`AGENTDECK_HOOKS=true`). The HTTP hook transport works; `Notification` is simply inert under `claude -p`, and it's kept ready for a future interactive / SDK (`query()` + Channels) mode where it would fire.
