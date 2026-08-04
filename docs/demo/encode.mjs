@@ -3,8 +3,12 @@ import { PNG } from 'pngjs';
 import gifenc from 'gifenc';
 const { GIFEncoder, quantize, applyPalette } = gifenc;
 
-// Read the ffconcat list (file + duration pairs) written by capture.mjs.
-const lines = readFileSync('frames/list.txt', 'utf8').split('\n');
+// Usage: node encode.mjs [framesDir] [outFile]   (defaults: frames, demo.gif)
+const FRAMES_DIR = process.argv[2] || 'frames';
+const OUT = process.argv[3] || 'demo.gif';
+
+// Read the ffconcat list (file + duration pairs) written by the capture script.
+const lines = readFileSync(`${FRAMES_DIR}/list.txt`, 'utf8').split('\n');
 const frames = [];
 for (let i = 0; i < lines.length; i++) {
   const m = lines[i].match(/^file '(.+)'$/);
@@ -23,6 +27,6 @@ for (const fr of frames) {
   gif.writeFrame(index, width, height, { palette, delay: fr.delayMs });
 }
 gif.finish();
-writeFileSync('demo.gif', gif.bytes());
-const kb = (readFileSync('demo.gif').length / 1024).toFixed(0);
-console.log(`wrote demo.gif — ${frames.length} frames, ${kb} KB`);
+writeFileSync(OUT, gif.bytes());
+const kb = (readFileSync(OUT).length / 1024).toFixed(0);
+console.log(`wrote ${OUT} — ${frames.length} frames, ${kb} KB`);

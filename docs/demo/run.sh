@@ -16,3 +16,11 @@ node capture.mjs   # captures frames + fails on any dashboard JS error
 node encode.mjs    # frames -> demo.gif (pure JS: gifenc + pngjs)
 cp demo.gif ../demo.gif
 echo "wrote ../demo.gif"
+
+# Second artifact: the connection states, rendered narrow so the state label is
+# legible at the README's display width. Takes ~30s — it really stops the daemon
+# and waits out the give-up threshold and the backoff.
+node capture-conn.mjs
+node encode.mjs frames-conn demo-conn.gif
+cp demo-conn.gif ../demo-conn.gif
+echo "wrote ../demo-conn.gif"
