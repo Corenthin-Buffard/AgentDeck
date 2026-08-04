@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.3.1] - 2026-08-04
+
+### Fixed
+- **A website you visit can no longer read your board.** If a hostile page's domain resolves to
+  `127.0.0.1` (DNS rebinding), the browser treats the daemon as same-origin and the page reaches it
+  directly. Reads are open on localhost by design, so `GET /api/tasks` handed over every task title,
+  prompt, branch, error and pending question. The `/ws` gate shipped in 0.2.3.0 could not stop this:
+  it compared `Origin` against `url.host`, and both come from the attacker-controlled `Host` header,
+  so they validated each other. Every route is now checked against a recognised `Host` **before
+  routing** — reads included, since the reads were the leak.
+
+  Nothing changes for the documented setup. Loopback names are accepted on **any** port, so
+  `ssh -L 9000:127.0.0.1:8787` keeps working even though the browser sends `localhost:9000` while the
+  daemon listens on 8787. Behind a reverse proxy, set `AGENTDECK_ALLOWED_HOSTS` to the hostname your
+  proxy sends; binding off-loopback without it rejects everything and says so on the first line of
+  the boot log rather than leaving you to debug blanket 403s.
+
 ## [0.2.3.0] - 2026-08-04
 
 ### Added
