@@ -1,5 +1,5 @@
 import { expect, test, describe } from "bun:test";
-import { looksLikeQuestion } from "../src/detect.ts";
+import { looksLikeQuestion, parseDecisionBrief } from "../src/detect.ts";
 
 describe("looksLikeQuestion", () => {
   test("detects a trailing question mark", () => {
@@ -150,5 +150,103 @@ describe("looksLikeQuestion", () => {
   test("a labeled list in a completion (no brief marker, no ask) is not a question", () => {
     const t = "Here's what I did:\nA) fixed the bug\nB) added a test\nC) updated docs.\nAll done, committed.";
     expect(looksLikeQuestion(t)).toBe(false);
+  });
+});
+
+describe("parseDecisionBrief", () => {
+  // The canonical shape: options on their own lines, an indented description
+  // under each, and the pick tagged inline.
+  test("pulls options out of a plain brief and keeps the recommended tag", () => {
+    const t =
+      "A) Ship as-is\n  Fine for the happy path but hides the null branch.\n" +
+      "B) Add the test (recommended)\n  Closes the gap; about fifteen minutes.\n" +
+      "Completeness: A=4/10, B=9/10\n" +
+      "Net: one integration test closes the only real gap.";
+    const brief = parseDecisionBrief(t);
+    expect(brief?.options).toEqual([
+      { letter: "A", label: "Ship as-is", recommended: false },
+      { letter: "B", label: "Add the test", recommended: true }, // tag stripped from the label
+    ]);
+  });
+
+  // Split-chain buckets land bold and inline on ONE line. A line-based pass would
+  // swallow the whole line as option A, so this is the case that decides the
+  // parser's shape, not an edge case.
+  test("reads bold inline split-chain buckets as four options", () => {
+    const t =
+      "**D3.1 — Ship E1?**\n" +
+      "**A) Include**, **B) Defer**, **C) Cut**, **D) Hold**\n" +
+      "Net: E1 is low-risk, lean Include.";
+    expect(parseDecisionBrief(t)?.options.map((o) => `${o.letter}:${o.label}`))
+      .toEqual(["A:Include", "B:Defer", "C:Cut", "D:Hold"]);
+  });
+
+  test("reads options rendered as a markdown bullet list", () => {
+    const t = "- A) Ship as-is\n- B) Add the retry cap\nNet: the cap closes a real hang.";
+    expect(parseDecisionBrief(t)?.options.map((o) => o.label)).toEqual(["Ship as-is", "Add the retry cap"]);
+  });
+
+  // No inline tag, so the recommendation has to come off the Recommendation line.
+  test("marks the option a bare-letter Recommendation line names", () => {
+    const t =
+      "**D3 — Test coverage gap**\n" +
+      "Recommendation: B — add the error-path test.\n" +
+      "A) Ship as-is\nB) Add the test\n" +
+      "Net: one test closes the gap.";
+    expect(parseDecisionBrief(t)?.options.find((o) => o.recommended)?.letter).toBe("B");
+  });
+
+  // `Recommendation: <label> because <reason>` is the canonical form. Guessing
+  // which option a label points at is exactly the clever-but-wrong this parser
+  // must not do — no option gets flagged rather than the wrong one.
+  test("does not guess when the Recommendation names a label instead of a letter", () => {
+    const t =
+      "Recommendation: Add the test because the null branch is untested.\n" +
+      "A) Ship as-is\nB) Add the test\n" +
+      "Net: one test closes the gap.";
+    expect(parseDecisionBrief(t)?.options.some((o) => o.recommended)).toBe(false);
+  });
+
+  // ── Refusals. Each of these would put clickable answers in front of an
+  // operator for something that was never a question. ──────────────────────
+  test("refuses a finished review that merely bullets its findings", () => {
+    const t =
+      "Here's what I reviewed:\n" +
+      "A) Architecture — clean\n" +
+      "B) Tests — all pass\n" +
+      "Recommendation: ship it — no blocking findings. Proceeding to /ship.";
+    expect(parseDecisionBrief(t)).toBeNull(); // no Net:/Completeness:/D— marker
+  });
+
+  test("refuses a labeled to-do list in a completion", () => {
+    expect(parseDecisionBrief("Here's what I did:\nA) fixed the bug\nB) added a test\nAll done, committed.")).toBeNull();
+  });
+
+  test("refuses a single option — a brief always offers a choice", () => {
+    expect(parseDecisionBrief("A) Ship as-is\nNet: nothing else to weigh.")).toBeNull();
+  });
+
+  // A gap in the letters means we latched onto prose that only looks like a list.
+  test("refuses non-contiguous letters", () => {
+    expect(parseDecisionBrief("A) Ship as-is\nC) Something else\nNet: pick one.")).toBeNull();
+  });
+
+  test("refuses empty and missing input", () => {
+    expect(parseDecisionBrief("")).toBeNull();
+    expect(parseDecisionBrief(null)).toBeNull();
+    expect(parseDecisionBrief(undefined)).toBeNull();
+  });
+
+  // Everything the detector calls a question must be safe to hand this function:
+  // it either extracts options or returns null, never throws.
+  test("never throws on anything the detector accepts", () => {
+    for (const t of [
+      "Which color should I use?",
+      "Reply with A, B, or C.",
+      "BLOCKED — AskUserQuestion unavailable; no human present.",
+      "Select an option to continue.",
+    ]) {
+      expect(() => parseDecisionBrief(t)).not.toThrow();
+    }
   });
 });

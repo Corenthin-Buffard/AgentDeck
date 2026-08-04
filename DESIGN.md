@@ -147,8 +147,9 @@ Empty states are features: warmth, context, and a primary action. Never
 
 - **Contrast** — every text/background pair clears 4.5:1 in both themes. See Rule 3.
 - **Touch targets** — interactive controls are at least 44px under 620px
-  (`.newbtn`, `.projsel select`). Desktop keeps its density; a mouse does not
-  need the area.
+  (`.newbtn`, `.projsel select`, `.opt`). Desktop keeps its density; a mouse does
+  not need the area. Add every new control to that media query — the reply
+  drawer's option rows shipped at 35px until a measurement caught them.
 - **Focus** — visible focus rings on every control: `outline: 2px solid var(--accent)`
   with `outline-offset: 2px`. Add new controls to that selector list.
 - **Announcements** — `#live` is an `aria-live="polite"` region. State transitions

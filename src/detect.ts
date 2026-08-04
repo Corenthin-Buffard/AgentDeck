@@ -53,3 +53,75 @@ export function looksLikeQuestion(text: string): boolean {
   if (/\?\s*$/.test(tail) || QUESTION_CUES.test(tail)) return true;
   return looksLikeDecisionBrief(trimmed.slice(-2000));
 }
+
+// ── Brief EXTRACTION (the dashboard's reply drawer) ────────────────────────
+// Detection above answers "is this an ask?". This answers "what were the
+// choices?", so the drawer can offer them as buttons instead of making the
+// operator retype a letter off a wall of prose.
+//
+// This parses PROSE, so it will occasionally be wrong. The UI is built around
+// that: a parsed option only PRE-FILLS the reply box, the original brief stays
+// on screen, and nothing is sent until the operator presses Send. A mis-parse is
+// therefore visible and free — which is the only reason parsing prose is an
+// acceptable input to a control surface that drives --dangerously-skip-permissions
+// agents. Do not turn these into one-click send.
+
+export interface BriefOption { letter: string; label: string; recommended: boolean }
+export interface DecisionBrief { options: BriefOption[] }
+
+const RECOMMENDED_TAG = /\s*\((?:recommended|recommand[ée]e?)\)\s*/i;
+// A `Recommendation:` line that names a bare letter. Only a letter counts — the
+// canonical form is `Recommendation: <choice> because <reason>`, where <choice>
+// is often a label, and guessing which option a label refers to would be exactly
+// the kind of clever-but-wrong the mis-parse rule above is written against.
+const RECOMMENDATION_LETTER = /(?:^|\n)\s*Recommendation:\s*(?:option\s+)?([A-H])\b/i;
+
+function addOption(map: Map<string, BriefOption>, letter: string, raw: string): void {
+  const key = letter.toUpperCase();
+  if (map.has(key)) return; // first spelling wins, matching the detector's bias
+  let label = raw.trim().replace(/[,;]+$/, "").trim();
+  const recommended = RECOMMENDED_TAG.test(label);
+  label = label.replace(RECOMMENDED_TAG, " ").trim();
+  if (label) map.set(key, { letter: key, label, recommended });
+}
+
+/**
+ * Pull the labeled options out of a gstack decision brief, or null when the text
+ * isn't confidently one.
+ *
+ * Guards, in order of how much they matter:
+ *  - the same BRIEF_MARKER the detector uses, so a finished review that happens
+ *    to bullet its findings `A) … B) …` is never turned into clickable answers;
+ *  - at least two options;
+ *  - letters contiguous from A. Real briefs are A, B, C…; a gap means we latched
+ *    onto prose that merely looks like a list.
+ */
+export function parseDecisionBrief(text: string | null | undefined): DecisionBrief | null {
+  if (!text) return null;
+  if (!BRIEF_MARKER.test(text)) return null;
+
+  const map = new Map<string, BriefOption>();
+  // Split-chain buckets render bold and inline on ONE line:
+  // `**A) Include**, **B) Defer**, **C) Cut**, **D) Hold**`. Try that first — a
+  // line-based pass would swallow the whole line as option A's label.
+  for (const m of text.matchAll(/\*\*\s*([A-H])\s?[).]\s*([^*\n]+?)\s*\*\*/g)) addOption(map, m[1], m[2]);
+  if (map.size < 2) {
+    map.clear();
+    for (const line of text.split("\n")) {
+      const m = line.match(/^\s*(?:[-*+]\s+)?(?:\*\*)?\s*([A-H])\s?[).]\s+(.+?)\s*$/);
+      if (m) addOption(map, m[1], m[2]);
+    }
+  }
+  if (map.size < 2) return null;
+
+  const options = [...map.values()].sort((a, b) => a.letter.localeCompare(b.letter));
+  const contiguousFromA = options.every((o, i) => o.letter.charCodeAt(0) === 65 + i);
+  if (!contiguousFromA) return null;
+
+  if (!options.some((o) => o.recommended)) {
+    const named = text.match(RECOMMENDATION_LETTER)?.[1]?.toUpperCase();
+    const hit = named && options.find((o) => o.letter === named);
+    if (hit) hit.recommended = true;
+  }
+  return { options };
+}
