@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync, openSync, closeSync, fstatSync, readSync, writeSync, constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { AgentDeckConfig, Project } from "./types.ts";
 
@@ -56,6 +56,69 @@ export function loadProjects(dir: string, fallbackRepo: string): Project[] {
   }
 }
 
+/**
+ * The dashboard token, PERSISTED across restarts (0600 in the data dir).
+ *
+ * It used to be a fresh `randomUUID()` per process. That was harmless while the
+ * token only gated write endpoints — a browser re-reads it from the HTML on the
+ * next request. It stopped being harmless once the token also gated the `/ws`
+ * upgrade: restarting the daemon minted a new token, the already-open dashboard
+ * kept sending the old one, and every reconnect attempt got a 403 forever. Live
+ * updates died until the user manually reloaded — and restarting the daemon is
+ * the single most common thing an operator does.
+ *
+ * Same secrecy either way (unguessable UUID, 0600), and `AGENTDECK_DASHBOARD_TOKEN`
+ * still overrides. MUST NOT throw: config.ts is imported everywhere, so any I/O
+ * problem degrades to an in-memory token rather than crash-looping the daemon.
+ */
+function loadOrCreateDashboardToken(dir: string): string {
+  const file = join(dir, "dashboard-token");
+  // O_NOFOLLOW: never read THROUGH a symlink. A pre-planted link would otherwise
+  // pin the token to attacker-known content. fstat + size cap: refuse anything
+  // that isn't a small regular file, so a fifo or huge file can't hang or blow
+  // up config import (which every module pulls in).
+  const readToken = (): string | null => {
+    let fd: number | undefined;
+    try {
+      fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size === 0 || st.size > 256) return null;
+      const buf = Buffer.alloc(st.size);
+      readSync(fd, buf, 0, st.size, 0);
+      const t = buf.toString("utf8").trim();
+      // Shape-check: our own tokens are UUIDs. Anything else means the file was
+      // tampered with, so mint a fresh one rather than trust it.
+      return /^[0-9a-fA-F-]{36}$/.test(t) ? t : null;
+    } catch {
+      return null;
+    } finally {
+      if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ }
+    }
+  };
+
+  const existing = readToken();
+  if (existing) return existing;
+
+  const token = randomUUID();
+  try {
+    mkdirSync(dir, { recursive: true });
+    // O_EXCL | O_CREAT: create or fail — never write THROUGH an existing path or
+    // symlink. EEXIST means either a concurrent daemon won the race or the file
+    // failed the checks above; re-read once, and only fall back to an in-memory
+    // token if that read is still unusable.
+    const fd = openSync(file, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    try { writeSync(fd, token); } finally { closeSync(fd); }
+    return token;
+  } catch (e: any) {
+    if (e?.code === "EEXIST") {
+      const raced = readToken();
+      if (raced) return raced;
+    }
+    console.warn(`[auth] could not persist the dashboard token to ${file}: ${e.message} — it will change on restart, so an open dashboard needs a reload after one`);
+    return token;
+  }
+}
+
 export const config: AgentDeckConfig = {
   dataDir,
   // A3: bind localhost only. Reach the dashboard via SSH tunnel, not public exposure.
@@ -107,7 +170,7 @@ export const config: AgentDeckConfig = {
   // the dashboard HTML. This one IS injected there (the browser needs it); keeping
   // it separate means scraping the page can't forge hook events. `||` not `??`:
   // an empty env override must not blank the secret and disable the gate.
-  dashboardToken: process.env.AGENTDECK_DASHBOARD_TOKEN || randomUUID(),
+  dashboardToken: process.env.AGENTDECK_DASHBOARD_TOKEN || loadOrCreateDashboardToken(dataDir),
   agentSettingsPath: join(dataDir, "agent-settings.json"),
 
   maxConcurrentAgents: Number(process.env.AGENTDECK_MAX_AGENTS ?? 4),

@@ -26,6 +26,95 @@ test('GET "/" serves the embedded dashboard HTML', async () => {
   }
 });
 
+// The brand lockup was defined in the approved mockup, then quietly dropped
+// during implementation — and nothing caught it, because the only assertion
+// above covers <title>, which lives in <head>. A title can stay correct while
+// the visible header says something else entirely (it did: "gorch·inbox").
+// These assertions cover what a user actually SEES.
+test('GET "/" serves the AgentDeck brand lockup in the body', async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const server = startServer();
+  try {
+    const html = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+    const body = html.slice(html.indexOf("<body"));
+
+    expect(body).toContain("AgentDeck");                    // the wordmark is visible
+    expect(body).toMatch(/<h1[^>]*class="mark"[^>]*>\s*AgentDeck\s*<\/h1>/); // and is the page heading
+    expect(html).toContain('rel="icon"');                   // the tab is identifiable
+    expect(html.toLowerCase()).not.toContain("gorch");       // no pre-rename leftovers
+  } finally {
+    server.stop(true);
+  }
+});
+
+// DESIGN.md Rule 3: any text colour clears 4.5:1, so --faint (4.10:1 dark,
+// 2.80:1 light) is non-text only. That rule was violated the same day it was
+// written — --done shipped with --faint's exact hex and coloured .chip.done at
+// 3.13:1, and nothing caught it. These assertions are that missing guard: they
+// fail if a text rule reaches for --faint again, or if either compliant token
+// is silently reverted. Recompute the ratios before changing a value here.
+test("serves contrast-compliant colour tokens", async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const server = startServer();
+  try {
+    const html = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+
+    expect(html).not.toContain("color:var(--faint)"); // --faint never carries text
+    expect(html).toContain("--dim:#9aa7b4");          // dark  7.71:1 on --bg
+    expect(html).toContain("--dim:#5a6570");          // light 5.59:1 on --bg
+    expect(html).toContain("--done:#8c97a4");         // dark  4.55:1 on its own tint
+    expect(html).toContain("--done:#5d6975");         // light 4.53:1 on its own tint
+    expect(html).toContain("min-height:44px");        // touch targets under 620px
+  } finally {
+    server.stop(true);
+  }
+});
+
+// /ws pushes the full task snapshot on open, and WebSockets are NOT covered by
+// the same-origin policy — so the "reads stay open on localhost" rule that
+// applies to GET endpoints would have let any page the user visits read the
+// board. The upgrade is gated on the dashboard token plus an Origin check.
+test("/ws rejects an upgrade without the dashboard token", async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const server = startServer();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+
+    // The token rides in Sec-WebSocket-Protocol, never the query string.
+    const proto = (t: string) => ({ "sec-websocket-protocol": `agentdeck.v1, ${t}` });
+
+    expect((await fetch(`${base}/ws`)).status).toBe(403);                              // no token
+    expect((await fetch(`${base}/ws`, { headers: proto("nope") })).status).toBe(403);  // wrong token
+    // A token in the URL must NOT work — that transport was deliberately dropped.
+    expect((await fetch(`${base}/ws?token=${config.dashboardToken}`)).status).toBe(403);
+
+    // Right token, foreign Origin — the cross-origin browser case.
+    const foreign = await fetch(`${base}/ws`, {
+      headers: { ...proto(config.dashboardToken), origin: "https://evil.example" },
+    });
+    expect(foreign.status).toBe(403);
+
+    // A malformed Origin must fail CLOSED. `new URL(origin)` throws on garbage,
+    // and the catch sets sameHost = false — an attacker sending a junk Origin
+    // must not slip past the host check into the token check.
+    const junk = await fetch(`${base}/ws`, {
+      headers: { ...proto(config.dashboardToken), origin: "not-a-url" },
+    });
+    expect(junk.status).toBe(403);
+
+    // Right token, no Origin (a non-browser client): passes the gate, then fails
+    // the upgrade itself because plain fetch sends no WebSocket handshake — 400,
+    // not 403, proves the gate let it through.
+    const allowed = await fetch(`${base}/ws`, { headers: proto(config.dashboardToken) });
+    expect(allowed.status).toBe(400);
+  } finally {
+    server.stop(true);
+  }
+});
+
 // A3/T5: the hook endpoints must reject a forged POST that lacks the per-session
 // token, so a random local process can't flip a task to `waiting`.
 test("hook endpoints require the per-session token", async () => {
