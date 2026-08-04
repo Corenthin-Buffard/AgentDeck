@@ -11,7 +11,7 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 
 <p align="center"><sub>One agent flips to <code>waiting</code>, you answer in the drawer, and it resumes — live over WebSocket.</sub></p>
 
-> Status: **v0.2.0.2** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
+> Status: **v0.2.3.0** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
 
 ## Why this and not Claude Squad / Conductor / amux
 
@@ -165,9 +165,14 @@ The dashboard's **Upload** button sends a local file to the box (no more manual
 `scp`): it lands under `<dataDir>/uploads/<project>/` and the toast gives you the
 absolute VPS path to reference in a task (with a copy button). Uploads — and every
 other state-changing request (create/stop/delete/reply) — are gated by a
-per-session dashboard token (injected into the served HTML, sent as a header, so a
-cross-origin page can't forge them) and path-contained: capped at 25 MB, filename
-sanitized, symlinked directories rejected, no writing outside the target dir.
+dashboard token (persisted 0600 in the data dir, injected into the served HTML,
+sent as a header, so a cross-origin page can't forge them) and path-contained:
+capped at 25 MB, filename sanitized, symlinked directories rejected, no writing
+outside the target dir. The **live WebSocket is gated on the same token** (sent as
+a subprotocol, never in the URL) plus an `Origin` check: WebSockets are not covered
+by the same-origin policy, so without that gate any page you had open could read
+the board. Note that plain `GET` reads stay open on localhost by design, which a
+DNS-rebinding page can still reach — tracked as P1 in `TODOS.md`.
 
 ## QA with authenticated cookies on the VPS
 
