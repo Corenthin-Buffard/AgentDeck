@@ -28,6 +28,14 @@ if (!config.projects.length) {
 // not where we resolved it, log ONCE at boot so "the CEO/Design/Eng marks never
 // tick" is an explained degradation, not a silent mystery. Not fatal — the marks
 // just stay ○ and everything else runs.
+// Bound off-loopback with no allowlist: the browser will send the proxy's
+// hostname, we only know the loopback names, so EVERY request 403s. Fail closed
+// (rebinding is exactly what the gate exists for) but say so at boot, so the
+// operator reads one line here instead of debugging blanket 403s.
+if (!["127.0.0.1", "localhost", "::1"].includes(config.host) && !config.allowedHosts.length) {
+  console.warn(`[host-gate] bound to ${config.host} but AGENTDECK_ALLOWED_HOSTS is empty — every request will be rejected. Set it to the hostname your proxy sends, e.g. AGENTDECK_ALLOWED_HOSTS=agentdeck.example.com`);
+}
+
 if (!existsSync(config.reviewReadBin)) {
   console.warn(`[plan-reviews] gstack-review-read not found (${config.reviewReadBin}) — review tracking disabled (set AGENTDECK_REVIEW_READ_BIN)`);
 }

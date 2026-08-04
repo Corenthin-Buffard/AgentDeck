@@ -60,6 +60,34 @@ const clients = new Set<ServerWebSocket<unknown>>();
 // the browser accepts the handshake; kept in sync with public/index.html.
 const WS_PROTOCOL = "agentdeck.v1";
 
+// ── DNS-rebinding gate ────────────────────────────────────────────────────
+// A hostile page served from a domain whose DNS resolves to 127.0.0.1 reaches
+// this daemon from the user's OWN browser, same-origin. Nothing below stops it:
+// reads are ungated by design, so `GET /api/tasks` hands it the whole board, and
+// the /ws Origin check can't help because it compares `Origin` against
+// `url.host` — and Bun derives `url.host` from the same attacker-controlled
+// `Host` header, so the two validate each other.
+//
+// So decide up front which Host values are ours. Compare NAMES, ignore the port:
+// `ssh -L 9000:127.0.0.1:8787` makes the browser send `localhost:9000` while we
+// listen on 8787, and that tunnel is the documented way in.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+export function allowedHost(hostHeader: string | null | undefined): boolean {
+  if (!hostHeader) return false; // HTTP/1.1 requires Host; absent = not something we serve
+  const raw = hostHeader.trim().toLowerCase();
+  // Strip the port. IPv6 literals are bracketed: `[::1]:8787` -> `::1`.
+  let name: string;
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]");
+    if (end === -1) return false; // malformed bracket — fail closed
+    name = raw.slice(1, end);
+  } else {
+    name = raw.split(":")[0];
+  }
+  if (!name) return false;
+  return LOOPBACK_HOSTS.has(name) || config.allowedHosts.includes(name);
+}
+
 function broadcast() {
   const payload = JSON.stringify({ type: "tasks", tasks: store.listTasks() });
   for (const ws of clients) { try { ws.send(payload); } catch { /* dropped */ } }
@@ -85,6 +113,16 @@ export function startServer() {
     async fetch(req, srv) {
       const url = new URL(req.url);
       const { pathname } = url;
+
+      // FIRST, before any routing: reject a Host we don't recognise. This has to
+      // run ahead of the read routes, because the reads are the leak — a rebound
+      // page reading /api/tasks never touches an auth gate.
+      if (!allowedHost(req.headers.get("host"))) {
+        return new Response(
+          "host not allowed — set AGENTDECK_ALLOWED_HOSTS if you serve this behind a reverse proxy\n",
+          { status: 403 },
+        );
+      }
 
       // WebSockets are NOT covered by the same-origin policy. The "reads stay
       // open on localhost" reasoning below does NOT extend here: CORS stops a
