@@ -39,7 +39,10 @@ db.exec(`
     last_activity INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     error TEXT,
-    plan_reviews TEXT
+    plan_reviews TEXT,
+    pipeline INTEGER NOT NULL DEFAULT 0,
+    step INTEGER NOT NULL DEFAULT 0,
+    step_skill_seen INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +74,26 @@ export function migrateTasks(database: Database) {
   const has = (name: string) => cols.some((c) => c.name === name);
   if (!has("project")) database.exec("ALTER TABLE tasks ADD COLUMN project TEXT");
   if (!has("plan_reviews")) database.exec("ALTER TABLE tasks ADD COLUMN plan_reviews TEXT");
+  // The pipeline columns BACKFILL, unlike the two above, and the difference is
+  // deliberate. `project` and `plan_reviews` coalesce at read time so they track
+  // the live registry. `pipeline` must NOT: it records a choice made when the task
+  // was created, and a task already in flight cannot be allowed to change what it
+  // is doing because the operator edited AGENTDECK_PIPELINE and restarted. Every
+  // pre-existing row predates the feature, so it is free-form: 0.
+  // `ALTER TABLE ... DEFAULT 0` already writes 0 into existing rows, so the
+  // UPDATE is belt-and-braces for a column added by an earlier build without one.
+  if (!has("pipeline")) {
+    database.exec("ALTER TABLE tasks ADD COLUMN pipeline INTEGER NOT NULL DEFAULT 0");
+    database.exec("UPDATE tasks SET pipeline = 0 WHERE pipeline IS NULL");
+  }
+  if (!has("step")) {
+    database.exec("ALTER TABLE tasks ADD COLUMN step INTEGER NOT NULL DEFAULT 0");
+    database.exec("UPDATE tasks SET step = 0 WHERE step IS NULL");
+  }
+  if (!has("step_skill_seen")) {
+    database.exec("ALTER TABLE tasks ADD COLUMN step_skill_seen INTEGER NOT NULL DEFAULT 0");
+    database.exec("UPDATE tasks SET step_skill_seen = 0 WHERE step_skill_seen IS NULL");
+  }
 }
 migrateTasks(db);
 
@@ -82,17 +105,28 @@ function rowToTask(r: any): Task {
     pendingQuestion: r.pending_question, lastActivity: r.last_activity,
     createdAt: r.created_at, error: r.error,
     planReviews: parsePlanReviewsCol(r.plan_reviews),
+    // `=== 1` not truthiness: the column is an INTEGER and a legacy NULL must read
+    // as false, never as "whatever the config says today".
+    pipeline: r.pipeline === 1,
+    step: typeof r.step === "number" ? r.step : 0,
+    stepSkillSeen: r.step_skill_seen === 1,
   };
 }
 
 export const store = {
   insertTask(t: Task) {
     db.query(`INSERT INTO tasks
-      (id,project,title,prompt,branch,worktree,tmux,session_id,status,phase,pending_question,last_activity,created_at,error,plan_reviews)
-      VALUES ($id,$project,$title,$prompt,$branch,$worktree,$tmux,$sid,$status,$phase,$pq,$la,$ca,$err,$pr)`).run({
+      (id,project,title,prompt,branch,worktree,tmux,session_id,status,phase,pending_question,last_activity,created_at,error,plan_reviews,pipeline,step,step_skill_seen)
+      VALUES ($id,$project,$title,$prompt,$branch,$worktree,$tmux,$sid,$status,$phase,$pq,$la,$ca,$err,$pr,$pipe,$step,$seen)`).run({
       $id: t.id, $project: t.project, $title: t.title, $prompt: t.prompt, $branch: t.branch, $worktree: t.worktree,
       $tmux: t.tmux, $sid: t.sessionId, $status: t.status, $phase: t.phase, $pq: t.pendingQuestion,
       $la: t.lastActivity, $ca: t.createdAt, $err: t.error, $pr: JSON.stringify(t.planReviews),
+      // Booleans are bound as 0/1 explicitly — same reason setPlanReviews exists:
+      // patchTask binds raw, and the column is an INTEGER either way.
+      // `?? 0` mirrors rowToTask's coalescing: the columns carry DEFAULT 0, so a
+      // caller that predates these fields writes a free-form task at step 0 rather
+      // than tripping a NOT NULL constraint.
+      $pipe: t.pipeline ? 1 : 0, $step: t.step ?? 0, $seen: t.stepSkillSeen ? 1 : 0,
     });
   },
   // Dedicated setter: patchTask binds each value raw, and SQLite can't bind a plain
@@ -100,6 +134,18 @@ export const store = {
   // live PlanReviews object through the generic patch path.
   setPlanReviews(id: string, reviews: PlanReviews) {
     db.query("UPDATE tasks SET plan_reviews = ? WHERE id = ?").run(JSON.stringify(reviews), id);
+  },
+  /** Advance to a pipeline step, clearing the per-step skill observation. Both
+   *  move together on purpose — `stepSkillSeen` is a property OF the current step,
+   *  so leaving it set across an advance would credit the new step with the old
+   *  one's skill. Dedicated setter for the same reason as setPlanReviews: patchTask
+   *  binds raw and these are INTEGER columns, not booleans. */
+  setStep(id: string, step: number) {
+    db.query("UPDATE tasks SET step = ?, step_skill_seen = 0 WHERE id = ?").run(step, id);
+  },
+  /** Record that the current step invoked a gstack skill. */
+  setStepSkillSeen(id: string, seen: boolean) {
+    db.query("UPDATE tasks SET step_skill_seen = ? WHERE id = ?").run(seen ? 1 : 0, id);
   },
   patchTask(id: string, patch: Partial<Task>) {
     const map: Record<string, string> = {

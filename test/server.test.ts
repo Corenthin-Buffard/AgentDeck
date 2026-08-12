@@ -730,3 +730,39 @@ describe("src/main.ts entry", () => {
     }
   });
 }, 30000);
+
+// ── pipeline flag coercion ──────────────────────────────────────────────────
+// POST /api/tasks accepts an optional `pipeline`. Tested through the exported
+// helper rather than the endpoint: reaching createTask would build a real git
+// worktree and spawn a real `claude`, which is not a unit test.
+describe("pipelineFlag", () => {
+  test("passes a real boolean through", async () => {
+    const { pipelineFlag } = await import("../src/server.ts");
+    expect(pipelineFlag(true)).toBe(true);
+    expect(pipelineFlag(false)).toBe(false);
+  });
+
+  test("absent means 'not specified' — createTask falls back to the config default", async () => {
+    const { pipelineFlag } = await import("../src/server.ts");
+    expect(pipelineFlag(undefined)).toBeUndefined();
+    expect(pipelineFlag(null)).toBeUndefined();
+  });
+
+  test("the STRING \"false\" must not turn the pipeline on", async () => {
+    const { pipelineFlag } = await import("../src/server.ts");
+    // The failure this guards: "false" is truthy, so a looser check would enable
+    // the pipeline for a task the operator explicitly opted out of — and that task
+    // would go on to push a branch and open a PR.
+    expect(pipelineFlag("false")).toBeUndefined();
+    expect(pipelineFlag("true")).toBeUndefined();
+    expect(pipelineFlag("")).toBeUndefined();
+  });
+
+  test("numbers and objects are ignored rather than coerced", async () => {
+    const { pipelineFlag } = await import("../src/server.ts");
+    expect(pipelineFlag(1)).toBeUndefined();
+    expect(pipelineFlag(0)).toBeUndefined();
+    expect(pipelineFlag({})).toBeUndefined();
+    expect(pipelineFlag([])).toBeUndefined();
+  });
+});

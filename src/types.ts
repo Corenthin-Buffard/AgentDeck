@@ -51,6 +51,17 @@ export interface Task {
   createdAt: number;
   error: string | null;
   planReviews: PlanReviews; // which plan reviews ran on this branch (auto-detected from the gstack log)
+  // ── daemon-driven gstack pipeline ────────────────────────────────────────
+  // When `pipeline` is true the DAEMON drives the task through the step table,
+  // one `claude -p` turn per step, and `phase` comes from the step it commanded
+  // rather than being inferred from the stream. When false the task is free-form
+  // and phase is inferred exactly as it always was.
+  pipeline: boolean;
+  step: number;          // index into the step table; meaningless when !pipeline
+  stepSkillSeen: boolean; // did the CURRENT step actually invoke a gstack skill?
+                          // A step that finishes without one means the pipeline
+                          // was commanded and did not happen — a failure the board
+                          // must not render as ordinary progress.
 }
 
 export interface AgentEvent {
@@ -100,6 +111,11 @@ export interface AgentDeckConfig {
   // relaxes is an undocumented Claude Code internal. See agentEnv() in agent.ts.
   allowRoot: boolean;
   permissionMode: string;  // used only when dangerouslySkipPermissions=false
+  // Default for a new task's `pipeline` flag (AGENTDECK_PIPELINE). Ships OFF:
+  // the machinery lands observable and harmless, and the default flips only once
+  // the compliance eval has a baseline. A task stores its OWN choice at creation,
+  // so changing this never alters a task already in flight.
+  pipelineDefault: boolean;
   extraClaudeArgs: string[]; // escape hatch for extra claude flags (--add-dir, --model, …)
   // Notification-hook wiring: launched agents POST hook events to the daemon.
   notificationHooks: boolean;    // wire the Notification/PreToolUse HTTP hooks

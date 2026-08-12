@@ -138,3 +138,71 @@ describe("plan_reviews serialize ↔ parse round-trip", () => {
       .toEqual({ ceo: null, design: null, eng: { status: "clean", stale: false } });
   });
 });
+
+// ── pipeline columns ────────────────────────────────────────────────────────
+// Unlike `project` and `plan_reviews`, these BACKFILL rather than coalescing at
+// read time. `pipeline` records a choice made when the task was created: a task
+// already in flight must not change what it is doing because the operator edited
+// AGENTDECK_PIPELINE and restarted the daemon.
+
+// The real v0.2.4.1 schema — what an upgrading user's DB actually looks like.
+const SCHEMA_V0241 = `
+  CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, project TEXT, title TEXT NOT NULL, prompt TEXT NOT NULL,
+    branch TEXT NOT NULL, worktree TEXT NOT NULL, tmux TEXT, session_id TEXT,
+    status TEXT NOT NULL, phase TEXT NOT NULL, pending_question TEXT,
+    last_activity INTEGER NOT NULL, created_at INTEGER NOT NULL, error TEXT,
+    plan_reviews TEXT
+  );`;
+
+describe("pipeline column migration (REGRESSION: live v0.2.4.1 schema)", () => {
+  const seed = (db: Database) =>
+    db.exec(`INSERT INTO tasks (id,project,title,prompt,branch,worktree,status,phase,last_activity,created_at)
+             VALUES ('t_old','web','legacy','do x','agentdeck/x','/wt','running','run',1,1)`);
+
+  test("adds all three columns and BACKFILLS legacy rows to free-form", () => {
+    const db = new Database(":memory:");
+    db.exec(SCHEMA_V0241);
+    seed(db);
+    expect(cols(db)).not.toContain("pipeline");
+
+    migrate(db);
+
+    expect(cols(db)).toContain("pipeline");
+    expect(cols(db)).toContain("step");
+    expect(cols(db)).toContain("step_skill_seen");
+    // Backfilled, NOT left NULL: every pre-existing row predates the feature, so
+    // it is free-form. A NULL here would later read as "whatever the config says".
+    const row = db.query("SELECT pipeline, step, step_skill_seen FROM tasks WHERE id='t_old'")
+      .get() as { pipeline: number; step: number; step_skill_seen: number };
+    expect(row.pipeline).toBe(0);
+    expect(row.step).toBe(0);
+    expect(row.step_skill_seen).toBe(0);
+    db.close();
+  });
+
+  test("a running pipeline task keeps its stored choice across a migration re-run", () => {
+    const db = new Database(":memory:");
+    db.exec(SCHEMA_V0241);
+    migrate(db);
+    db.exec(`INSERT INTO tasks (id,project,title,prompt,branch,worktree,status,phase,last_activity,created_at,pipeline,step,step_skill_seen)
+             VALUES ('t_pipe','web','p','do y','agentdeck/y','/wt2','running','review',2,2,1,3,1)`);
+    migrate(db); // idempotent: must not reset an in-flight task to free-form
+    const row = db.query("SELECT pipeline, step, step_skill_seen FROM tasks WHERE id='t_pipe'")
+      .get() as { pipeline: number; step: number; step_skill_seen: number };
+    expect(row.pipeline).toBe(1);
+    expect(row.step).toBe(3);
+    expect(row.step_skill_seen).toBe(1);
+    db.close();
+  });
+
+  test("migrates a v0.1.x DB (no project, no plan_reviews, no pipeline) in one pass", () => {
+    const db = new Database(":memory:");
+    db.exec(OLD_SCHEMA);
+    migrate(db);
+    for (const c of ["project", "plan_reviews", "pipeline", "step", "step_skill_seen"]) {
+      expect(cols(db)).toContain(c);
+    }
+    db.close();
+  });
+});

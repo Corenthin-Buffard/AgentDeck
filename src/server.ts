@@ -138,6 +138,21 @@ export function isLoopbackBind(host: string): boolean {
  * every send costs nothing measurable and means a parser improvement applies to
  * agents that are already waiting, with no migration and nothing to backfill.
  */
+/**
+ * Read the request body's `pipeline` field, or `undefined` for "not specified"
+ * (which lets createTask fall through to config.pipelineDefault).
+ *
+ * ONLY a real boolean counts. A stale client sending the STRING "false" would be
+ * truthy under any looser check, silently turning the pipeline ON for a task the
+ * operator asked to keep free-form — and that task would then go and open a PR.
+ * Erring toward the configured default is always recoverable; guessing `true`
+ * from a string is not. PURE + exported so the coercion is testable without
+ * creating a worktree and spawning a real agent.
+ */
+export function pipelineFlag(v: unknown): boolean | undefined {
+  return typeof v === "boolean" ? v : undefined;
+}
+
 export function withBriefs<T extends { status: string; pendingQuestion?: string | null }>(tasks: T[]) {
   return tasks.map((t) => {
     // Only a WAITING agent is asking anything. Parsing a running or done task's
@@ -207,7 +222,14 @@ export function startServer() {
   // so its write fetches can carry the x-agentdeck-token header. Computed once —
   // fixed for the process. Function replacement so a `$` in a custom token isn't
   // read as a $-pattern.
-  const dashboardHtml = indexHtml.replace("__AD_TOKEN__", () => escAttr(config.dashboardToken));
+  // The pipeline default rides along in the same meta-tag mechanism. It belongs
+  // here rather than on /api/projects (it is not a property of a project) and not
+  // on /api/health (that answers "is this daemon working", not "how is it set up").
+  // The New-task checkbox needs it before the first render, so a served constant
+  // beats another round trip.
+  const dashboardHtml = indexHtml
+    .replace("__AD_TOKEN__", () => escAttr(config.dashboardToken))
+    .replace("__AD_PIPELINE_DEFAULT__", () => (config.pipelineDefault ? "true" : "false"));
   // From here on, a notice raised at RUNTIME (agent.ts retracting the root-bypass
   // claim) reaches every open dashboard immediately instead of waiting for the next
   // reconnect. Registered before serve() so nothing raised during startup is lost.
@@ -341,8 +363,9 @@ export function startServer() {
         if (b.projectId != null && b.projectId !== "" && !projectById(String(b.projectId))) {
           return json({ error: "unknown project" }, 400);
         }
+        const pipeline = pipelineFlag(b.pipeline);
         try {
-          const t = await createTask(String(b.title), String(b.prompt), b.projectId ? String(b.projectId) : undefined);
+          const t = await createTask(String(b.title), String(b.prompt), b.projectId ? String(b.projectId) : undefined, pipeline);
           return json({ task: t });
         } catch (e: any) {
           return json({ error: `could not create task: ${e.message}` }, 500);

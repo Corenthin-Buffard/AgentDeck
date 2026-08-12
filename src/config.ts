@@ -176,6 +176,11 @@ export const config: AgentDeckConfig = {
   // opt-in, so anything that isn't an explicit "true" leaves it alone.
   allowRoot: isOptIn(process.env.AGENTDECK_ALLOW_ROOT),
   permissionMode: process.env.AGENTDECK_PERMISSION_MODE ?? "acceptEdits",
+  // Default for a new task's pipeline flag. OFF unless explicitly enabled: this
+  // ships the state machine observable and harmless, so upgrading a patch release
+  // can never start opening PRs on its own. `!== "false"` rather than `=== "true"`
+  // once opted in, matching the AGENTDECK_SKIP_PERMISSIONS idiom above.
+  pipelineDefault: (process.env.AGENTDECK_PIPELINE ?? "false") !== "false",
   extraClaudeArgs: (process.env.AGENTDECK_CLAUDE_ARGS ?? "").split(" ").filter(Boolean),
 
   // Notification-hook wiring. OPT-IN (off by default): it's unproven under

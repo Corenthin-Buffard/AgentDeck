@@ -11,8 +11,16 @@ function slugify(s: string): string {
 }
 
 /** 1 task = 1 branch = 1 worktree = 1 agent. taskId is the correlation key.
- *  `projectId` picks the repo; omitted/unknown falls back to the first project. */
-export async function createTask(title: string, prompt: string, projectId?: string): Promise<Task> {
+ *  `projectId` picks the repo; omitted/unknown falls back to the first project.
+ *  `pipeline` decides whether the daemon drives this task through the gstack step
+ *  table or leaves it free-form; it is STORED on the task, so a later change to
+ *  AGENTDECK_PIPELINE never alters a task already running. */
+export async function createTask(
+  title: string,
+  prompt: string,
+  projectId?: string,
+  pipeline: boolean = config.pipelineDefault,
+): Promise<Task> {
   const project = projectById(projectId) ?? config.projects[0];
   if (!project) throw new Error("no project configured — add one to projects.json");
   const id = "t_" + randomUUID().slice(0, 8);
@@ -24,6 +32,7 @@ export async function createTask(title: string, prompt: string, projectId?: stri
     status: "running", phase: "unknown", pendingQuestion: null,
     lastActivity: now, createdAt: now, error: null,
     planReviews: { ceo: null, design: null, eng: null },
+    pipeline, step: 0, stepSkillSeen: false,
   };
   store.insertTask(task);
   emitUpdate(id);
