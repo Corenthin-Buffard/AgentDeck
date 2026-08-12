@@ -6,6 +6,7 @@ import { emitUpdate } from "./bus.ts";
 import { clearNotice, notice } from "./notices.ts";
 import { notify } from "./notify.ts";
 import { phaseFromSignal, mergePhase, canStillReview, slashToSkill } from "./phase.ts";
+import { loadSteps, stepPrompt } from "./pipeline.ts";
 import { looksLikeQuestion } from "./detect.ts";
 import type { Task, Phase, Status, PlanReviews, PlanReviewState } from "./types.ts";
 
@@ -455,7 +456,17 @@ function attach(task: Task, child: ChildProcess) {
   /** Apply a stream signal, carrying its authoritative-ness through to the merge. */
   const applySignal = (sig: { skill?: string; tool?: string; shipped?: boolean }) => {
     const s = phaseFromSignal(sig);
-    if (s) setPhase(s.phase, s.authoritative);
+    if (!s) return;
+    // A PIPELINE task's phase is whatever the daemon commanded — it does not get
+    // re-derived from the stream. What the stream is good for here is confirming
+    // the agent actually ran the skill it was told to; a step that completes
+    // without one is the pipeline silently not happening.
+    const t = store.getTask(task.id);
+    if (t?.pipeline) {
+      if (sig.skill && !t.stepSkillSeen) store.setStepSkillSeen(task.id, true);
+      return;
+    }
+    setPhase(s.phase, s.authoritative);
   };
 
   // `?.` not `!`: on Bun these streams exist even for a spawn that never started,
@@ -579,6 +590,57 @@ function attach(task: Task, child: ChildProcess) {
     pump();
   });
 
+  /**
+   * Retry the CURRENT pipeline step after a transient failure. Returns false when
+   * the caller should mark the task failed instead — not a pipeline task, or the
+   * budget is spent.
+   *
+   * Bounded, and the bound is per step: a step that succeeds resets it, so a long
+   * pipeline cannot accumulate retries into an unbounded loop, and a step that is
+   * genuinely broken stops after MAX_STEP_RETRIES rather than burning tokens
+   * forever on something that will never work.
+   */
+  function retryStep(why: string): boolean {
+    const t = store.getTask(task.id);
+    if (!t?.pipeline) return false;
+    const used = stepRetries.get(task.id) ?? 0;
+    if (used >= MAX_STEP_RETRIES) {
+      stepRetries.delete(task.id);
+      patch({ status: "error", error: `step ${t.step + 1} failed ${used + 1}× (${why})` });
+      notify(store.getTask(task.id)!, "error");
+      return true; // handled — do NOT let the caller patch a second error
+    }
+    stepRetries.set(task.id, used + 1);
+    log("log", `step ${t.step + 1} failed (${why}) — retry ${used + 1}/${MAX_STEP_RETRIES}`);
+    runStep(t, t.step);
+    return true;
+  }
+
+  /**
+   * Advance a pipeline task to its next step. Returns false when there is nothing
+   * to advance — a free-form task, or the last step just finished — in which case
+   * the caller marks the task done.
+   */
+  function advancePipeline(): boolean {
+    const t = store.getTask(task.id);
+    if (!t?.pipeline) return false;
+    stepRetries.delete(task.id); // the step succeeded; its budget is spent, not carried
+    const steps = loadSteps();
+    const finished = steps[t.step];
+    // The step was COMMANDED to run a skill and the stream never showed one. The
+    // work may well be fine, but the pipeline did not happen — record it so the
+    // board can say so rather than showing ordinary progress.
+    if (finished?.skill && !t.stepSkillSeen) {
+      store.bumpPipelineMissed(task.id);
+      log("log", `step ${t.step + 1} finished without invoking /${finished.skill}`);
+    }
+    const next = t.step + 1;
+    if (next >= steps.length) return false; // pipeline complete → caller marks done
+    store.setStep(task.id, next);
+    runStep(store.getTask(task.id)!, next);
+    return true;
+  }
+
   function handle(e: any) {
     if (e.type === "system" && e.subtype === "init") {
       sawInit = true; // the launch got past Claude Code's startup checks
@@ -642,18 +704,28 @@ function attach(task: Task, child: ChildProcess) {
       const finalText = (text || e.result || "").trim();
       log("text", finalText.slice(0, EVENT_TEXT_MAX));
       if (e.subtype !== "success") {
-        patch({ status: "error", error: `result: ${e.subtype}` });
-        notify(store.getTask(task.id)!, "error");
+        // TRANSIENT: the turn itself failed (API error, aborted). For a pipeline
+        // task, retrying the step is worth it — losing six completed steps to one
+        // blip would be the daemon's fault, not the agent's. A step that RAN and
+        // reported it could not proceed exits successfully and is handled below,
+        // so this branch never retries something that will fail again forever.
+        if (!retryStep(`result: ${e.subtype}`)) {
+          patch({ status: "error", error: `result: ${e.subtype}` });
+          notify(store.getTask(task.id)!, "error");
+        }
       } else if (looksLikeQuestion(finalText)) {
         // The agent's ask sits at the END of the turn; for a long turn (a heavy
         // gstack skill) keep the TAIL, not the head, so the drawer shows the
         // actual question/decision briefs instead of the intro.
+        // A question does NOT advance the pipeline: answering resumes THIS step's
+        // session, so the step the operator was asked about is the step that
+        // finishes. See answer().
         const shown = finalText.length > EVENT_TEXT_MAX ? "…" + finalText.slice(-(EVENT_TEXT_MAX - 1)) : finalText;
         patch({ status: "waiting", pendingQuestion: shown });
         log("question", shown);
         notify(store.getTask(task.id)!, "waiting");
-      } else {
-        setPhase("done");
+      } else if (!advancePipeline()) {
+        setPhase("done", true);
         patch({ status: "done" });
         notify(store.getTask(task.id)!, "done");
       }
@@ -701,8 +773,44 @@ function spawnAgent(task: Task, argv: string[]): void {
   attach(task, child);
 }
 
+// Per-step retry budget for pipeline tasks. Reset when a step succeeds, so the
+// bound is per step rather than per task.
+const MAX_STEP_RETRIES = 2;
+const stepRetries = new Map<string, number>();
+
+/**
+ * Run one pipeline step in a FRESH session.
+ *
+ * Fresh, not `--resume`, and that is the load-bearing choice. Resuming would
+ * accumulate seven heavy skills' worth of transcript into one context, which
+ * compacts — and a compacted agent that loses the thread simply ends its turn,
+ * which this daemon reads as success. Each step instead starts clean and picks up
+ * where the last one left off through gstack's on-disk artifacts (the spec file,
+ * `*-reviews.jsonl`, the test plan). That handoff is the design's central bet and
+ * the one thing only a real run can validate.
+ *
+ * `task.sessionId` therefore holds the CURRENT step's session, which is what the
+ * A2 restart loop resumes and what an operator's answer continues.
+ */
+function runStep(task: Task, index: number): void {
+  const steps = loadSteps();
+  const step = steps[index];
+  if (!step) return;
+  store.patchTask(task.id, { status: "running", phase: step.phase, lastActivity: Date.now() });
+  store.addEvent({ taskId: task.id, ts: Date.now(), kind: "phase", data: step.phase });
+  emitUpdate(task.id);
+  // scheduleAfterExit, not schedule: the turn that just ended may still have a
+  // live child for a few milliseconds, and two `claude` processes in one worktree
+  // would edit the same files at once.
+  scheduleAfterExit(task.id, () =>
+    spawnAgent(task, argvFor({ prompt: stepPrompt(step, task.prompt) })));
+}
+
 /** Launch a fresh agent for a task (turn 1). */
 export function launchTask(task: Task): void {
+  // A pipeline task starts at step 0 under the daemon's control; a free-form task
+  // gets its prompt verbatim, exactly as before.
+  if (task.pipeline) { runStep(task, task.step); return; }
   schedule(task.id, () => spawnAgent(task, argvFor({ prompt: task.prompt })));
 }
 

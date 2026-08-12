@@ -42,7 +42,8 @@ db.exec(`
     plan_reviews TEXT,
     pipeline INTEGER NOT NULL DEFAULT 0,
     step INTEGER NOT NULL DEFAULT 0,
-    step_skill_seen INTEGER NOT NULL DEFAULT 0
+    step_skill_seen INTEGER NOT NULL DEFAULT 0,
+    pipeline_missed INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +95,10 @@ export function migrateTasks(database: Database) {
     database.exec("ALTER TABLE tasks ADD COLUMN step_skill_seen INTEGER NOT NULL DEFAULT 0");
     database.exec("UPDATE tasks SET step_skill_seen = 0 WHERE step_skill_seen IS NULL");
   }
+  if (!has("pipeline_missed")) {
+    database.exec("ALTER TABLE tasks ADD COLUMN pipeline_missed INTEGER NOT NULL DEFAULT 0");
+    database.exec("UPDATE tasks SET pipeline_missed = 0 WHERE pipeline_missed IS NULL");
+  }
 }
 migrateTasks(db);
 
@@ -110,14 +115,15 @@ function rowToTask(r: any): Task {
     pipeline: r.pipeline === 1,
     step: typeof r.step === "number" ? r.step : 0,
     stepSkillSeen: r.step_skill_seen === 1,
+    pipelineMissed: typeof r.pipeline_missed === "number" ? r.pipeline_missed : 0,
   };
 }
 
 export const store = {
   insertTask(t: Task) {
     db.query(`INSERT INTO tasks
-      (id,project,title,prompt,branch,worktree,tmux,session_id,status,phase,pending_question,last_activity,created_at,error,plan_reviews,pipeline,step,step_skill_seen)
-      VALUES ($id,$project,$title,$prompt,$branch,$worktree,$tmux,$sid,$status,$phase,$pq,$la,$ca,$err,$pr,$pipe,$step,$seen)`).run({
+      (id,project,title,prompt,branch,worktree,tmux,session_id,status,phase,pending_question,last_activity,created_at,error,plan_reviews,pipeline,step,step_skill_seen,pipeline_missed)
+      VALUES ($id,$project,$title,$prompt,$branch,$worktree,$tmux,$sid,$status,$phase,$pq,$la,$ca,$err,$pr,$pipe,$step,$seen,$missed)`).run({
       $id: t.id, $project: t.project, $title: t.title, $prompt: t.prompt, $branch: t.branch, $worktree: t.worktree,
       $tmux: t.tmux, $sid: t.sessionId, $status: t.status, $phase: t.phase, $pq: t.pendingQuestion,
       $la: t.lastActivity, $ca: t.createdAt, $err: t.error, $pr: JSON.stringify(t.planReviews),
@@ -127,6 +133,7 @@ export const store = {
       // caller that predates these fields writes a free-form task at step 0 rather
       // than tripping a NOT NULL constraint.
       $pipe: t.pipeline ? 1 : 0, $step: t.step ?? 0, $seen: t.stepSkillSeen ? 1 : 0,
+      $missed: t.pipelineMissed ?? 0,
     });
   },
   // Dedicated setter: patchTask binds each value raw, and SQLite can't bind a plain
@@ -146,6 +153,11 @@ export const store = {
   /** Record that the current step invoked a gstack skill. */
   setStepSkillSeen(id: string, seen: boolean) {
     db.query("UPDATE tasks SET step_skill_seen = ? WHERE id = ?").run(seen ? 1 : 0, id);
+  },
+  /** A commanded step finished without invoking its skill. Incremented in SQL so
+   *  it cannot lose a count to a read-modify-write race between two turns. */
+  bumpPipelineMissed(id: string) {
+    db.query("UPDATE tasks SET pipeline_missed = pipeline_missed + 1 WHERE id = ?").run(id);
   },
   patchTask(id: string, patch: Partial<Task>) {
     const map: Record<string, string> = {

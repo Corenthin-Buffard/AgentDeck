@@ -32,7 +32,7 @@ export async function createTask(
     status: "running", phase: "unknown", pendingQuestion: null,
     lastActivity: now, createdAt: now, error: null,
     planReviews: { ceo: null, design: null, eng: null },
-    pipeline, step: 0, stepSkillSeen: false,
+    pipeline, step: 0, stepSkillSeen: false, pipelineMissed: 0,
   };
   store.insertTask(task);
   emitUpdate(id);

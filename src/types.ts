@@ -59,9 +59,11 @@ export interface Task {
   pipeline: boolean;
   step: number;          // index into the step table; meaningless when !pipeline
   stepSkillSeen: boolean; // did the CURRENT step actually invoke a gstack skill?
-                          // A step that finishes without one means the pipeline
-                          // was commanded and did not happen — a failure the board
-                          // must not render as ordinary progress.
+  pipelineMissed: number; // how many completed steps finished WITHOUT invoking the
+                          // skill they were told to. Sticky, unlike stepSkillSeen,
+                          // because "the pipeline was commanded and did not happen"
+                          // is a fact about the whole task — and the board must not
+                          // render it as ordinary progress.
 }
 
 export interface AgentEvent {
