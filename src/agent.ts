@@ -662,12 +662,48 @@ function attach(task: Task, child: ChildProcess) {
   }
 }
 
+/** What varies between the three ways an agent turn starts. */
+export interface LaunchSpec {
+  /** Session to resume. Omitted/null for a fresh turn-1 launch. */
+  resume?: string | null;
+  /** The turn's instruction — always the FINAL positional argument. */
+  prompt: string;
+}
+
+/**
+ * The complete argv for one `claude` launch.
+ *
+ * PURE + exported, and that is the whole point: the command line used to be
+ * assembled inline at three call sites and asserted by nothing. A flag missing
+ * from all three at once is exactly how the gstack skill mapping stayed dead for
+ * eight releases — there was no value anywhere that a test could look at.
+ *
+ * `--resume <sid>` must precede baseArgs(), and the prompt must stay last: it is
+ * a positional, so anything appended after it would be read as another one.
+ */
+export function argvFor(spec: LaunchSpec): string[] {
+  const resume = spec.resume ? ["--resume", spec.resume] : [];
+  return [...resume, ...baseArgs(), spec.prompt];
+}
+
+/**
+ * The single place a `claude` child is created.
+ *
+ * One helper so the spawn options and the debug line cannot drift between call
+ * sites. The argv goes to OUR stderr (journald), not the events table: it is one
+ * line per turn rather than per tool call, and it never competes with the agent's
+ * own events for the 200-row cap the drawer reads. Redacted regardless — argv can
+ * carry operator-supplied flags, and a daemon log is not a place to leak a token.
+ */
+function spawnAgent(task: Task, argv: string[]): void {
+  console.error(`[agent ${task.id}] ${config.claudeBin} ${scrubSecrets(argv.join(" "), [config.dashboardToken, config.hookToken])}`);
+  const child = spawn(config.claudeBin, argv, currentSpawnOpts(task.worktree));
+  attach(task, child);
+}
+
 /** Launch a fresh agent for a task (turn 1). */
 export function launchTask(task: Task): void {
-  schedule(task.id, () => {
-    const child = spawn(config.claudeBin, [...baseArgs(), task.prompt], currentSpawnOpts(task.worktree));
-    attach(task, child);
-  });
+  schedule(task.id, () => spawnAgent(task, argvFor({ prompt: task.prompt })));
 }
 
 /** Human answer to a waiting agent — the proven prose+resume mechanic. */
@@ -677,11 +713,14 @@ export function answer(taskId: string, text: string): void {
   store.patchTask(taskId, { status: "running", pendingQuestion: null, lastActivity: Date.now() });
   emitUpdate(taskId);
   // Waits for the outgoing agent to exit first — never two `claude --resume` on one session.
-  scheduleAfterExit(taskId, () => {
-    const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), text], currentSpawnOpts(t.worktree));
-    attach(t, child);
-  });
+  scheduleAfterExit(taskId, () => spawnAgent(t, argvFor({ resume: t.sessionId, prompt: text })));
 }
+
+/** What a task is told after a daemon restart interrupted it mid-turn. Named
+ *  rather than inline so a test can assert the A2 path without duplicating the
+ *  string, and so the pipeline state machine can replace it with the step it was
+ *  actually on rather than a vague nudge. */
+export const RESUME_PROMPT = "continue where you left off";
 
 /** A2 durability: after a daemon restart, resume any task that was mid-run. */
 export function resumeTask(taskId: string): void {
@@ -689,10 +728,7 @@ export function resumeTask(taskId: string): void {
   if (!t?.sessionId) return;
   store.patchTask(taskId, { status: "resuming", lastActivity: Date.now() });
   emitUpdate(taskId);
-  scheduleAfterExit(taskId, () => {
-    const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), "continue where you left off"], currentSpawnOpts(t.worktree));
-    attach(t, child);
-  });
+  scheduleAfterExit(taskId, () => spawnAgent(t, argvFor({ resume: t.sessionId, prompt: RESUME_PROMPT })));
 }
 
 export function stopTask(taskId: string): void {
