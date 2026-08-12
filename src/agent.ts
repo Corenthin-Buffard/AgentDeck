@@ -5,7 +5,7 @@ import { store } from "./db.ts";
 import { emitUpdate } from "./bus.ts";
 import { clearNotice, notice } from "./notices.ts";
 import { notify } from "./notify.ts";
-import { phaseFromSignal, mergePhase, canStillReview } from "./phase.ts";
+import { phaseFromSignal, mergePhase, canStillReview, slashToSkill } from "./phase.ts";
 import { looksLikeQuestion } from "./detect.ts";
 import type { Task, Phase, Status, PlanReviews, PlanReviewState } from "./types.ts";
 
@@ -447,10 +447,15 @@ function attach(task: Task, child: ChildProcess) {
 
   const patch = (p: Partial<Task>) => { store.patchTask(task.id, { ...p, lastActivity: now() }); emitUpdate(task.id); };
   const log = (kind: any, data: string) => store.addEvent({ taskId: task.id, ts: now(), kind, data });
-  const setPhase = (next: Phase) => {
+  const setPhase = (next: Phase, authoritative = false) => {
     const t = store.getTask(task.id); if (!t) return;
-    const merged = mergePhase(t.phase, next);
+    const merged = mergePhase(t.phase, next, authoritative);
     if (merged !== t.phase) { patch({ phase: merged }); log("phase", merged); }
+  };
+  /** Apply a stream signal, carrying its authoritative-ness through to the merge. */
+  const applySignal = (sig: { skill?: string; tool?: string; shipped?: boolean }) => {
+    const s = phaseFromSignal(sig);
+    if (s) setPhase(s.phase, s.authoritative);
   };
 
   // `?.` not `!`: on Bun these streams exist even for a spawn that never started,
@@ -590,10 +595,12 @@ function attach(task: Task, child: ChildProcess) {
       if (ev?.type === "content_block_start" && ev.content_block?.type === "tool_use") {
         const name: string = ev.content_block.name;
         log("tool", name);
-        const p = phaseFromSignal({ tool: name }); if (p) setPhase(p);
-        if (name === "Skill" && ev.content_block.input?.skill) {
-          const sp = phaseFromSignal({ skill: String(ev.content_block.input.skill) }); if (sp) setPhase(sp);
-        }
+        // Tool NAME is all this event can tell us. It carries `input: {}` by
+        // protocol — arguments stream in afterwards as input_json_delta — so a
+        // skill's name is NOT readable here. Reading it from this event is what
+        // left SKILL_PHASE dead in production for eight releases. Skills are
+        // picked up from the consolidated `assistant` message below instead.
+        applySignal({ tool: name });
         patch({}); // bump lastActivity
         return;
       }
@@ -604,7 +611,24 @@ function attach(task: Task, child: ChildProcess) {
       // message(s). Deltas carry the same text and are NOT accumulated, so there's
       // no doubling — and no substring-dedup that could drop a restated question
       // and silently flip waiting -> done.
-      for (const c of e.message.content) if (c.type === "text") text += c.text;
+      //
+      // It is ALSO the only place a tool's arguments arrive complete. Verified
+      // against a real stream: content_block_start gives
+      //   {"type":"tool_use","name":"Skill","input":{}}
+      // and the name only materialises here, as {"skill":"careful"}. This is the
+      // single source of skill signals; anything reading them earlier sees {}.
+      for (const c of e.message.content) {
+        if (c?.type === "text") { text += c.text; continue; }
+        if (c?.type !== "tool_use" || !c.input || typeof c.input !== "object") continue;
+        if (c.name === "Skill" && typeof c.input.skill === "string") {
+          applySignal({ skill: c.input.skill });
+        } else if (c.name === "SlashCommand" && typeof c.input.command === "string") {
+          // An agent may type `/review` instead of calling the Skill tool. That
+          // produces no Skill block at all, so treating it as "no skill ran"
+          // would mark a task that behaved perfectly as off-pipeline.
+          applySignal({ skill: slashToSkill(c.input.command) });
+        }
+      }
     }
     if (e.type === "result") {
       // Refresh the plan-review marks BEFORE mutating phase/status. Gate on the
