@@ -86,3 +86,42 @@ describe("argvFor", () => {
     expect(argv.filter((a) => a === nasty)).toHaveLength(1);
   });
 });
+
+// ── liveness coalescing ─────────────────────────────────────────────────────
+// Every tool call used to write lastActivity and re-serialize the WHOLE board.
+// The pipeline runs seven heavy skills per task against four concurrent agents,
+// so that hot path gets ~100x busier. Only liveness is throttled; real
+// transitions still broadcast immediately.
+describe("shouldBumpLiveness", () => {
+  test("always allows the first bump of a task", async () => {
+    const { shouldBumpLiveness } = await import("../src/agent.ts");
+    // `lastLiveness` starts at 0 and `now` is an epoch, so the very first tool
+    // call of a turn is always far outside the window — a new task's card must
+    // never sit stale waiting for the interval to elapse.
+    expect(shouldBumpLiveness(0, Date.now())).toBe(true);
+  });
+
+  test("suppresses a burst inside the window", async () => {
+    const { shouldBumpLiveness } = await import("../src/agent.ts");
+    expect(shouldBumpLiveness(1_000, 1_100, 250)).toBe(false);
+    expect(shouldBumpLiveness(1_000, 1_249, 250)).toBe(false);
+  });
+
+  test("allows one through once the window has passed", async () => {
+    const { shouldBumpLiveness } = await import("../src/agent.ts");
+    expect(shouldBumpLiveness(1_000, 1_250, 250)).toBe(true);
+    expect(shouldBumpLiveness(1_000, 9_999, 250)).toBe(true);
+  });
+
+  test("a 500-tool-call step writes ~4 times a second, not 500 times", async () => {
+    const { shouldBumpLiveness } = await import("../src/agent.ts");
+    let last = 0, writes = 0;
+    // 500 tool calls spread over 10 seconds — a realistic heavy gstack step.
+    for (let i = 0; i < 500; i++) {
+      const t = i * 20;
+      if (shouldBumpLiveness(last, t, 250)) { last = t; writes++; }
+    }
+    expect(writes).toBeLessThanOrEqual(41); // 10s / 250ms, plus the first
+    expect(writes).toBeGreaterThan(0);      // liveness must not stop entirely
+  });
+});

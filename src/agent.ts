@@ -318,6 +318,23 @@ export function shouldRelay(queuedBytes: number, max = STDERR_RELAY_MAX_QUEUE): 
   return queuedBytes <= max;
 }
 
+// How often a task's "still alive" timestamp may be written. Every tool call used
+// to trigger one SQLite UPDATE plus a full-board JSON.stringify over a SELECT *
+// (server.ts broadcast) — fine at a handful of tool calls per task, but the
+// pipeline runs seven heavy skills per task against a default of four concurrent
+// agents, which is that hot path roughly a hundredfold.
+//
+// Only LIVENESS is throttled. Real transitions — phase, status, question, result —
+// still broadcast the instant they happen, so nothing the operator needs to see
+// is ever delayed; the board's "3s ago" simply moves in quarter-second steps.
+const LIVENESS_MIN_INTERVAL_MS = 250;
+
+/** PURE + exported so the throttle is testable without a clock or a spawn — the
+ *  same shape as shouldRelay above. */
+export function shouldBumpLiveness(last: number, now: number, interval = LIVENESS_MIN_INTERVAL_MS): boolean {
+  return now - last >= interval;
+}
+
 /**
  * Bounded stderr accumulator. PURE (no I/O, no timers) + exported so eviction and
  * chunk-boundary behaviour are unit-testable without spawning.
@@ -447,6 +464,15 @@ function attach(task: Task, child: ChildProcess) {
   const now = () => Date.now();
 
   const patch = (p: Partial<Task>) => { store.patchTask(task.id, { ...p, lastActivity: now() }); emitUpdate(task.id); };
+  // Liveness-only writes are coalesced; see shouldBumpLiveness. Any patch() above
+  // also refreshes lastActivity, so a real transition resets the window for free.
+  let lastLiveness = 0;
+  const bumpLiveness = () => {
+    const t = now();
+    if (!shouldBumpLiveness(lastLiveness, t)) return;
+    lastLiveness = t;
+    patch({});
+  };
   const log = (kind: any, data: string) => store.addEvent({ taskId: task.id, ts: now(), kind, data });
   const setPhase = (next: Phase, authoritative = false) => {
     const t = store.getTask(task.id); if (!t) return;
@@ -663,7 +689,7 @@ function attach(task: Task, child: ChildProcess) {
         // left SKILL_PHASE dead in production for eight releases. Skills are
         // picked up from the consolidated `assistant` message below instead.
         applySignal({ tool: name });
-        patch({}); // bump lastActivity
+        bumpLiveness();
         return;
       }
       if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { return; } // liveness-only; not accumulated
