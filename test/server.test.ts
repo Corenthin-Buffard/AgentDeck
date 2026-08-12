@@ -633,6 +633,13 @@ describe("daemon notices", () => {
       expect(html).toContain('d.type==="notices"');
       expect(html).toContain("loadNotices()");        // survives a refused /ws upgrade
       expect(html).toContain(".notice .x:focus-visible"); // DESIGN.md focus-ring rule
+      // No control bytes. A stray NUL (easy to introduce via a \\u0000 separator in
+      // JS) makes strict grep implementations — ugrep, busybox — treat the response
+      // as binary and report no match, while the page still renders fine in a
+      // browser. GNU grep still exits 0, so this would have broken local tooling
+      // rather than GitHub CI; it is wrong either way, and the HTML tokenizer
+      // rewrites a NUL inside <script> to U+FFFD. Caught exactly this way once.
+      expect(/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(html)).toBe(false);
     } finally {
       server.stop(true);
     }

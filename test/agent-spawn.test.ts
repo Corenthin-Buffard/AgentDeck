@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../src/config.ts";
 import { store } from "../src/db.ts";
-import { answer, isRunning, launchTask, stopTask } from "../src/agent.ts";
+import { answer, isRunning, launchTask, resumeTask, stopTask } from "../src/agent.ts";
 import { notices, resetNotices } from "../src/notices.ts";
 import type { Task } from "../src/types.ts";
 
@@ -168,11 +168,10 @@ test("stopping a QUEUED task cancels it — it must not spawn later", async () =
   expect(runs.length).toBe(1); // only the blocker
 }, 30000);
 
-test("the root bypass retracts its own claim when the guard is still refusing", async () => {
-  // IS_SANDBOX is an undocumented Claude Code internal. If an upstream release
-  // removes it, the amber "agents are spawned with IS_SANDBOX=1" banner would
-  // keep asserting a capability that no longer exists. A failing task must
-  // replace it with the truth.
+test("a failing launch under the bypass reaches task.error either way", async () => {
+  // The uid-dependent half (does it raise the daemon notice?) is unit-tested in
+  // agent.test.ts against both branches. What must hold on ANY machine — including
+  // a non-root CI runner — is that the operator still sees the real cause.
   const wasAllowRoot = config.allowRoot;
   config.allowRoot = true;
   try {
@@ -181,9 +180,12 @@ test("the root bypass retracts its own claim when the guard is still refusing", 
     launchTask(t);
 
     expect(await until(() => store.getTask(t.id)?.status === "error")).toBe(true);
+    expect(store.getTask(t.id)!.error ?? "").toContain("root/sudo privileges");
+    // The daemon-level notice is raised only under uid 0 — assert the branch this
+    // machine is actually on, so the test means something everywhere.
     const raised = notices().find((n) => n.code === "root-bypass-failed");
-    expect(raised).toBeDefined();
-    expect(raised!.level).toBe("error");
+    if (process.getuid?.() === 0) expect(raised).toBeDefined();
+    else expect(raised).toBeUndefined();
   } finally {
     config.allowRoot = wasAllowRoot;
   }
@@ -294,3 +296,41 @@ test("a replacement waits for the outgoing agent to exit — never two on one se
   }
   expect(maxLive).toBe(1);
 }, 40000);
+
+test("a spawned child receives whatever spawnOpts put in its env", async () => {
+  // Smoke: proves the env object actually reaches the child. The uid MATRIX lives
+  // in agent.test.ts against spawnOpts(cwd, uid) directly — asserting it here
+  // against the runner's own uid would make the test agree with whatever the
+  // machine happens to be, which is worthless on CI (never root).
+  config.claudeBin = fakeBin("env-echo", `echo "SEEN:[$IS_SANDBOX]" >&2\nexit 1`);
+  const t = makeTask("t_env");
+  launchTask(t);
+  expect(await until(() => store.getTask(t.id)?.status === "error")).toBe(true);
+  const expected = process.getuid?.() === 0 && config.allowRoot ? "SEEN:[1]" : "SEEN:[]";
+  expect(store.getTask(t.id)!.error).toContain(expected);
+}, 20000);
+
+test("a resumed task that dies before init lands in error with the cause", async () => {
+  // The A2 path this branch rewrote, and the reported symptom itself: a resumed
+  // agent the root guard refuses never reaches `init`, so it used to sit in
+  // `resuming` for ever with no error text. Also pins that resumeTask passes
+  // --resume <sessionId> rather than starting a fresh conversation.
+  const marker = join(dir, "resume-args.txt");
+  config.claudeBin = fakeBin("refuse-resume", [
+    `echo "$@" >> "${marker}"`,
+    `echo "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons" >&2`,
+    `exit 1`,
+  ].join("\n"));
+
+  const t = makeTask("t_resume");
+  store.patchTask(t.id, { sessionId: "sess-resume", status: "resuming" });
+  resumeTask(t.id);
+
+  expect(await until(() => store.getTask(t.id)?.status === "error", 20000)).toBe(true);
+  const err = store.getTask(t.id)!.error ?? "";
+  expect(err).toContain("code 1");
+  expect(err).toContain("root/sudo privileges");   // the cause, not just an exit code
+  const args = await Bun.file(marker).text().catch(() => "");
+  expect(args).toContain("--resume");
+  expect(args).toContain("sess-resume");
+}, 30000);

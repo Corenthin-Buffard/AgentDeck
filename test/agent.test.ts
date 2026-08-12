@@ -1,5 +1,7 @@
-import { describe, expect, test } from "bun:test";
-import { agentEnv, createStderrTail, exitReason, scrubSecrets, shouldRelay } from "../src/agent.ts";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { agentEnv, checkRootBypassStillWorks, createStderrTail, exitReason, scrubSecrets, shouldRelay, spawnOpts } from "../src/agent.ts";
+import { config } from "../src/config.ts";
+import { notices, resetNotices } from "../src/notices.ts";
 
 // Pure helpers extracted from the supervisor so the parts that decide whether an
 // agent can start — and what the operator is told when it can't — are testable
@@ -187,5 +189,87 @@ describe("scrubSecrets", () => {
   test("leaves an ordinary failure message untouched", () => {
     const msg = "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons";
     expect(scrubSecrets(msg, [TOKEN])).toBe(msg);
+  });
+});
+
+describe("checkRootBypassStillWorks", () => {
+  // IS_SANDBOX is an undocumented Claude Code internal. If an upstream release
+  // removes it, the amber "agents are spawned with IS_SANDBOX=1" banner would keep
+  // asserting a capability that no longer exists — so a launch the guard refused
+  // must retract it. The uid is injected so BOTH branches run on any machine; the
+  // non-root branch is the one CI takes and it was previously untestable.
+  const REFUSAL = "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons";
+  const wasAllowRoot = config.allowRoot;
+  beforeEach(() => { resetNotices(); config.allowRoot = true; });
+  afterEach(() => { resetNotices(); config.allowRoot = wasAllowRoot; });
+
+  const raised = () => notices().some((n) => n.code === "root-bypass-failed");
+
+  test("root + opt-in + refusal → retracts the claim", () => {
+    checkRootBypassStillWorks(REFUSAL, 0);
+    expect(raised()).toBe(true);
+  });
+
+  test("NON-root never raises it, even with ALLOW_ROOT inherited", () => {
+    // A shared EnvironmentFile can set ALLOW_ROOT on a daemon that isn't root;
+    // publishing "no task can start" there would be flatly false.
+    checkRootBypassStillWorks(REFUSAL, 1000);
+    expect(raised()).toBe(false);
+  });
+
+  test("no getuid (non-POSIX) never raises it", () => {
+    checkRootBypassStillWorks(REFUSAL, undefined);
+    expect(raised()).toBe(false);
+  });
+
+  test("without the opt-in it stays quiet — the guard refusing is expected", () => {
+    config.allowRoot = false;
+    checkRootBypassStillWorks(REFUSAL, 0);
+    expect(raised()).toBe(false);
+  });
+
+  test("unrelated stderr never raises it", () => {
+    checkRootBypassStillWorks("ENOENT: no such file or directory", 0);
+    expect(raised()).toBe(false);
+  });
+
+  test("raises once, however many tasks fail", () => {
+    checkRootBypassStillWorks(REFUSAL, 0);
+    checkRootBypassStillWorks(REFUSAL, 0);
+    checkRootBypassStillWorks(REFUSAL, 0);
+    expect(notices().filter((n) => n.code === "root-bypass-failed")).toHaveLength(1);
+  });
+});
+
+describe("spawnOpts — the seam that makes the root fix real", () => {
+  // agentEnv() being correct is not enough: spawnOpts is where the env is attached
+  // to the actual spawn. Drop `env` there, or read a stale flag, and every
+  // agentEnv test stays green while root daemons keep failing every task. The uid
+  // is injected so this runs identically on a root box and on a CI runner —
+  // an earlier version of this test read the runner's uid and asserted whatever
+  // that implied, which meant reverting the fix left CI green.
+  const wasAllowRoot = config.allowRoot;
+  afterEach(() => { config.allowRoot = wasAllowRoot; });
+
+  test("uid 0 + opt-in → the child gets IS_SANDBOX=1", () => {
+    config.allowRoot = true;
+    expect((spawnOpts("/tmp", 0).env as any).IS_SANDBOX).toBe("1");
+  });
+
+  test("uid 0 without the opt-in → no injection", () => {
+    config.allowRoot = false;
+    expect((spawnOpts("/tmp", 0).env as any).IS_SANDBOX).toBeUndefined();
+  });
+
+  test("non-root → no injection even with the opt-in", () => {
+    config.allowRoot = true;
+    expect((spawnOpts("/tmp", 1000).env as any).IS_SANDBOX).toBeUndefined();
+  });
+
+  test("stdio keeps stderr piped, and cwd is passed through", () => {
+    // stderr must stay "pipe" or the whole capture workstream silently stops.
+    const o = spawnOpts("/some/worktree", 1000);
+    expect(o.cwd).toBe("/some/worktree");
+    expect(o.stdio).toEqual(["ignore", "pipe", "pipe"]);
   });
 });

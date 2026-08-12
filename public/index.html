@@ -295,7 +295,7 @@ function dismissedNotices(){try{const v=JSON.parse(localStorage.getItem(NOTICE_K
 // Keyed on code AND message: if the message changes (a different path, a new
 // reason) that is new information and must resurface rather than stay hidden
 // behind a dismissal of the old wording.
-function noticeKey(n){return n.code+" "+n.message;}
+function noticeKey(n){return n.code+"|"+n.message;}
 function dismissNotice(key){
   const d=dismissedNotices();
   if(!d.includes(key)){d.push(key);try{localStorage.setItem(NOTICE_KEY,JSON.stringify(d.slice(-40)));}catch{}}

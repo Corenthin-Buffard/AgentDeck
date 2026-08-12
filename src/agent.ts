@@ -277,13 +277,18 @@ export function agentEnv(base: NodeJS.ProcessEnv, allowRoot: boolean, uid: numbe
  * Not memoized on purpose: the test suite shares one `config` singleton, and a
  * cached env would make config.allowRoot un-overridable in tests.
  */
-function spawnOpts(cwd: string): SpawnOptions {
+export function spawnOpts(cwd: string, uid: number | undefined): SpawnOptions {
   return {
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
-    env: agentEnv(process.env, config.allowRoot, process.getuid?.()),
+    env: agentEnv(process.env, config.allowRoot, uid),
   };
 }
+
+/** The spawn options for THIS process. Split so the uid-dependent branch above is
+ *  assertable on a non-root machine — a test that reads the runner's own uid and
+ *  changes what it expects proves nothing on CI, which is never root. */
+const currentSpawnOpts = (cwd: string): SpawnOptions => spawnOpts(cwd, process.getuid?.());
 
 // How much of a dead agent's stderr we keep. STDERR_ERROR_MAX is the task.error
 // budget — enough for the whole of a real failure (the root refusal is 93 bytes)
@@ -392,10 +397,13 @@ const isLive = (s: Status): boolean => s === "running" || s === "resuming";
  * allowRoot is on retracts it with an error notice. Deduped by code, so a hundred
  * failing tasks add exactly one.
  */
-function checkRootBypassStillWorks(stderr: string): void {
+export function checkRootBypassStillWorks(stderr: string, uid: number | undefined): void {
   // uid guard: without it, a NON-root daemon that merely inherits ALLOW_ROOT from a
   // shared EnvironmentFile would publish a flatly false "no task can start".
-  if (process.getuid?.() !== 0 || !config.allowRoot || !ROOT_REFUSAL.test(stderr)) return;
+  // `uid` is a REQUIRED parameter, not a defaulted one: a default cannot express
+  // "no uid", because passing undefined explicitly triggers it — so the non-POSIX
+  // branch would be untestable. Same trap as rootBlocksAgents in config.ts.
+  if (uid !== 0 || !config.allowRoot || !ROOT_REFUSAL.test(stderr)) return;
   notice("error", "root-bypass-failed",
     "AGENTDECK_ALLOW_ROOT is set, but Claude Code still refused --dangerously-skip-permissions as root — the IS_SANDBOX escape hatch this relies on is undocumented and appears to have been removed upstream. No task can start. Run the daemon as an unprivileged user, or set AGENTDECK_SKIP_PERMISSIONS=false (agents run, gstack skills won't resolve).");
 }
@@ -515,7 +523,7 @@ function attach(task: Task, child: ChildProcess) {
     // the root guard refused the launch. Without that condition, an agent merely
     // printing the phrase — reviewing this repo, say, where it appears in the
     // README and the CHANGELOG — would raise an undismissable daemon-wide error.
-    if (!sawInit && !signal && code !== 0) checkRootBypassStillWorks(raw);
+    if (!sawInit && !signal && code !== 0) checkRootBypassStillWorks(raw, process.getuid?.());
     return scrubSecrets(err.excerpt(), [config.dashboardToken, config.hookToken]);
   };
 
@@ -633,7 +641,7 @@ function attach(task: Task, child: ChildProcess) {
 /** Launch a fresh agent for a task (turn 1). */
 export function launchTask(task: Task): void {
   schedule(task.id, () => {
-    const child = spawn(config.claudeBin, [...baseArgs(), task.prompt], spawnOpts(task.worktree));
+    const child = spawn(config.claudeBin, [...baseArgs(), task.prompt], currentSpawnOpts(task.worktree));
     attach(task, child);
   });
 }
@@ -646,7 +654,7 @@ export function answer(taskId: string, text: string): void {
   emitUpdate(taskId);
   // Waits for the outgoing agent to exit first — never two `claude --resume` on one session.
   scheduleAfterExit(taskId, () => {
-    const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), text], spawnOpts(t.worktree));
+    const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), text], currentSpawnOpts(t.worktree));
     attach(t, child);
   });
 }
@@ -658,7 +666,7 @@ export function resumeTask(taskId: string): void {
   store.patchTask(taskId, { status: "resuming", lastActivity: Date.now() });
   emitUpdate(taskId);
   scheduleAfterExit(taskId, () => {
-    const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), "continue where you left off"], spawnOpts(t.worktree));
+    const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), "continue where you left off"], currentSpawnOpts(t.worktree));
     attach(t, child);
   });
 }
