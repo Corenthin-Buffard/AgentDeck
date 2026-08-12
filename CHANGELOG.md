@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.2.4.2] - 2026-08-12
+
+### Fixed
+- **The install runbook still produced the broken install it now detects.** v0.2.4.1 taught the
+  daemon to recognise that it was running as root and explain itself. The README, meanwhile, kept
+  installing as root and offering `AGENTDECK_ALLOW_ROOT` as one of two equal options — so anyone
+  following it reproduced exactly the situation that produced the bug report, and the fastest way out
+  of the red banner was the workaround rather than the fix. The README also contradicted itself:
+  it called `User=` in the systemd unit "the supported configuration" while the runbook wrote a
+  `systemd --user` unit, where `User=` is not a valid directive.
+
+  The runbook now branches on `uname -s` and then `id -u`. Installing as yourself is unchanged.
+  Installing as **root** creates a dedicated unprivileged service account and a system unit for it,
+  and the install is not declared successful until a witness task actually runs in the target repo.
+  `AGENTDECK_ALLOW_ROOT` is no longer offered there; it remains documented as a last resort for
+  machines where no service account can be created, and its behaviour is unchanged.
+
+### Added
+- **`scripts/setup-agent-user.sh`** — the mechanical half of the root path: creates the account and
+  its directories, writes `/etc/systemd/system/agentdeck.service`, reloads systemd. Idempotent, and
+  deliberately does *not* enable or start the service, because credentials and repo access are human
+  decisions that must come first. It is the single source of truth for the unit's contents; the
+  README shows the invocation rather than a second copy that would drift.
+- **`--check`**, an audit of what the *agent* needs — `claude`, its own Claude Code credentials,
+  gstack, `git`, an authenticated `gh`, `bun`/`bunx`/`node` — resolved as the service user, on the
+  service PATH. It exits 0 (ready), 2 (the daemon will run but a flagged part of the workflow will
+  not, e.g. `/ship` without `gh`) or 1 (broken; don't start it). Checking with your own PATH is how
+  an install gets certified and then fails on first contact.
+- **A CI job that runs the script for real**, twice, and asserts the generated unit parses
+  (`systemd-analyze verify`) — plus a case asserting `--check` still *fails* on an unfinished
+  install, so the gate can't silently become inert.
+- **A migration section** for existing root installs, which opens with a required drain: Claude Code
+  stores transcripts under `$HOME`, so changing the daemon's `HOME` makes every stored `sessionId`
+  unresolvable and `claude --resume` loses those tasks silently.
+
+### Changed
+- `ROOT_BLOCKED_MESSAGE` now leads with the real fix and lists the workarounds after it, mildest
+  first — an operator acting on a red banner acts on the first remedy they read, and for two
+  releases that was the one keeping every agent at uid 0. A test asserts the order, not just the
+  presence of each string.
+
 ## [0.2.4.1] - 2026-08-12
 
 ### Fixed

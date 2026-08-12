@@ -9,6 +9,39 @@ permissions:
   contents: read
 
 jobs:
+  # The root-install runbook delegates its mechanical half to this script. An
+  # install script the CI never RUNS is prose with a .sh extension, so this job
+  # executes it for real on a throwaway runner — twice, because the runbook tells
+  # operators to re-run it, and once more in --check mode to prove the check can
+  # still fail. A gate that always passes is the failure mode to fear here.
+  setup-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/setup-agent-user.sh
+      - name: Provision (twice — must be idempotent)
+        run: |
+          sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci
+          id adci
+          sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci
+          echo "OK: second run succeeded too"
+      - name: The generated unit is valid to systemd
+        run: |
+          systemd-analyze verify /etc/systemd/system/adci.service
+          grep -q '^User=adci' /etc/systemd/system/adci.service
+          grep -q '^RestartPreventExitStatus=78' /etc/systemd/system/adci.service
+          echo "OK: unit parses and carries the directives the runbook promises"
+      # A bare account has no claude, no credentials and no gstack: --check MUST
+      # report FAIL (exit 1). If this ever exits 0, the runbook's "green before you
+      # start the daemon" gate is inert and would certify a dead install.
+      - name: --check fails on an unfinished install
+        run: |
+          if sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci --check; then
+            echo "--check passed on an install with no claude and no credentials"; exit 1
+          fi
+          echo "OK: --check correctly refuses an unfinished install"
+
   test:
     runs-on: ubuntu-latest
     steps:
