@@ -230,8 +230,11 @@ If you already run the daemon as root (with or without `AGENTDECK_ALLOW_ROOT`), 
 
 1. `systemctl --user stop agentdeck && systemctl --user disable agentdeck` — before touching the SQLite file.
 2. Create the account and give it what it needs: `sudo scripts/setup-agent-user.sh`, then `claude`, gstack and credentials for it (runbook steps 0b–2).
-3. Move the data dir, so the database, worktrees and task rows come along:
-   `mv ~/.agentdeck /var/lib/agentdeck/.agentdeck && chown -R agentdeck: /var/lib/agentdeck/.agentdeck`
+3. Move the data dir, so the database, worktrees and task rows come along. Step 2 already created an empty `/var/lib/agentdeck/.agentdeck`, and `mv` onto an existing directory would nest yours *inside* it — leaving the daemon with an empty database and every task apparently gone. Remove the empty one first; `rmdir` refuses if it isn't empty, which is the guard you want:
+   ```
+   rmdir /var/lib/agentdeck/.agentdeck
+   mv ~/.agentdeck /var/lib/agentdeck/.agentdeck && chown -R agentdeck: /var/lib/agentdeck/.agentdeck
+   ```
 4. Give it the target repo (runbook step 4) — **including `git config --global --add safe.directory <repo>` for yourself**, or your own `git` starts refusing the repo you just handed over.
 5. Write the new env file **without** `AGENTDECK_ALLOW_ROOT`; it has no reason to exist anymore.
 6. `sudo scripts/setup-agent-user.sh --check`, then `systemctl daemon-reload && systemctl enable --now agentdeck`.

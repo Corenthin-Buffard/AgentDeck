@@ -110,15 +110,19 @@ provision() {
   # Empty but present beats absent: the operator fills it in, and --check tells
   # them it still has no target repo.
   if [ ! -f "$ENV_FILE" ]; then
-    cat > "$ENV_FILE" <<EOF
+    # umask BEFORE the create, not chmod after: the operator pastes API tokens and
+    # webhook URLs into this file, and a create-then-chmod leaves a world-readable
+    # window. Same reason daemon.ts rm+creates agent-settings.json at 0600.
+    ( umask 077; cat > "$ENV_FILE" <<EOF
 # AgentDeck config, systemd EnvironmentFile format: one KEY=VALUE per line,
 # no quoting and no shell expansion. Fill in AGENTDECK_TARGET_REPO before starting.
 AGENTDECK_HOST=127.0.0.1
 AGENTDECK_PORT=8787
 #AGENTDECK_TARGET_REPO=/absolute/path/to/repo
 EOF
+    )
     chown "$AD_USER:$AD_USER" "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
+    chmod 600 "$ENV_FILE"  # belt and braces: umask above already made it 0600
     echo "env       $ENV_FILE seeded (fill in AGENTDECK_TARGET_REPO)"
   else
     echo "env       $ENV_FILE exists, left alone"
@@ -208,7 +212,14 @@ check() {
     if grep -qE '^AGENTDECK_TARGET_REPO=..*' "$ENV_FILE"; then
       local repo; repo="$(grep -E '^AGENTDECK_TARGET_REPO=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
       ok "env" "$ENV_FILE"
-      if run_as "test -d '$repo/.git' && test -w '$repo/.git'" 2>/dev/null; then
+      # run_as interpolates into a shell string, so the path must be quoted for the
+      # shell, not just wrapped in quotes here: a lone ' in the value escapes the
+      # quoting and the check can report OK on a path that does not exist. Verified
+      # with AGENTDECK_TARGET_REPO="/nope' || true || '". printf %q makes it inert.
+      # This value is agent-writable (the env file belongs to the service account,
+      # and agents run as it), and this check is the gate the runbook trusts.
+      local qrepo; qrepo="$(printf '%q' "$repo")"
+      if run_as "test -d $qrepo/.git && test -w $qrepo/.git" 2>/dev/null; then
         ok "target repo" "$repo (writable by $AD_USER)"
       else
         fail "target repo" "$AD_USER cannot write $repo/.git — chown it, or clone to a neutral path"
@@ -217,7 +228,7 @@ check() {
       # culprit) makes the repo unreachable even when its own mode is fine, and the
       # two failures need different fixes.
       local parent; parent="$(dirname "$repo")"
-      if run_as "test -x '$parent'" 2>/dev/null; then
+      if run_as "test -x $(printf '%q' "$parent")" 2>/dev/null; then
         ok "repo parent" "$parent is traversable"
       else
         fail "repo parent" "$AD_USER cannot traverse $parent (mode $(stat -c '%a' "$parent" 2>/dev/null || echo '?')) — move the repo rather than opening it up"

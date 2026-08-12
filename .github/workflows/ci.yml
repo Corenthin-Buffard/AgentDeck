@@ -28,6 +28,11 @@ jobs:
           echo "OK: second run succeeded too"
       - name: The generated unit is valid to systemd
         run: |
+          # systemd-analyze verify EXITS 1 when ExecStart doesn't resolve, and the
+          # runner has no agentdeck binary. Stub it so this step tests the unit we
+          # generate rather than the runner's lack of an install — same reason the
+          # smoke test below stubs `claude` on PATH.
+          sudo install -m 755 /bin/true /usr/local/bin/agentdeck
           systemd-analyze verify /etc/systemd/system/adci.service
           grep -q '^User=adci' /etc/systemd/system/adci.service
           grep -q '^RestartPreventExitStatus=78' /etc/systemd/system/adci.service
@@ -41,6 +46,28 @@ jobs:
             echo "--check passed on an install with no claude and no credentials"; exit 1
           fi
           echo "OK: --check correctly refuses an unfinished install"
+      # The gate has three answers: ready (0), ready-but-degraded (2), broken (1),
+      # and the runbook branches on which one it gets. The step above proves it can
+      # say "broken". This proves 2 is REACHABLE and DISTINCT from 1 — otherwise the
+      # runbook would halt on a benign warning, or worse, walk past a real failure.
+      # Everything that blocks the daemon gets satisfied; gh stays unauthenticated
+      # and gstack-review-read stays absent, so at least one warning is guaranteed.
+      - name: --check separates "degraded" from "broken"
+        run: |
+          sudo git init -q /srv/adrepo
+          sudo mkdir -p /var/lib/adci/.claude/skills/gstack/bin
+          printf '#!/bin/sh\necho stub-claude\n' | sudo tee /var/lib/adci/.local/bin/claude >/dev/null
+          sudo chmod +x /var/lib/adci/.local/bin/claude
+          echo '{"stub":true}'  | sudo tee /var/lib/adci/.claude/.credentials.json >/dev/null
+          echo '1.0.0.0'        | sudo tee /var/lib/adci/.claude/skills/gstack/VERSION >/dev/null
+          sudo chown -R adci:adci /var/lib/adci /srv/adrepo
+          echo 'AGENTDECK_TARGET_REPO=/srv/adrepo' | sudo tee -a /var/lib/adci/.config/agentdeck/env >/dev/null
+          set +e
+          sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci --check
+          code=$?
+          set -e
+          [ "$code" = 2 ] || { echo "expected exit 2 (degraded), got $code"; exit 1; }
+          echo "OK: --check reports 2 — runs, but the flagged half of the workflow would not"
 
   test:
     runs-on: ubuntu-latest
