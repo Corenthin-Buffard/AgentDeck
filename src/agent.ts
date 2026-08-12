@@ -531,7 +531,14 @@ function attach(task: Task, child: ChildProcess) {
       // and the terminal handler called it "exited mid-run", which is a lie: the
       // agent finished fine, the supervisor dropped the event.
       try { handle(e); }
-      catch (err) { log("log", `stream handler failed on a ${e?.type ?? "?"} event: ${(err as Error).message}`); }
+      catch (err) {
+        // The catch body itself must never throw: log() writes to SQLite, and
+        // SQLITE_FULL / a busy-timeout expiry is exactly the condition most likely
+        // to have made handle() throw in the first place. An escape here takes the
+        // daemon down — there is no uncaughtException handler.
+        try { log("log", `stream handler failed on a ${e?.type ?? "?"} event: ${(err as Error).message}`); }
+        catch { console.error(`[agent ${task.id}] stream handler failed and could not be logged`); }
+      }
     }
   });
 
@@ -609,6 +616,7 @@ function attach(task: Task, child: ChildProcess) {
     // the init event never reaches "running", and used to sit in "resuming" for
     // ever with no error text. That is exactly the root-failure path for tasks the
     // A2 loop resumes at daemon restart.
+    stepRetries.delete(task.id); // terminal for this task's current step
     if (t && isLive(t.status)) {
       // Log the tail BEFORE the patch, so a dashboard that opens the drawer the
       // instant the error appears already has the context. Only on an abnormal
@@ -690,6 +698,16 @@ function attach(task: Task, child: ChildProcess) {
       store.bumpPipelineMissed(task.id);
       log("log", `step ${t.step + 1} finished without invoking /${finished.skill}`);
     }
+    // The stored index can point past the end of the table — an operator shrinks
+    // pipeline-steps.md under a task in flight. nextStep() would call that "done"
+    // and the task would graduate having skipped every remaining step, /ship and
+    // /canary included. runStep's own guard never sees it: within one process
+    // nextStep bounds against the same memoized array.
+    if (t.step >= steps.length) {
+      patch({ status: "error", error: `step ${t.step + 1} is past the end of the ${steps.length}-step table — the step table changed under a running task` });
+      notify(store.getTask(task.id)!, "error");
+      return true; // handled: do NOT let the caller mark this done
+    }
     const where = nextStep(t, steps);
     if ("done" in where) return false; // pipeline complete → caller marks done
     store.setStep(task.id, where.step);
@@ -698,6 +716,14 @@ function attach(task: Task, child: ChildProcess) {
   }
 
   function handle(e: any) {
+    // OWNERSHIP GATE. release() guards the terminal handlers this way; the stdout
+    // handler had nothing, so a child that was stopped, superseded or whose task
+    // was deleted kept mutating the row. Reproduced: stopTask() on a pipeline task
+    // left the child alive (SIGTERM, no escalation), its `result` still advanced
+    // the step, and the task walked on toward /ship after the operator paused it.
+    if (running.get(task.id) !== child || supersededChildren.has(child)) return;
+    const owner = store.getTask(task.id);
+    if (!owner || !isLive(owner.status)) return;
     if (e.type === "system" && e.subtype === "init") {
       sawInit = true; // the launch got past Claude Code's startup checks
       // Proof that agents CAN start. Retract any standing claim to the contrary,
@@ -787,7 +813,8 @@ function attach(task: Task, child: ChildProcess) {
         // step reports a reason, and reasons do not resolve themselves.
         const why = blockedReason(finalText);
         log("log", `step ${store.getTask(task.id)!.step + 1} reported STEP BLOCKED: ${why}`);
-        patch({ status: "error", error: `step ${store.getTask(task.id)!.step + 1} blocked: ${why}` });
+        stepRetries.delete(task.id);
+      patch({ status: "error", error: `step ${store.getTask(task.id)!.step + 1} blocked: ${why}` });
         notify(store.getTask(task.id)!, "error");
       } else if (!advancePipeline()) {
         setPhase("done", true);
@@ -873,14 +900,6 @@ function runStep(task: Task, index: number): void {
     store.patchTask(task.id, { status: "error", error: `step ${index + 1} is past the end of the ${steps.length}-step table — the step table changed under a running task`, lastActivity: Date.now() });
     emitUpdate(task.id);
     return;
-  }
-  // Record WHAT this task is running, once. Per turn it would evict the real
-  // tool/phase/text events from the 200-row window the drawer reads.
-  if (index === 0) {
-    store.addEvent({
-      taskId: task.id, ts: Date.now(), kind: "log",
-      data: "pipeline: " + steps.map((s, i) => `${i + 1}. ${s.phase}${s.skill ? ` /${s.skill}` : ""}`).join("  "),
-    });
   }
   // Log the phase only when it actually CHANGES. Steps 6 and 7 are both `ship`, and
   // a retry re-runs the same step, so an unconditional write filled the drawer with

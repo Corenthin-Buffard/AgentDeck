@@ -7,6 +7,8 @@
 <meta name="ad-token" content="__AD_TOKEN__">
 <!-- Whether the New-task pipeline checkbox starts ticked (AGENTDECK_PIPELINE). -->
 <meta name="ad-pipeline-default" content="__AD_PIPELINE_DEFAULT__">
+<!-- The resolved pipeline step table, daemon-wide. -->
+<meta name="ad-pipeline-steps" content="__AD_PIPELINE_STEPS__">
 <title>AgentDeck · Master Inbox</title>
 <!-- Favicon: the same deck glyph as the header, inline so the binary stays
      self-contained (no extra file, no server route). Hex is hard-coded because
@@ -277,6 +279,9 @@ const AD_TOKEN=(document.querySelector('meta[name=ad-token]')||{}).content||"";
 // Whether the New-task pipeline box starts ticked (AGENTDECK_PIPELINE). Served in
 // the HTML rather than fetched, so the drawer renders correctly on first open.
 const AD_PIPELINE_DEFAULT=((document.querySelector('meta[name=ad-pipeline-default]')||{}).content||"")==="true";
+// Served resolved, not derived from an event: a per-task event row is evicted from
+// the 200-row window long before anyone opens the drawer.
+const AD_PIPELINE_STEPS=((document.querySelector('meta[name=ad-pipeline-steps]')||{}).content||"").split(" | ").filter(Boolean);
 // Every state-changing request carries the dashboard token so the daemon accepts
 // it (and a cross-origin page, which can't read this token, can't forge them).
 function authHeaders(extra){return Object.assign({"x-agentdeck-token":AD_TOKEN},extra||{});}
@@ -635,16 +640,10 @@ async function sendAnswer(id){
 }
 async function openTask(id){
   const t=tasks.find(x=>x.id===id);
-  // The daemon logs the resolved step table once, at step 0 — parse it back out
-  // rather than duplicating the table in the client, so an override is reflected.
-  let pipeSteps=[];
   const ev=await fetch(`/api/tasks/${id}/events`).then(r=>r.json()).catch(()=>({events:[]}));
   const df=await fetch(`/api/tasks/${id}/diff`).then(r=>r.json()).catch(()=>({diff:""}));
   // Cap the diff so a task touching many files can't bloat the drawer DOM (events
   // are already capped below). The full diff lives in the worktree.
-  // The daemon logs "pipeline: 1. plan /spec  2. plan /autoplan  …" once, at step 0.
-  const pipeEv=(ev.events||[]).find(e=>e.kind==="log"&&typeof e.data==="string"&&e.data.startsWith("pipeline: "));
-  if(pipeEv)pipeSteps=pipeEv.data.slice("pipeline: ".length).split(/\s{2,}/).map(s=>s.replace(/^\d+\.\s*/,"")).filter(Boolean);
   const diff=df.diff||"";
   const DIFF_CAP=4000;
   const diffShown=diff.length>DIFF_CAP?diff.slice(0,DIFF_CAP)+`\n… ${diff.length-DIFF_CAP} more chars truncated (see the worktree)`:diff;
@@ -662,7 +661,7 @@ async function openTask(id){
   showDrawer(`<h2>${esc(t.title)}</h2>
     <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span><span>phase ${esc(t.phase)}</span><span>${esc(t.status)}</span>
       <span>${t.pipeline?`pipeline step ${esc(String((t.step||0)+1))}`:"free-form"}</span></div>
-    ${t.pipeline&&pipeSteps.length?`<label class="lbl">Pipeline</label><div class="q">${pipeSteps.map((st,i)=>`${i===(t.step||0)?"▶ ":"  "}${i+1}. ${esc(st)}`).join("\n")}</div>`:""}
+    ${t.pipeline&&AD_PIPELINE_STEPS.length?`<label class="lbl">Pipeline</label><div class="q">${AD_PIPELINE_STEPS.map((st,i)=>`${i===(t.step||0)?"▶ ":"  "}${esc(st)}`).join("\n")}</div>`:""}
     ${t.pipeline&&t.pipelineMissed>0?`<label class="lbl">Pipeline</label><div class="q">⚠ ${esc(String(t.pipelineMissed))} step${t.pipelineMissed>1?"s":""} finished without invoking the gstack skill they were told to run. The work may be fine, but it was not spec'd, reviewed or QA'd by the pipeline.</div>`:""}
     ${t.error?`<label class="lbl">Error</label><div class="q">${esc(t.error)}</div>`:""}
     <label class="lbl">Diff</label><div class="q">${esc(diffShown||"(no changes)")}</div>

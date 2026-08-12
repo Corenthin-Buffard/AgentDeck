@@ -16,6 +16,7 @@ import { notices, noticesTruncated, setNoticeListener } from "./notices.ts";
 import { answer, stopTask } from "./agent.ts";
 import { createTask, removeTask, findBySession } from "./tasks.ts";
 import { parseDecisionBrief } from "./detect.ts";
+import { stepSummary } from "./pipeline.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
 
@@ -227,9 +228,15 @@ export function startServer() {
   // on /api/health (that answers "is this daemon working", not "how is it set up").
   // The New-task checkbox needs it before the first render, so a served constant
   // beats another round trip.
+  // The resolved step table rides along too. It was briefly written as a per-task
+  // EVENT, which was dead on arrival: recentEvents returns the newest 200 rows and
+  // a single gstack skill writes hundreds of `tool` rows, so the one row the drawer
+  // looked for was evicted before step 1 finished. The table is daemon-wide (the
+  // override file is), so it belongs here, resolved once, like the token.
   const dashboardHtml = indexHtml
     .replace("__AD_TOKEN__", () => escAttr(config.dashboardToken))
-    .replace("__AD_PIPELINE_DEFAULT__", () => (config.pipelineDefault ? "true" : "false"));
+    .replace("__AD_PIPELINE_DEFAULT__", () => (config.pipelineDefault ? "true" : "false"))
+    .replace("__AD_PIPELINE_STEPS__", () => escAttr(stepSummary().join(" | ")));
   // From here on, a notice raised at RUNTIME (agent.ts retracting the root-bypass
   // claim) reaches every open dashboard immediately instead of waiting for the next
   // reconnect. Registered before serve() so nothing raised during startup is lost.

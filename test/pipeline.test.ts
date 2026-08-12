@@ -9,6 +9,7 @@ import { looksLikeQuestion } from "../src/detect.ts";
 import { config } from "../src/config.ts";
 import { notices, resetNotices } from "../src/notices.ts";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach } from "bun:test";
@@ -312,6 +313,32 @@ describe("loadSteps", () => {
     withDataDir((f) => writeFileSync(f, "plan /invented-skill\nDo it.\n"));
     expect(loadSteps()).toHaveLength(1);
     expect(notices().some((n) => n.message.includes("invented-skill"))).toBe(true);
+  });
+
+  // REGRESSION. `worktreesDir` defaults to a child of `dataDir`, so any agent can
+  // create `../pipeline-steps.md` from its own cwd. A FIFO there makes open(2)
+  // BLOCK FOREVER — it does not throw, so "never throws" says nothing about it —
+  // and the daemon that reads it never binds a port, never shows a notice, and
+  // never restarts, because the process is alive. Reproduced before the fix.
+  test("a FIFO at the override path cannot hang the reader", () => {
+    const d = withDataDir();
+    execFileSync("mkfifo", [join(d, "pipeline-steps.md")]);
+    const t0 = Date.now();
+    expect(loadSteps()).toEqual(DEFAULT_STEPS);      // degrades, does not block
+    expect(Date.now() - t0).toBeLessThan(2000);      // and does not wait on a writer
+    expect(notices().some((n) => n.code === "pipeline-steps")).toBe(true);
+  });
+
+  test("a directory at the override path is refused, not read", () => {
+    withDataDir((f) => mkdirSync(f));
+    expect(loadSteps()).toEqual(DEFAULT_STEPS);
+    expect(notices().some((n) => n.code === "pipeline-steps")).toBe(true);
+  });
+
+  test("an oversized override is refused rather than loaded into memory", () => {
+    withDataDir((f) => writeFileSync(f, "plan /spec\n" + "x".repeat(300 * 1024)));
+    expect(loadSteps()).toEqual(DEFAULT_STEPS);
+    expect(notices().some((n) => n.message.includes("cap"))).toBe(true);
   });
 
   test("the table is memoized — the file is read once per process", () => {

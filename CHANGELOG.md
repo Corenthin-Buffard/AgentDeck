@@ -54,9 +54,23 @@
   including the `result` that decides whether the task advances. The task then sat in
   `running` until its child closed and was reported as "exited mid-run", which was a lie: the
   agent had finished fine, the supervisor dropped the event.
+- **Any agent could hang every future daemon boot.** The step-table override is read from
+  the data dir, and `worktreesDir` sits under it — so an agent could create a FIFO at that
+  path from its own worktree. `open(2)` on a FIFO blocks forever and never throws, so a
+  never-throws guarantee said nothing about it: the daemon stopped before binding a port,
+  with no dashboard, no notice and no systemd restart, because the process stayed alive.
+  The read now refuses anything that is not a small regular file, opens non-blocking, and
+  never follows a symlink. Verified by booting the shipped binary with a FIFO planted at
+  the path: it starts, serves, and says why.
+- **Pausing a task did not pause it.** The stdout handler had no check that the child still
+  owned the task, so a stopped pipeline task kept advancing — reproduced going from
+  `stopped` to `done` on its own, two agent launches later. On the full table that path
+  reaches `/ship`. The handler now applies the same ownership guard the terminal handlers
+  already used.
 - **A step index past the end of the table** (an operator shrinks `pipeline-steps.md` under a
   running task) now fails with the reason instead of parking the task in `running` with no
-  process, no error and nothing to see.
+  process, no error and nothing to see — and it is caught where the realistic path actually
+  reads it, so a task can no longer graduate having silently skipped `/ship` and `/canary`.
 - **The plan segment went dark the moment `/spec` wrote a file.** Phase signals now carry
   authoritative-ness per skill. `mergePhase` was strictly forward-only, so the Edit `/spec` makes
   writing its own spec file pushed the bar to `run`, and every later plan-phase skill was rejected

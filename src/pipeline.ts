@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
 import { SKILL_PHASE, normalizeSkill, ORDER } from "./phase.ts";
@@ -212,6 +212,55 @@ export function parseSteps(text: string): PipelineStep[] | null {
   return out.length ? out : null;
 }
 
+/** Refuse anything that is not a small REGULAR file, and never read THROUGH a
+ *  symlink or a FIFO.
+ *
+ *  This is the load-bearing guard, not a nicety. `worktreesDir` defaults to a
+ *  child of `dataDir`, so any agent can create `../pipeline-steps.md` from its own
+ *  cwd. A FIFO there makes `open(2)` BLOCK FOREVER — it does not throw, so a
+ *  never-throws promise says nothing about it — and a huge file OOMs the reader.
+ *  Both turn a one-shot agent compromise into a persistent denial of the whole
+ *  orchestrator. O_NONBLOCK makes opening a FIFO fail instead of hang; fstat then
+ *  rejects anything that is not a regular file, and the size cap bounds the read.
+ *
+ *  Returns null when there is nothing usable to parse; the caller falls back to
+ *  the built-in table. Never throws. */
+const OVERRIDE_MAX_BYTES = 256 * 1024;
+function readOverride(file: string): string | null {
+  let fd: number | undefined;
+  try {
+    // O_NONBLOCK: a FIFO fails with ENXIO rather than blocking the process.
+    // O_NOFOLLOW: never read through a planted symlink.
+    fd = openSync(file, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      notice("warn", "pipeline-steps", `${file} is not a regular file — ignoring it and using the built-in pipeline`);
+      return null;
+    }
+    if (st.size > OVERRIDE_MAX_BYTES) {
+      notice("warn", "pipeline-steps", `${file} is ${st.size} bytes (cap ${OVERRIDE_MAX_BYTES}) — ignoring it and using the built-in pipeline`);
+      return null;
+    }
+    if (st.size === 0) return null;
+    const buf = Buffer.alloc(st.size);
+    readSync(fd, buf, 0, st.size, 0);
+    return buf.toString("utf8");
+  } catch (e: any) {
+    // ENOENT is the normal case: no override, use the built-in table silently.
+    if (e?.code !== "ENOENT") {
+      notice("warn", "pipeline-steps", `could not read ${file}: ${e.message} — using the built-in pipeline`);
+    }
+    return null;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ }
+  }
+}
+
+/** The step table as the dashboard shows it: "1. plan /spec", … */
+export function stepSummary(steps: PipelineStep[] = loadSteps()): string[] {
+  return steps.map((s, i) => `${i + 1}. ${s.phase}${s.skill ? ` /${s.skill}` : ""}`);
+}
+
 // Memoized so the file is read once per process, not once per step. `undefined`
 // means "not resolved yet" — distinct from a resolved empty result.
 let cached: PipelineStep[] | undefined;
@@ -227,16 +276,8 @@ let cached: PipelineStep[] | undefined;
 export function loadSteps(): PipelineStep[] {
   if (cached) return cached;
   const file = join(config.dataDir, "pipeline-steps.md");
-  let raw: string;
-  try {
-    raw = readFileSync(file, "utf8");
-  } catch (e: any) {
-    // ENOENT is the normal case: no override, use the built-in table silently.
-    if (e?.code !== "ENOENT") {
-      notice("warn", "pipeline-steps", `could not read ${file}: ${e.message} — using the built-in pipeline`);
-    }
-    return (cached = DEFAULT_STEPS);
-  }
+  const raw = readOverride(file);
+  if (raw === null) return (cached = DEFAULT_STEPS);
   const parsed = parseSteps(raw);
   if (!parsed) {
     notice("warn", "pipeline-steps", `${file} is not a valid step table — using the built-in pipeline`);
