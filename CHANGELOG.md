@@ -53,6 +53,12 @@
   `systemctl is-active` plus a grep for the page title — both of which pass on a completely broken
   install. It now checks `id -u` before writing the env file, and verifies with `/api/health`.
 
+- **The release workflow was building the wrong entry point.** Moving argv handling into
+  `src/main.ts` updated `package.json` and CI, but `release.yml` kept compiling `src/daemon.ts` — so
+  CI stayed green while every *published binary* would have shipped without `--version`, `--help` or
+  unknown-flag rejection. Nothing ran the artifact before publishing it; now the release job asserts
+  the binary's own reported version equals the VERSION file before it uploads anything.
+
 ### Changed
 - **`GET /api/health`** answers liveness (`ok`, `version`, `uptimeMs`) to a plain `curl`, so probes
   and the install runbook work unauthenticated; `uid` and the notice text that explains a failure
@@ -75,6 +81,15 @@
   an escaped string can bisect an entity like `&#39;`.
 
 ### Internal
+- A literal NUL byte, used as a separator inside the dashboard's notice-dismissal key, made the
+  served HTML count as binary to strict `grep` implementations (ugrep, busybox), which report no
+  match while the page renders perfectly in a browser — and the HTML tokenizer rewrites a NUL inside
+  a `<script>` to U+FFFD anyway. GNU grep is unaffected, so this broke local tooling rather than
+  GitHub CI. The suite now asserts the served page contains no control bytes.
+- Two CI-only failures caught before pushing: a test that could only pass as root (it asserted a
+  notice that is deliberately uid-gated), and the new `/api/health` assertion, which a runner
+  without Claude Code correctly answers `ok:false`. The first became a uid-injectable unit test
+  covering both branches; the second gives the smoke daemon a stub binary.
 - Replacing an agent (every reply, and every resume) now waits for the outgoing `claude` to actually
   exit before starting its successor. It used to send SIGTERM and spawn immediately, so for as long
   as the old agent took to die two of them were appending to one session transcript and editing one
