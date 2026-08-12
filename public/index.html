@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!-- Per-session token injected by the daemon; the upload POST carries it as ?token=. -->
 <meta name="ad-token" content="__AD_TOKEN__">
+<!-- Whether the New-task pipeline checkbox starts ticked (AGENTDECK_PIPELINE). -->
+<meta name="ad-pipeline-default" content="__AD_PIPELINE_DEFAULT__">
+<!-- The resolved pipeline step table, daemon-wide. -->
+<meta name="ad-pipeline-steps" content="__AD_PIPELINE_STEPS__">
 <title>AgentDeck · Master Inbox</title>
 <!-- Favicon: the same deck glyph as the header, inline so the binary stays
      self-contained (no extra file, no server route). Hex is hard-coded because
@@ -127,6 +131,22 @@
   .row.waiting .seg.active .bar{background:var(--wait)}.row.error .seg.active .bar{background:var(--err)}
   .seg .pl{font-family:var(--mono);font-size:9.5px;letter-spacing:.3px;text-transform:uppercase;color:var(--dim);margin-top:5px;text-align:center;white-space:nowrap}
   .seg.active .pl{color:var(--text);font-weight:600}
+  /* Three pipeline states. `inferred` is quiet on purpose — an opted-out task is
+     not a problem, the board simply is not measuring it. `missed` is NOT quiet:
+     the pipeline was commanded and did not happen, which is the one failure that
+     must never look like ordinary progress. Dashed, so it reads without color. */
+  /* Specificity matters here: `.row.waiting .seg.active .bar` (0,5,0) beats a bare
+     `.phases.missed .seg .bar` (0,3,0), so on the two row states an operator looks
+     at most the active segment kept its solid colour and the warning vanished.
+     These are written to outrank it on every row state. */
+  .phases.inferred{opacity:.45}
+  .row .phases.inferred .seg .bar,
+  .row.waiting .phases.inferred .seg.active .bar,
+  .row.error .phases.inferred .seg.active .bar{background:repeating-linear-gradient(90deg,var(--line-soft) 0 3px,transparent 3px 6px)}
+  .row .phases.missed .seg .bar,
+  .row.waiting .phases.missed .seg.active .bar,
+  .row.error .phases.missed .seg.active .bar{background:repeating-linear-gradient(90deg,var(--wait) 0 3px,transparent 3px 6px)}
+  .pipewarn{font-family:var(--mono);font-size:9.5px;letter-spacing:.3px;color:var(--wait);margin-top:5px}
   /* Plan-review marks: a calm, monochrome CEO/Design/Eng row under the plan
      segment. Glyph SHAPE carries state (○ not-run, ✓ clean, ⚠ not-clean, trailing
      * = stale) so it reads without color; --dim/--faint (never the status colors
@@ -256,6 +276,12 @@ const BRANCH_ICON=`<svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="
   +`<path d="M3.5 10V4M3.5 7h2.5a2 2 0 0 0 2-2V4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>`
   +`<circle cx="3.5" cy="2.6" r="1.4" fill="currentColor"/><circle cx="8" cy="2.6" r="1.4" fill="currentColor"/></svg>`;
 const AD_TOKEN=(document.querySelector('meta[name=ad-token]')||{}).content||"";
+// Whether the New-task pipeline box starts ticked (AGENTDECK_PIPELINE). Served in
+// the HTML rather than fetched, so the drawer renders correctly on first open.
+const AD_PIPELINE_DEFAULT=((document.querySelector('meta[name=ad-pipeline-default]')||{}).content||"")==="true";
+// Served resolved, not derived from an event: a per-task event row is evicted from
+// the 200-row window long before anyone opens the drawer.
+const AD_PIPELINE_STEPS=((document.querySelector('meta[name=ad-pipeline-steps]')||{}).content||"").split(" | ").filter(Boolean);
 // Every state-changing request carries the dashboard token so the daemon accepts
 // it (and a cross-origin page, which can't read this token, can't forge them).
 function authHeaders(extra){return Object.assign({"x-agentdeck-token":AD_TOKEN},extra||{});}
@@ -366,13 +392,29 @@ function reviewMarks(t){
     return `<span class="${cls}" title="${esc(title)}" aria-label="${esc(title)}">${esc(label)}<b>${esc(glyph)}</b></span>`;
   }).join("")+`</div>`;
 }
+// The phase bar has three meanings, and conflating them is how a broken pipeline
+// hides in plain sight:
+//   pipeline on, steps running their skills → normal. The daemon commanded it.
+//   pipeline OFF                            → muted. Not measuring, by choice.
+//   pipeline ON but a step ran no skill      → warned. Commanded and did not happen.
+// The third is NOT status:"error" — the code may be perfectly good; what failed is
+// that it went unreviewed. Overloading `error` would train the operator to ignore
+// the loudest signal they have.
+function pipeState(t){
+  if(!t.pipeline)return {cls:"inferred",note:"off-pipeline — phase inferred from file edits, not tracked"};
+  if(t.pipelineMissed>0)return {cls:"missed",note:`pipeline did not run: ${t.pipelineMissed} step${t.pipelineMissed>1?"s":""} finished without invoking their gstack skill`};
+  return {cls:"",note:""};
+}
 function phaseBar(t){
   const idx=PHASES.indexOf(t.phase);
-  return `<div class="phases">`+PHASES.map((p,i)=>{
+  const st=pipeState(t);
+  // title AND aria-label both carry the note — a title alone is not accessible.
+  const attrs=st.note?` title="${esc(st.note)}" aria-label="${esc(st.note)}"`:"";
+  return `<div class="phases ${st.cls}"${attrs}>`+PHASES.map((p,i)=>{
     const cls=i<idx?"done":i===idx?"active":"";
     // Marks live inside the first (plan) seg as a sibling of .pl.
     return `<div class="seg ${cls}"><div class="bar"></div><div class="pl">${p}</div>${i===0?reviewMarks(t):""}</div>`;
-  }).join("")+`</div>`;
+  }).join("")+`</div>`+(st.cls==="missed"?`<div class="pipewarn">⚠ pipeline did not run</div>`:"");
 }
 function actions(t){
   if(t.status==="waiting")return `<button class="btn primary" onclick="reply('${t.id}')">Reply</button>`;
@@ -473,8 +515,18 @@ function openNew(){
     <label class="lbl" for="nt">Title</label><input id="nt" placeholder="Billing rework">
     <label class="lbl" for="np">Instructions for the agent</label>
     <textarea id="np" placeholder="Implement X following the gstack workflow…" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')createTask()"></textarea>
+    <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--dim);font-family:var(--mono)">
+      <input type="checkbox" id="ntpipe" style="width:auto"${AD_PIPELINE_DEFAULT?" checked":""}> Follow the gstack pipeline</label>
+    <div class="hint" id="ntpipehint"></div>
     <div class="hint">⌘/Ctrl + Enter to launch</div>
     <button class="btn primary" onclick="createTask()">Launch agent</button>`);
+  const pipe=document.getElementById("ntpipe"),hint=document.getElementById("ntpipehint");
+  // Say what the choice actually changes, and update as it is toggled — the two
+  // modes behave differently enough that a bare checkbox would be a guess.
+  const sayPipe=()=>{hint.textContent=pipe.checked
+    ? "The daemon runs spec → autoplan → implement → review → qa → ship → canary, one turn per step."
+    : "Free-form: the agent gets your instructions as-is, and the phase bar is inferred, not tracked.";};
+  pipe.addEventListener("change",sayPipe);sayPipe();
   setTimeout(()=>document.getElementById("nt")?.focus(),50);
 }
 async function createTask(){
@@ -483,7 +535,10 @@ async function createTask(){
   // No project field means a single-project setup → let the server pick the default.
   const psel=document.getElementById("ntproj");
   const projectId=psel?psel.value:(currentProject!=="all"?currentProject:undefined);
-  const r=await fetch("/api/tasks",{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({title,prompt,projectId})});
+  // Always send a real BOOLEAN. The server ignores anything else and falls back to
+  // its configured default, which would silently contradict an unticked box.
+  const pipeline=!!(document.getElementById("ntpipe")||{}).checked;
+  const r=await fetch("/api/tasks",{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({title,prompt,projectId,pipeline})});
   if(r.ok)closeDrawer();else alert("Error: "+(await r.json()).error);
 }
 // ── upload (local → VPS) ──
@@ -604,7 +659,10 @@ async function openTask(id){
     return `${new Date(e.ts).toLocaleTimeString()} · ${esc(e.kind)} · ${esc(String(e.data).slice(0,cap))}`;
   };
   showDrawer(`<h2>${esc(t.title)}</h2>
-    <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span><span>phase ${esc(t.phase)}</span><span>${esc(t.status)}</span></div>
+    <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span><span>phase ${esc(t.phase)}</span><span>${esc(t.status)}</span>
+      <span>${t.pipeline?`pipeline step ${esc(String((t.step||0)+1))}`:"free-form"}</span></div>
+    ${t.pipeline&&AD_PIPELINE_STEPS.length?`<label class="lbl">Pipeline</label><div class="q">${AD_PIPELINE_STEPS.map((st,i)=>`${i===(t.step||0)?"▶ ":"  "}${esc(st)}`).join("\n")}</div>`:""}
+    ${t.pipeline&&t.pipelineMissed>0?`<label class="lbl">Pipeline</label><div class="q">⚠ ${esc(String(t.pipelineMissed))} step${t.pipelineMissed>1?"s":""} finished without invoking the gstack skill they were told to run. The work may be fine, but it was not spec'd, reviewed or QA'd by the pipeline.</div>`:""}
     ${t.error?`<label class="lbl">Error</label><div class="q">${esc(t.error)}</div>`:""}
     <label class="lbl">Diff</label><div class="q">${esc(diffShown||"(no changes)")}</div>
     <label class="lbl">Recent events</label>

@@ -1,11 +1,12 @@
 import { afterAll, afterEach, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../src/config.ts";
 import { store } from "../src/db.ts";
 import { answer, isRunning, launchTask, resumeTask, stopTask } from "../src/agent.ts";
 import { notices, resetNotices } from "../src/notices.ts";
+import { resetStepsCache } from "../src/pipeline.ts";
 import type { Task } from "../src/types.ts";
 
 // The supervisor's process handling had ZERO coverage across the whole suite —
@@ -28,13 +29,14 @@ function fakeBin(name: string, body: string): string {
   return p;
 }
 
-function makeTask(id: string): Task {
+function makeTask(id: string, pipeline = false): Task {
   const t: Task = {
     id, project: "default", title: `spawn test ${id}`, prompt: "noop",
     branch: `test/${id}`, worktree: dir, tmux: null, sessionId: null,
     status: "running", phase: "unknown", pendingQuestion: null,
     lastActivity: Date.now(), createdAt: Date.now(), error: null,
     planReviews: { ceo: null, design: null, eng: null },
+    pipeline, step: 0, stepSkillSeen: false, pipelineMissed: 0,
   };
   store.insertTask(t);
   made.push(id);
@@ -334,3 +336,134 @@ test("a resumed task that dies before init lands in error with the cause", async
   expect(args).toContain("--resume");
   expect(args).toContain("sess-resume");
 }, 30000);
+
+// ── the daemon-driven pipeline, end to end ──────────────────────────────────
+// Everything above this point tests the supervisor's process handling. These test
+// the STATE MACHINE, which had zero coverage: nothing in the suite ever created a
+// pipeline task, and nothing ever emitted a `result` event — so retry, the
+// question-does-not-advance rule, STEP BLOCKED and the advance itself were all
+// unexercised. They are also the paths that end in `git push`.
+//
+// Same fake-bin approach as above: a real subprocess, real fds, real exit codes.
+// A two-step override table (installed through the resetStepsCache seam) keeps the
+// fake agent to two turns.
+
+/**
+ * A fake `claude` that emits one full turn of stream-json and exits 0.
+ *
+ * `printf '%s\n'`, never `echo`: /bin/sh here is dash, whose echo performs escape
+ * processing, so a `\n` inside the JSON becomes a REAL newline and splits the
+ * object across two lines. The supervisor then fails to parse it and skips the
+ * event — which looks exactly like a product bug and is not one. Keep every
+ * emitted JSON object on a single line, with no escapes.
+ */
+function fakeAgent(name: string, opts: { skill?: string; final: string }): string {
+  const skillLine = opts.skill
+    ? `printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Skill","input":{"skill":"${opts.skill}"}}]}}'`
+    : "";
+  return fakeBin(name, [
+    `printf '%s\\n' "$@" >> "${join(dir, "argv.log")}"`,
+    `printf '%s\\n' '{"type":"system","subtype":"init","session_id":"sess-1"}'`,
+    skillLine,
+    `printf '%s\\n' '{"type":"result","subtype":"success","result":"${opts.final}"}'`,
+  ].filter(Boolean).join("\n"));
+}
+
+/** Point loadSteps at a throwaway two-step table. */
+function twoStepTable(body: string) {
+  const d = mkdtempSync(join(tmpdir(), "agentdeck-steps-"));
+  writeFileSync(join(d, "pipeline-steps.md"), body);
+  config.dataDir = d;
+  resetStepsCache();
+  return d;
+}
+
+const originalDataDir = config.dataDir;
+afterEach(() => { config.dataDir = originalDataDir; resetStepsCache(); });
+
+test("a pipeline task advances step 0 -> 1 -> done, each in a FRESH session", async () => {
+  twoStepTable("plan /spec\nWrite the spec.\n\nreview /review\nReview the diff.\n");
+  config.claudeBin = fakeAgent("stepper", { skill: "spec", final: "STEP OK" });
+  const t = makeTask("t_pipe_advance", true);
+
+  launchTask(t);
+  expect(await until(() => store.getTask(t.id)?.status === "done")).toBe(true);
+
+  const done = store.getTask(t.id)!;
+  expect(done.step).toBe(1);        // advanced off step 0
+  expect(done.phase).toBe("done");  // terminal phase after the LAST step
+  // The intermediate phase came from the TABLE, not inferred from the stream:
+  // step 1 is `review`, and nothing in the fake agent's output implies it.
+  const phases = store.recentEvents(t.id).filter((e) => e.kind === "phase").map((e) => e.data);
+  expect(phases).toContain("plan");
+  expect(phases).toContain("review");
+  // Fresh session per step: no launch may carry --resume.
+  const argv = readFileSync(join(dir, "argv.log"), "utf8");
+  expect(argv).not.toContain("--resume");
+  rmSync(join(dir, "argv.log"), { force: true });
+});
+
+test("the COMMANDED skill is credited; an ad-hoc one is not", async () => {
+  // The integrity signal. Step 0 commands /spec; the agent runs /browse instead,
+  // so the step must be recorded as missed rather than as ordinary progress.
+  twoStepTable("plan /spec\nWrite the spec.\n\nreview /review\nReview the diff.\n");
+  config.claudeBin = fakeAgent("wrongskill", { skill: "browse", final: "STEP OK" });
+  const t = makeTask("t_pipe_missed", true);
+
+  launchTask(t);
+  expect(await until(() => (store.getTask(t.id)?.pipelineMissed ?? 0) > 0)).toBe(true);
+  expect(store.getTask(t.id)!.pipelineMissed).toBeGreaterThan(0);
+});
+
+test("STEP BLOCKED halts the pipeline instead of marching on to the next step", async () => {
+  twoStepTable("plan /spec\nWrite the spec.\n\nreview /review\nReview the diff.\n");
+  config.claudeBin = fakeAgent("blocked", { skill: "spec", final: "STEP BLOCKED: dev server will not boot" });
+  const t = makeTask("t_pipe_blocked", true);
+
+  launchTask(t);
+  expect(await until(() => store.getTask(t.id)?.status === "error")).toBe(true);
+
+  const blocked = store.getTask(t.id)!;
+  expect(blocked.step).toBe(0);                                  // never advanced
+  expect(blocked.error).toContain("dev server will not boot");   // the reason reaches the card
+});
+
+test("a question parks the task WITHOUT advancing the step", async () => {
+  twoStepTable("plan /spec\nWrite the spec.\n\nreview /review\nReview the diff.\n");
+  config.claudeBin = fakeAgent("asker", { skill: "spec", final: "Two schemas are possible. Which should I use?" });
+  const t = makeTask("t_pipe_question", true);
+
+  launchTask(t);
+  expect(await until(() => store.getTask(t.id)?.status === "waiting")).toBe(true);
+  expect(store.getTask(t.id)!.step).toBe(0); // answering must resume THIS step
+});
+
+test("a transient failure retries the step, then gives up exactly once", async () => {
+  twoStepTable("plan /spec\nWrite the spec.\n\nreview /review\nReview the diff.\n");
+  const counter = join(dir, "tries.log");
+  config.claudeBin = fakeBin("flaky", [
+    `printf 'x\\n' >> "${counter}"`,
+    `printf '%s\\n' '{"type":"system","subtype":"init","session_id":"s"}'`,
+    `printf '%s\\n' '{"type":"result","subtype":"error_during_execution"}'`,
+  ].join("\n"));
+  const t = makeTask("t_pipe_retry", true);
+
+  launchTask(t);
+  expect(await until(() => store.getTask(t.id)?.status === "error", 10000)).toBe(true);
+
+  // MAX_STEP_RETRIES = 2, so the step runs at most 3 times and then stops.
+  const tries = readFileSync(counter, "utf8").trim().split("\n").length;
+  expect(tries).toBeGreaterThan(1);   // it did retry
+  expect(tries).toBeLessThanOrEqual(3); // and it is bounded
+  expect(store.getTask(t.id)!.error).toContain("step 1");
+  rmSync(counter, { force: true });
+});
+
+test("a free-form task is untouched by any of this", async () => {
+  config.claudeBin = fakeAgent("plain", { final: "all done" });
+  const t = makeTask("t_freeform", false);
+
+  launchTask(t);
+  expect(await until(() => store.getTask(t.id)?.status === "done")).toBe(true);
+  expect(store.getTask(t.id)!.pipelineMissed).toBe(0);
+});

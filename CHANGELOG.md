@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.4.2] - 2026-08-12
+## [0.2.5.1] - 2026-08-12
 
 ### Fixed
 - **The install runbook still produced the broken install it now detects.** v0.2.4.1 taught the
@@ -40,6 +40,110 @@
   first — an operator acting on a red banner acts on the first remedy they read, and for two
   releases that was the one keeping every agent at uid 0. A test asserts the order, not just the
   presence of each string.
+
+## [0.2.5.0] - 2026-08-12
+
+### Added
+- **The daemon now drives the gstack pipeline instead of hoping the agent does.** Tick *Follow the
+  gstack pipeline* on a new task and AgentDeck runs it as a sequence — `/spec` → `/autoplan` →
+  implement → `/review` → `/qa` → `/ship` → `/canary` — one `claude -p` turn per step, advancing on
+  success. `phase` stops being archaeology and becomes something the daemon knows, because it is
+  what the daemon just asked for.
+
+  The first design injected a preamble telling the agent to follow the sequence. The plan review's
+  outside voice killed it, correctly: an instruction is unenforceable here. A turn ends when the
+  model stops, and the supervisor reads a quiet `result` as `done` — so an agent that finished
+  `/spec`, wrote a summary and stopped would have been marked complete for ever, half a pipeline in.
+
+  Each step runs in a **fresh session**. Resuming would pile seven heavy skills into one context,
+  which compacts, and a compacted agent that loses the thread simply ends its turn — which this
+  daemon reads as success. Steps hand off through gstack's on-disk artifacts instead. That handoff
+  is the design's central bet and the one thing only a real run can validate.
+
+  A question does not advance the step: answering resumes that step's session. A turn that *failed*
+  retries, bounded per step; a step that *ran* and reported it cannot proceed halts the task.
+
+  `/ship` is told not to bump `VERSION` or edit `CHANGELOG.md`. Agents work in sibling worktrees, so
+  there is no concurrent write — the collision is a *merge* conflict when the second PR lands, which
+  no lock on ship-entry can prevent. Removing the per-task bump removes the conflict.
+
+  Off by default (`AGENTDECK_PIPELINE`), so upgrading can never start opening PRs on its own. The
+  step table is overridable at `<dataDir>/pipeline-steps.md`, read lazily so a bad file degrades to
+  the built-in table with a dashboard notice rather than crash-looping the daemon.
+
+### Fixed
+- **The board had never once shown a gstack phase.** `src/agent.ts` read the skill name from
+  `input.skill` on a `content_block_start` event, but the Anthropic streaming protocol starts every
+  `tool_use` block with `input: {}` **by design** — the arguments follow as `input_json_delta`
+  fragments. Confirmed against a real capture: `content_block_start` gives
+  `{"name":"Skill","input":{}}`, and the name only materialises on the consolidated `assistant`
+  message as `{"skill":"careful"}`. So `SKILL_PHASE` never fired in production, and every phase on
+  every board came from the `Edit|Write` → `run` rule plus the terminal `done`. The CEO/Design/Eng
+  glyphs were never affected — they come from the `gstack-review-read` subprocess.
+
+  Also: an agent that types `/review` emits no `Skill` block at all, so the `SlashCommand` path is
+  handled too; skill names are normalised; `/autoplan` joins the map; and `/canary` moves from `qa`
+  to `ship`, because as `qa` it arrived after `/ship` and was swallowed by the forward-only merge.
+
+- **A permanently-failing pipeline step respawned agents forever.** `retryStep` set its
+  budget and then advanced through `killExisting`, which clears per-task state on every step
+  transition — so each retry wiped its own bound. Caught by the first integration test that
+  ever drove the state machine: nine spawns instead of three. The budget is now cleared where
+  a task actually leaves the pipeline, not where it merely changes step.
+- **One malformed event no longer strands a task.** Several stream-json events arrive in a
+  single read, and a throw while handling one abandoned every remaining line in that chunk —
+  including the `result` that decides whether the task advances. The task then sat in
+  `running` until its child closed and was reported as "exited mid-run", which was a lie: the
+  agent had finished fine, the supervisor dropped the event.
+- **Any agent could hang every future daemon boot.** The step-table override is read from
+  the data dir, and `worktreesDir` sits under it — so an agent could create a FIFO at that
+  path from its own worktree. `open(2)` on a FIFO blocks forever and never throws, so a
+  never-throws guarantee said nothing about it: the daemon stopped before binding a port,
+  with no dashboard, no notice and no systemd restart, because the process stayed alive.
+  The read now refuses anything that is not a small regular file, opens non-blocking, and
+  never follows a symlink. Verified by booting the shipped binary with a FIFO planted at
+  the path: it starts, serves, and says why.
+- **Pausing a task did not pause it.** The stdout handler had no check that the child still
+  owned the task, so a stopped pipeline task kept advancing — reproduced going from
+  `stopped` to `done` on its own, two agent launches later. On the full table that path
+  reaches `/ship`. The handler now applies the same ownership guard the terminal handlers
+  already used.
+- **A step index past the end of the table** (an operator shrinks `pipeline-steps.md` under a
+  running task) now fails with the reason instead of parking the task in `running` with no
+  process, no error and nothing to see — and it is caught where the realistic path actually
+  reads it, so a task can no longer graduate having silently skipped `/ship` and `/canary`.
+- **The plan segment went dark the moment `/spec` wrote a file.** Phase signals now carry
+  authoritative-ness per skill. `mergePhase` was strictly forward-only, so the Edit `/spec` makes
+  writing its own spec file pushed the bar to `run`, and every later plan-phase skill was rejected
+  as a regression. A skill knows which phase it is in; an edit is only guessing.
+  `investigate`/`design-review`/`browse` stay inferred, so debugging during `/ship` cannot drag the
+  bar backwards.
+
+### Changed
+- The dashboard tells three pipeline states apart: driven, free-form (muted and dashed — not
+  measuring, by choice), and *commanded but nothing happened* (amber, "pipeline did not run"). The
+  third is deliberately **not** `status: "error"`: the code may be fine, what failed is that it went
+  unreviewed, and overloading the loudest signal trains you to ignore it.
+- The per-tool-call liveness write is coalesced to one per 250ms per task. Every tool call used to
+  trigger a SQLite `UPDATE` plus a full-board re-serialisation; the pipeline makes that path roughly
+  a hundredfold busier. Real transitions still broadcast immediately.
+
+### Internal
+- The step table is validated at BOOT, not on the first pipeline task, so a broken override is
+  visible at startup rather than at first use; the resolved table is recorded once per task and
+  shown in the drawer with the current step marked.
+- Six integration tests drive the real supervisor against a fake `claude` over real pipes and
+  exit codes: advance across steps in fresh sessions, the commanded skill credited while an
+  ad-hoc one is not, `STEP BLOCKED` halting instead of continuing to ship, a question parking
+  the task without advancing it, the retry bound, and a free-form task left alone.
+- `argvFor()` and `spawnAgent()` make the launch command line a value tests can assert on. It was
+  assembled inline at three call sites and checked by nothing — which is exactly how a flag missing
+  from all three at once survived eight releases.
+- `pipeline`, `step`, `step_skill_seen` and `pipeline_missed` columns. `pipeline` **backfills**
+  rather than coalescing at read, unlike `project`/`plan_reviews`: it records a choice made at
+  creation, and a task already three steps in must not change what it is doing because the operator
+  edited an env var and restarted.
+- 285 tests, up from 107 before this branch.
 
 ## [0.2.4.1] - 2026-08-12
 

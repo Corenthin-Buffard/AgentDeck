@@ -1,11 +1,15 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { emitUpdate } from "./bus.ts";
 import { clearNotice, notice } from "./notices.ts";
 import { notify } from "./notify.ts";
-import { phaseFromSignal, mergePhase, canStillReview } from "./phase.ts";
+import { phaseFromSignal, mergePhase, canStillReview, slashToSkill } from "./phase.ts";
+import {
+  loadSteps, stepPrompt, creditsStep, stepOutcome, blockedReason, nextStep, retryDecision,
+} from "./pipeline.ts";
 import { looksLikeQuestion } from "./detect.ts";
 import type { Task, Phase, Status, PlanReviews, PlanReviewState } from "./types.ts";
 
@@ -219,6 +223,11 @@ function retire(taskId: string, child: ChildProcess): Promise<void> {
  */
 export function killExisting(taskId: string): Promise<void> {
   bumpGen(taskId);                       // invalidate any replacement still waiting
+  // NOTE: the retry budget is deliberately NOT cleared here. killExisting runs on
+  // every step transition (scheduleAfterExit), so clearing it made retryStep reset
+  // its own bound on each retry — a step that always fails respawned `claude`
+  // forever, unattended. The budget is cleared where the task actually LEAVES the
+  // pipeline: stopTask() and removeTask(), plus advancePipeline() on success.
   const cancelled = cancelQueued(taskId);
   const c = running.get(taskId);
   if (!c) {
@@ -315,6 +324,23 @@ const STDERR_RELAY_MAX_QUEUE = 1 << 20;
  */
 export function shouldRelay(queuedBytes: number, max = STDERR_RELAY_MAX_QUEUE): boolean {
   return queuedBytes <= max;
+}
+
+// How often a task's "still alive" timestamp may be written. Every tool call used
+// to trigger one SQLite UPDATE plus a full-board JSON.stringify over a SELECT *
+// (server.ts broadcast) — fine at a handful of tool calls per task, but the
+// pipeline runs seven heavy skills per task against a default of four concurrent
+// agents, which is that hot path roughly a hundredfold.
+//
+// Only LIVENESS is throttled. Real transitions — phase, status, question, result —
+// still broadcast the instant they happen, so nothing the operator needs to see
+// is ever delayed; the board's "3s ago" simply moves in quarter-second steps.
+const LIVENESS_MIN_INTERVAL_MS = 250;
+
+/** PURE + exported so the throttle is testable without a clock or a spawn — the
+ *  same shape as shouldRelay above. */
+export function shouldBumpLiveness(last: number, now: number, interval = LIVENESS_MIN_INTERVAL_MS): boolean {
+  return now - last >= interval;
 }
 
 /**
@@ -446,11 +472,46 @@ function attach(task: Task, child: ChildProcess) {
   const now = () => Date.now();
 
   const patch = (p: Partial<Task>) => { store.patchTask(task.id, { ...p, lastActivity: now() }); emitUpdate(task.id); };
+  // Liveness-only writes are coalesced; see shouldBumpLiveness. A real transition
+  // refreshes lastActivity anyway, so a liveness write suppressed just after one
+  // costs the operator nothing. (It does NOT reset this window — patch() doesn't
+  // touch lastLiveness — which is why the wording is "costs nothing", not "resets".)
+  let lastLiveness = 0;
+  const bumpLiveness = () => {
+    const t = now();
+    if (!shouldBumpLiveness(lastLiveness, t)) return;
+    lastLiveness = t;
+    patch({});
+  };
   const log = (kind: any, data: string) => store.addEvent({ taskId: task.id, ts: now(), kind, data });
-  const setPhase = (next: Phase) => {
-    const t = store.getTask(task.id); if (!t) return;
-    const merged = mergePhase(t.phase, next);
+  /** `pre` lets a caller that has ALREADY read the row pass it in, so a single
+   *  stream signal costs one SELECT rather than two. */
+  const setPhase = (next: Phase, authoritative = false, pre?: Task) => {
+    const t = pre ?? store.getTask(task.id); if (!t) return;
+    const merged = mergePhase(t.phase, next, authoritative);
     if (merged !== t.phase) { patch({ phase: merged }); log("phase", merged); }
+  };
+  /** Apply a stream signal, carrying its authoritative-ness through to the merge. */
+  const applySignal = (sig: { skill?: string; tool?: string; shipped?: boolean }) => {
+    const s = phaseFromSignal(sig);
+    if (!s) return;
+    // A PIPELINE task's phase is whatever the daemon commanded — it does not get
+    // re-derived from the stream. What the stream is good for here is confirming
+    // the agent actually ran the skill it was told to; a step that completes
+    // without one is the pipeline silently not happening.
+    const t = store.getTask(task.id);
+    if (!t) return;
+    if (t.pipeline) {
+      // Only the COMMANDED skill counts. Crediting any mapped skill let an agent
+      // that ran /browse during the `review` step mark the step as having happened,
+      // so pipelineMissed stayed 0 and the board reported a pipeline that did not
+      // run as ordinary progress — the exact failure this feature exists to show.
+      if (sig.skill && !t.stepSkillSeen && creditsStep(loadSteps()[t.step], sig.skill)) {
+        store.markStepSkillSeen(task.id);
+      }
+      return;
+    }
+    setPhase(s.phase, s.authoritative, t); // reuse the row we just read
   };
 
   // `?.` not `!`: on Bun these streams exist even for a spawn that never started,
@@ -463,7 +524,21 @@ function attach(task: Task, child: ChildProcess) {
       const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
       if (!line.trim()) continue;
       let e: any; try { e = JSON.parse(line); } catch { continue; }
-      handle(e);
+      // A throw from ONE event must not abandon the rest of the chunk. Several
+      // stream-json events usually arrive in a single read, so an exception here
+      // skipped every line after it — including the `result` that decides whether
+      // the task advances. The task then sat in `running` until its child closed
+      // and the terminal handler called it "exited mid-run", which is a lie: the
+      // agent finished fine, the supervisor dropped the event.
+      try { handle(e); }
+      catch (err) {
+        // The catch body itself must never throw: log() writes to SQLite, and
+        // SQLITE_FULL / a busy-timeout expiry is exactly the condition most likely
+        // to have made handle() throw in the first place. An escape here takes the
+        // daemon down — there is no uncaughtException handler.
+        try { log("log", `stream handler failed on a ${e?.type ?? "?"} event: ${(err as Error).message}`); }
+        catch { console.error(`[agent ${task.id}] stream handler failed and could not be logged`); }
+      }
     }
   });
 
@@ -541,6 +616,7 @@ function attach(task: Task, child: ChildProcess) {
     // the init event never reaches "running", and used to sit in "resuming" for
     // ever with no error text. That is exactly the root-failure path for tasks the
     // A2 loop resumes at daemon restart.
+    stepRetries.delete(task.id); // terminal for this task's current step
     if (t && isLive(t.status)) {
       // Log the tail BEFORE the patch, so a dashboard that opens the drawer the
       // instant the error appears already has the context. Only on an abnormal
@@ -574,7 +650,80 @@ function attach(task: Task, child: ChildProcess) {
     pump();
   });
 
+  /**
+   * Retry the CURRENT pipeline step after a transient failure.
+   *
+   * Returns FALSE only for a non-pipeline task, where the caller must mark it
+   * failed. Returns TRUE whenever this function handled it — either a retry was
+   * scheduled, or the budget was exhausted and the error was already patched here.
+   * (An earlier version of this comment claimed the exhausted branch returned
+   * false, which would have had the caller patch and notify a second time.)
+   *
+   * Bounded, and the bound is per step: a step that succeeds resets it, so a long
+   * pipeline cannot accumulate retries into an unbounded loop, and a step that is
+   * genuinely broken stops after MAX_STEP_RETRIES rather than burning tokens
+   * forever on something that will never work.
+   */
+  function retryStep(why: string): boolean {
+    const t = store.getTask(task.id);
+    if (!t?.pipeline) return false;
+    const used = stepRetries.get(task.id) ?? 0;
+    if (retryDecision(used, MAX_STEP_RETRIES) === "fail") {
+      stepRetries.delete(task.id);
+      patch({ status: "error", error: `step ${t.step + 1} failed ${used + 1}× (${why})` });
+      notify(store.getTask(task.id)!, "error");
+      return true; // handled — do NOT let the caller patch a second error
+    }
+    stepRetries.set(task.id, used + 1);
+    log("log", `step ${t.step + 1} failed (${why}) — retry ${used + 1}/${MAX_STEP_RETRIES}`);
+    runStep(t, t.step);
+    return true;
+  }
+
+  /**
+   * Advance a pipeline task to its next step. Returns false when there is nothing
+   * to advance — a free-form task, or the last step just finished — in which case
+   * the caller marks the task done.
+   */
+  function advancePipeline(): boolean {
+    const t = store.getTask(task.id);
+    if (!t?.pipeline) return false;
+    stepRetries.delete(task.id); // the step succeeded; its budget is spent, not carried
+    const steps = loadSteps();
+    const finished = steps[t.step];
+    // The step was COMMANDED to run a skill and the stream never showed one. The
+    // work may well be fine, but the pipeline did not happen — record it so the
+    // board can say so rather than showing ordinary progress.
+    if (finished?.skill && !t.stepSkillSeen) {
+      store.bumpPipelineMissed(task.id);
+      log("log", `step ${t.step + 1} finished without invoking /${finished.skill}`);
+    }
+    // The stored index can point past the end of the table — an operator shrinks
+    // pipeline-steps.md under a task in flight. nextStep() would call that "done"
+    // and the task would graduate having skipped every remaining step, /ship and
+    // /canary included. runStep's own guard never sees it: within one process
+    // nextStep bounds against the same memoized array.
+    if (t.step >= steps.length) {
+      patch({ status: "error", error: `step ${t.step + 1} is past the end of the ${steps.length}-step table — the step table changed under a running task` });
+      notify(store.getTask(task.id)!, "error");
+      return true; // handled: do NOT let the caller mark this done
+    }
+    const where = nextStep(t, steps);
+    if ("done" in where) return false; // pipeline complete → caller marks done
+    store.setStep(task.id, where.step);
+    runStep(store.getTask(task.id)!, where.step);
+    return true;
+  }
+
   function handle(e: any) {
+    // OWNERSHIP GATE. release() guards the terminal handlers this way; the stdout
+    // handler had nothing, so a child that was stopped, superseded or whose task
+    // was deleted kept mutating the row. Reproduced: stopTask() on a pipeline task
+    // left the child alive (SIGTERM, no escalation), its `result` still advanced
+    // the step, and the task walked on toward /ship after the operator paused it.
+    if (running.get(task.id) !== child || supersededChildren.has(child)) return;
+    const owner = store.getTask(task.id);
+    if (!owner || !isLive(owner.status)) return;
     if (e.type === "system" && e.subtype === "init") {
       sawInit = true; // the launch got past Claude Code's startup checks
       // Proof that agents CAN start. Retract any standing claim to the contrary,
@@ -590,11 +739,13 @@ function attach(task: Task, child: ChildProcess) {
       if (ev?.type === "content_block_start" && ev.content_block?.type === "tool_use") {
         const name: string = ev.content_block.name;
         log("tool", name);
-        const p = phaseFromSignal({ tool: name }); if (p) setPhase(p);
-        if (name === "Skill" && ev.content_block.input?.skill) {
-          const sp = phaseFromSignal({ skill: String(ev.content_block.input.skill) }); if (sp) setPhase(sp);
-        }
-        patch({}); // bump lastActivity
+        // Tool NAME is all this event can tell us. It carries `input: {}` by
+        // protocol — arguments stream in afterwards as input_json_delta — so a
+        // skill's name is NOT readable here. Reading it from this event is what
+        // left SKILL_PHASE dead in production for eight releases. Skills are
+        // picked up from the consolidated `assistant` message below instead.
+        applySignal({ tool: name });
+        bumpLiveness();
         return;
       }
       if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") { return; } // liveness-only; not accumulated
@@ -604,7 +755,24 @@ function attach(task: Task, child: ChildProcess) {
       // message(s). Deltas carry the same text and are NOT accumulated, so there's
       // no doubling — and no substring-dedup that could drop a restated question
       // and silently flip waiting -> done.
-      for (const c of e.message.content) if (c.type === "text") text += c.text;
+      //
+      // It is ALSO the only place a tool's arguments arrive complete. Verified
+      // against a real stream: content_block_start gives
+      //   {"type":"tool_use","name":"Skill","input":{}}
+      // and the name only materialises here, as {"skill":"careful"}. This is the
+      // single source of skill signals; anything reading them earlier sees {}.
+      for (const c of e.message.content) {
+        if (c?.type === "text") { text += c.text; continue; }
+        if (c?.type !== "tool_use" || !c.input || typeof c.input !== "object") continue;
+        if (c.name === "Skill" && typeof c.input.skill === "string") {
+          applySignal({ skill: c.input.skill });
+        } else if (c.name === "SlashCommand" && typeof c.input.command === "string") {
+          // An agent may type `/review` instead of calling the Skill tool. That
+          // produces no Skill block at all, so treating it as "no skill ran"
+          // would mark a task that behaved perfectly as off-pipeline.
+          applySignal({ skill: slashToSkill(c.input.command) });
+        }
+      }
     }
     if (e.type === "result") {
       // Refresh the plan-review marks BEFORE mutating phase/status. Gate on the
@@ -618,18 +786,38 @@ function attach(task: Task, child: ChildProcess) {
       const finalText = (text || e.result || "").trim();
       log("text", finalText.slice(0, EVENT_TEXT_MAX));
       if (e.subtype !== "success") {
-        patch({ status: "error", error: `result: ${e.subtype}` });
-        notify(store.getTask(task.id)!, "error");
+        // TRANSIENT: the turn itself failed (API error, aborted). For a pipeline
+        // task, retrying the step is worth it — losing six completed steps to one
+        // blip would be the daemon's fault, not the agent's. A step that RAN and
+        // reported it could not proceed exits successfully and is handled below,
+        // so this branch never retries something that will fail again forever.
+        if (!retryStep(`result: ${e.subtype}`)) {
+          patch({ status: "error", error: `result: ${e.subtype}` });
+          notify(store.getTask(task.id)!, "error");
+        }
       } else if (looksLikeQuestion(finalText)) {
         // The agent's ask sits at the END of the turn; for a long turn (a heavy
         // gstack skill) keep the TAIL, not the head, so the drawer shows the
         // actual question/decision briefs instead of the intro.
+        // A question does NOT advance the pipeline: answering resumes THIS step's
+        // session, so the step the operator was asked about is the step that
+        // finishes. See answer().
         const shown = finalText.length > EVENT_TEXT_MAX ? "…" + finalText.slice(-(EVENT_TEXT_MAX - 1)) : finalText;
         patch({ status: "waiting", pendingQuestion: shown });
         log("question", shown);
         notify(store.getTask(task.id)!, "waiting");
-      } else {
-        setPhase("done");
+      } else if (stepOutcome(finalText) === "blocked" && store.getTask(task.id)?.pipeline) {
+        // The step ran and said it could not proceed. Advancing would send /review,
+        // /qa and /ship after work that just declared itself blocked — the one
+        // outcome the pipeline exists to prevent. Not a retry either: a blocked
+        // step reports a reason, and reasons do not resolve themselves.
+        const why = blockedReason(finalText);
+        log("log", `step ${store.getTask(task.id)!.step + 1} reported STEP BLOCKED: ${why}`);
+        stepRetries.delete(task.id);
+      patch({ status: "error", error: `step ${store.getTask(task.id)!.step + 1} blocked: ${why}` });
+        notify(store.getTask(task.id)!, "error");
+      } else if (!advancePipeline()) {
+        setPhase("done", true);
         patch({ status: "done" });
         notify(store.getTask(task.id)!, "done");
       }
@@ -638,12 +826,103 @@ function attach(task: Task, child: ChildProcess) {
   }
 }
 
+/** What varies between the three ways an agent turn starts. */
+export interface LaunchSpec {
+  /** Session to resume. Omitted/null for a fresh turn-1 launch. */
+  resume?: string | null;
+  /** The turn's instruction — always the FINAL positional argument. */
+  prompt: string;
+}
+
+/**
+ * The complete argv for one `claude` launch.
+ *
+ * PURE + exported, and that is the whole point: the command line used to be
+ * assembled inline at three call sites and asserted by nothing. A flag missing
+ * from all three at once is exactly how the gstack skill mapping stayed dead for
+ * eight releases — there was no value anywhere that a test could look at.
+ *
+ * `--resume <sid>` must precede baseArgs(), and the prompt must stay last: it is
+ * a positional, so anything appended after it would be read as another one.
+ */
+export function argvFor(spec: LaunchSpec): string[] {
+  const resume = spec.resume ? ["--resume", spec.resume] : [];
+  return [...resume, ...baseArgs(), spec.prompt];
+}
+
+/**
+ * The single place a `claude` child is created.
+ *
+ * One helper so the spawn options and the debug line cannot drift between call
+ * sites. The argv goes to OUR stderr (journald), not the events table: it is one
+ * line per turn rather than per tool call, and it never competes with the agent's
+ * own events for the 200-row cap the drawer reads. Redacted regardless — argv can
+ * carry operator-supplied flags, and a daemon log is not a place to leak a token.
+ */
+function spawnAgent(task: Task, argv: string[]): void {
+  // FLAGS ONLY. The final positional is the raw task prompt, or the operator's
+  // typed reply — and scrubSecrets is a known-value scrubber, not a secret
+  // detector: it removes our two tokens and `?token=`-shaped query strings, and
+  // would sail straight past an `sk-…` pasted into the reply drawer. journald
+  // typically outlives the DB and is not 0600, so the prompt does not go there.
+  const flags = scrubSecrets(argv.slice(0, -1).join(" "), [config.dashboardToken, config.hookToken]);
+  console.error(`[agent ${task.id}] ${config.claudeBin} ${flags} <prompt ${argv.at(-1)?.length ?? 0}b>`);
+  const child = spawn(config.claudeBin, argv, currentSpawnOpts(task.worktree));
+  attach(task, child);
+}
+
+// Per-step retry budget for pipeline tasks. Reset when a step succeeds, so the
+// bound is per step rather than per task.
+const MAX_STEP_RETRIES = 2;
+const stepRetries = new Map<string, number>();
+
+/**
+ * Run one pipeline step in a FRESH session.
+ *
+ * Fresh, not `--resume`, and that is the load-bearing choice. Resuming would
+ * accumulate seven heavy skills' worth of transcript into one context, which
+ * compacts — and a compacted agent that loses the thread simply ends its turn,
+ * which this daemon reads as success. Each step instead starts clean and picks up
+ * where the last one left off through gstack's on-disk artifacts (the spec file,
+ * `*-reviews.jsonl`, the test plan). That handoff is the design's central bet and
+ * the one thing only a real run can validate.
+ *
+ * `task.sessionId` therefore holds the CURRENT step's session, which is what the
+ * A2 restart loop resumes and what an operator's answer continues.
+ */
+function runStep(task: Task, index: number): void {
+  const steps = loadSteps();
+  const step = steps[index];
+  if (!step) {
+    // The stored step index is past the end of the table — an operator shrank
+    // pipeline-steps.md under a task already in flight. Returning silently here
+    // parked the task in `running` with no child, no error and nothing to see.
+    store.patchTask(task.id, { status: "error", error: `step ${index + 1} is past the end of the ${steps.length}-step table — the step table changed under a running task`, lastActivity: Date.now() });
+    emitUpdate(task.id);
+    return;
+  }
+  // Log the phase only when it actually CHANGES. Steps 6 and 7 are both `ship`, and
+  // a retry re-runs the same step, so an unconditional write filled the drawer with
+  // duplicate rows that read as progress.
+  const prev = store.getTask(task.id)?.phase;
+  store.patchTask(task.id, { status: "running", phase: step.phase, lastActivity: Date.now() });
+  if (prev !== step.phase) store.addEvent({ taskId: task.id, ts: Date.now(), kind: "phase", data: step.phase });
+  emitUpdate(task.id);
+  // scheduleAfterExit, not schedule: the turn that just ended may still have a
+  // live child for a few milliseconds, and two `claude` processes in one worktree
+  // would edit the same files at once.
+  // A fresh fence per turn: a task prompt cannot close a delimiter it cannot guess.
+  const fence = `<<<TASK-${randomUUID().slice(0, 8)}>>>`;
+  scheduleAfterExit(task.id, () =>
+    spawnAgent(task, argvFor({ prompt: stepPrompt(step, task.prompt, fence) })));
+}
+
 /** Launch a fresh agent for a task (turn 1). */
 export function launchTask(task: Task): void {
-  schedule(task.id, () => {
-    const child = spawn(config.claudeBin, [...baseArgs(), task.prompt], currentSpawnOpts(task.worktree));
-    attach(task, child);
-  });
+  // A pipeline task starts at step 0 under the daemon's control; a free-form task
+  // gets its prompt verbatim, exactly as before.
+  if (task.pipeline) { runStep(task, task.step); return; }
+  schedule(task.id, () => spawnAgent(task, argvFor({ prompt: task.prompt })));
 }
 
 /** Human answer to a waiting agent — the proven prose+resume mechanic. */
@@ -653,11 +932,15 @@ export function answer(taskId: string, text: string): void {
   store.patchTask(taskId, { status: "running", pendingQuestion: null, lastActivity: Date.now() });
   emitUpdate(taskId);
   // Waits for the outgoing agent to exit first — never two `claude --resume` on one session.
-  scheduleAfterExit(taskId, () => {
-    const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), text], currentSpawnOpts(t.worktree));
-    attach(t, child);
-  });
+  scheduleAfterExit(taskId, () => spawnAgent(t, argvFor({ resume: t.sessionId, prompt: text })));
 }
+
+/** What a task is told after a daemon restart interrupted it mid-turn. Named
+ *  rather than inline so a test can assert the A2 path without duplicating the
+ *  string. NOTE: a pipeline task gets this same nudge today — resumeTask does not
+ *  re-issue the step it was on. Re-issuing stepPrompt() there is an open follow-up,
+ *  not something this constant already does. */
+export const RESUME_PROMPT = "continue where you left off";
 
 /** A2 durability: after a daemon restart, resume any task that was mid-run. */
 export function resumeTask(taskId: string): void {
@@ -665,10 +948,7 @@ export function resumeTask(taskId: string): void {
   if (!t?.sessionId) return;
   store.patchTask(taskId, { status: "resuming", lastActivity: Date.now() });
   emitUpdate(taskId);
-  scheduleAfterExit(taskId, () => {
-    const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), "continue where you left off"], currentSpawnOpts(t.worktree));
-    attach(t, child);
-  });
+  scheduleAfterExit(taskId, () => spawnAgent(t, argvFor({ resume: t.sessionId, prompt: RESUME_PROMPT })));
 }
 
 export function stopTask(taskId: string): void {
@@ -677,11 +957,15 @@ export function stopTask(taskId: string): void {
   // Not killExisting(): leaving a LIVE child in `running` lets its exit handler run
   // normally, see status "stopped", skip the error patch, and pump() the queue.
   bumpGen(taskId);  // a replacement still waiting on a dying child must not fire
+  stepRetries.delete(taskId);
   const cancelled = cancelQueued(taskId);
   running.get(taskId)?.kill("SIGTERM");
   store.patchTask(taskId, { status: "stopped", lastActivity: Date.now() });
   emitUpdate(taskId);
   if (cancelled) pump();
 }
+
+/** Drop per-task in-memory state when the task itself goes away. */
+export function forgetTask(taskId: string): void { stepRetries.delete(taskId); }
 
 export function isRunning(taskId: string): boolean { return running.has(taskId); }

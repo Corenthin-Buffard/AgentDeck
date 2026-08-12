@@ -1,6 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { Database } from "bun:sqlite";
-import { migrateTasks as migrate, parsePlanReviewsCol } from "../src/db.ts";
+import { migrateTasks as migrate, parsePlanReviewsCol, store } from "../src/db.ts";
 import type { PlanReviews } from "../src/types.ts";
 
 // The `project` column migration: `CREATE TABLE IF NOT EXISTS` won't add a column
@@ -136,5 +136,122 @@ describe("plan_reviews serialize ↔ parse round-trip", () => {
     // A partial object (only eng stored) fills the missing keys with null.
     expect(parsePlanReviewsCol(JSON.stringify({ eng: { status: "clean", stale: false } })))
       .toEqual({ ceo: null, design: null, eng: { status: "clean", stale: false } });
+  });
+});
+
+// ── pipeline columns ────────────────────────────────────────────────────────
+// Unlike `project` and `plan_reviews`, these BACKFILL rather than coalescing at
+// read time. `pipeline` records a choice made when the task was created: a task
+// already in flight must not change what it is doing because the operator edited
+// AGENTDECK_PIPELINE and restarted the daemon.
+
+// The real v0.2.4.1 schema — what an upgrading user's DB actually looks like.
+const SCHEMA_V0241 = `
+  CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, project TEXT, title TEXT NOT NULL, prompt TEXT NOT NULL,
+    branch TEXT NOT NULL, worktree TEXT NOT NULL, tmux TEXT, session_id TEXT,
+    status TEXT NOT NULL, phase TEXT NOT NULL, pending_question TEXT,
+    last_activity INTEGER NOT NULL, created_at INTEGER NOT NULL, error TEXT,
+    plan_reviews TEXT
+  );`;
+
+// One list, so a column cannot be added to the migration without the test noticing.
+const PIPELINE_COLS = ["pipeline", "step", "step_skill_seen", "pipeline_missed"];
+
+describe("pipeline column migration (REGRESSION: live v0.2.4.1 schema)", () => {
+  const seed = (db: Database) =>
+    db.exec(`INSERT INTO tasks (id,project,title,prompt,branch,worktree,status,phase,last_activity,created_at)
+             VALUES ('t_old','web','legacy','do x','agentdeck/x','/wt','running','run',1,1)`);
+
+  test("adds every pipeline column and BACKFILLS legacy rows to free-form", () => {
+    const db = new Database(":memory:");
+    db.exec(SCHEMA_V0241);
+    seed(db);
+    expect(cols(db)).not.toContain("pipeline");
+
+    migrate(db);
+
+    for (const c of PIPELINE_COLS) expect(cols(db)).toContain(c);
+    // Backfilled, NOT left NULL: every pre-existing row predates the feature, so
+    // it is free-form. A NULL here would later read as "whatever the config says".
+    const row = db.query(`SELECT ${PIPELINE_COLS.join(",")} FROM tasks WHERE id='t_old'`)
+      .get() as Record<string, number>;
+    for (const c of PIPELINE_COLS) expect(row[c]).toBe(0);
+    db.close();
+  });
+
+  test("a running pipeline task keeps its stored choice across a migration re-run", () => {
+    const db = new Database(":memory:");
+    db.exec(SCHEMA_V0241);
+    migrate(db);
+    db.exec(`INSERT INTO tasks (id,project,title,prompt,branch,worktree,status,phase,last_activity,created_at,pipeline,step,step_skill_seen)
+             VALUES ('t_pipe','web','p','do y','agentdeck/y','/wt2','running','review',2,2,1,3,1)`);
+    migrate(db); // idempotent: must not reset an in-flight task to free-form
+    const row = db.query("SELECT pipeline, step, step_skill_seen FROM tasks WHERE id='t_pipe'")
+      .get() as { pipeline: number; step: number; step_skill_seen: number };
+    expect(row.pipeline).toBe(1);
+    expect(row.step).toBe(3);
+    expect(row.step_skill_seen).toBe(1);
+    db.close();
+  });
+
+  test("migrates a v0.1.x DB (no project, no plan_reviews, no pipeline) in one pass", () => {
+    const db = new Database(":memory:");
+    db.exec(OLD_SCHEMA);
+    migrate(db);
+    for (const c of ["project", "plan_reviews", ...PIPELINE_COLS]) {
+      expect(cols(db)).toContain(c);
+    }
+    db.close();
+  });
+});
+
+// ── the pipeline setters, against the REAL store ────────────────────────────
+// setStep/markStepSkillSeen/bumpPipelineMissed had no tests at all, and the
+// invariant they encode is load-bearing: step_skill_seen is a property OF the
+// current step, so an advance that failed to clear it would credit the new step
+// with the previous one's skill and pipelineMissed would never fire.
+describe("pipeline store setters", () => {
+  const mk = (id: string) => ({
+    id, project: "default", title: "x", prompt: "x", branch: `b/${id}`, worktree: "/w",
+    tmux: null, sessionId: null, status: "running", phase: "plan", pendingQuestion: null,
+    lastActivity: 1, createdAt: 1, error: null,
+    planReviews: { ceo: null, design: null, eng: null },
+    pipeline: true, step: 0, stepSkillSeen: false, pipelineMissed: 0,
+  }) as any;
+
+  test("advancing a step CLEARS the previous step's skill observation", () => {
+    const t = mk("t_setters_1");
+    store.insertTask(t);
+    try {
+      store.markStepSkillSeen(t.id);
+      expect(store.getTask(t.id)!.stepSkillSeen).toBe(true);
+      store.setStep(t.id, 1);
+      const after = store.getTask(t.id)!;
+      expect(after.step).toBe(1);
+      expect(after.stepSkillSeen).toBe(false); // else step 1 inherits step 0's credit
+    } finally { store.deleteTask(t.id); }
+  });
+
+  test("bumpPipelineMissed accumulates in SQL rather than clobbering", () => {
+    const t = mk("t_setters_2");
+    store.insertTask(t);
+    try {
+      store.bumpPipelineMissed(t.id);
+      store.bumpPipelineMissed(t.id);
+      expect(store.getTask(t.id)!.pipelineMissed).toBe(2);
+    } finally { store.deleteTask(t.id); }
+  });
+
+  test("a task round-trips its pipeline fields through insert and read", () => {
+    const t = mk("t_setters_3");
+    t.pipeline = false; t.step = 4; t.pipelineMissed = 3;
+    store.insertTask(t);
+    try {
+      const back = store.getTask(t.id)!;
+      expect(back.pipeline).toBe(false);
+      expect(back.step).toBe(4);
+      expect(back.pipelineMissed).toBe(3);
+    } finally { store.deleteTask(t.id); }
   });
 });

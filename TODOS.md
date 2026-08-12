@@ -17,6 +17,24 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **Session ids don't survive a change of `HOME`** — **Priority: P3**
   Claude Code stores transcripts under `$HOME/.claude/projects/<encoded-cwd>`. The DB persists a `sessionId` as if it were portable; it isn't. Move the daemon to another account (or move the worktrees), and every stored `sessionId` becomes unresolvable — `claude --resume` finds nothing, and A2 durability loses those tasks **silently**, because the daemon can't even attribute the failure. Observed 2026-08-12: `/root/.claude/projects/-root--agentdeck-worktrees-t-703ad468` was orphaned by the migration to a service account. The README's migration section works around it by requiring a drain first. Open question: should the daemon detect an unresolvable `sessionId` and say so, instead of failing without explanation?
 
+- **Per-task WebSocket deltas** — **Priority: P4**
+  `broadcast()` (`src/server.ts`) serialises EVERY task on every update: a `SELECT *`, a
+  `JSON.parse` per row, a `JSON.stringify` of the whole board, then a send to each open browser. So
+  board cost scales with the number of tasks on screen — the same wall the DT3 density item runs
+  into at 20-40 agents. The v0.2.5 work fixed the *frequency* (liveness coalescing, one write per
+  250ms per task) because that was the amplification the pipeline introduced; deltas are the
+  structural answer for board *size*. Send the changed task rather than the whole board. Depends on
+  the coalescing landing first, so the two effects can be measured apart. (Eng review, 2026-08-12.)
+
+- **Merge-time versioning** — **Priority: P3**
+  The pipeline's `/ship` step deliberately tells the agent NOT to bump `VERSION` or edit
+  `CHANGELOG.md`: agents work in sibling worktrees, so the collision is a *merge* conflict when the
+  second PR lands, and no lock on ship-entry can prevent it. That removes the conflict but hands the
+  bump to a human on every PR — invisible debt that compounds as agent count rises. `src/cleanup.ts`
+  (v0.2.2.0) already proves a merged PR via `gh` with a head-SHA match, so the detection half exists;
+  what is missing is the bump itself and a rule for several PRs landing together. Depends on the
+  step-6 wording shipping. (Eng review, 2026-08-12.)
+
 - **Queued tasks display as `running`** — **Priority: P3**
   `src/tasks.ts:24` sets `status: "running"` at creation, before any process exists. A task waiting behind `AGENTDECK_MAX_AGENTS` therefore shows on the board as live with no agent attached, so the running pill overstates what is actually executing. v0.2.4.1 fixed the *behavioural* half of this (a queued task can now be cancelled, and answering one no longer double-spawns), but not the display. Wants a real `queued` status through `Status`, the DB, the board sections and the pills. (Eng review, 2026-08-12.)
 
@@ -63,7 +81,7 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Completed
 
-- **v0.2.4.2** (2026-08-12) — **The install runbook stopped producing root installs**, which also closed the P2 above ("run agents as an unprivileged uid instead of relying on `IS_SANDBOX`") — *differently than planned*. The plan was to keep a root daemon and drop privileges per spawned agent; the answer was to not run the daemon as root at all. Measured on the way there, so nobody re-derives it: Bun's `node:child_process` **silently ignores** the `uid`/`gid` spawn options (asked for 65534, ran as 0, no error); `setpriv` does work, and a `feat/agent-user` branch implementing the drop was written and abandoned because it kept a root daemon and duplicated credentials, skills and permissions across two identities to solve what one unprivileged identity removes. Verified end to end: agent at uid 999, `--dangerously-skip-permissions` accepted, gstack resolving. New `scripts/setup-agent-user.sh` (+ `--check`, + a CI job that runs it for real), a runbook that branches on `uname -s` then `id -u`, and a migration section gated on a drain. `AGENTDECK_ALLOW_ROOT` survives unchanged as a last resort. Surfaced a P3: `sessionId`s don't survive a change of `HOME`.
+- **v0.2.5.1** (2026-08-12) — **The install runbook stopped producing root installs**, which also closed the P2 above ("run agents as an unprivileged uid instead of relying on `IS_SANDBOX`") — *differently than planned*. The plan was to keep a root daemon and drop privileges per spawned agent; the answer was to not run the daemon as root at all. Measured on the way there, so nobody re-derives it: Bun's `node:child_process` **silently ignores** the `uid`/`gid` spawn options (asked for 65534, ran as 0, no error); `setpriv` does work, and a `feat/agent-user` branch implementing the drop was written and abandoned because it kept a root daemon and duplicated credentials, skills and permissions across two identities to solve what one unprivileged identity removes. Verified end to end: agent at uid 999, `--dangerously-skip-permissions` accepted, gstack resolving. New `scripts/setup-agent-user.sh` (+ `--check`, + a CI job that runs it for real), a runbook that branches on `uname -s` then `id -u`, and a migration section gated on a drain. `AGENTDECK_ALLOW_ROOT` survives unchanged as a last resort. Surfaced a P3: `sessionId`s don't survive a change of `HOME`.
 
 - **v0.2.4.0** (2026-08-04) — **The reply drawer offers the agent's options.** A gstack decision brief reaches the dashboard as prose (headless Claude Code has no AskUserQuestion tool, so gstack renders briefs as text), and the operator had to read a wall of it and retype a letter. `parseDecisionBrief` in `src/detect.ts` now extracts the labeled options next to the existing detector, reusing its `BRIEF_MARKER` guard; the server attaches the result as a derived, never-persisted `brief` field. Clicking an option only PRE-FILLS the reply box — the brief stays on screen and nothing is sent until Send, because this parses prose and a mis-parse must be visible and free rather than dispatched to an agent running with skipped permissions. Refuses anything that isn't confidently a brief: no `Net:`/`Completeness:`/`D—` marker, fewer than two options, or a gap in the letters. 11 parser tests + 4 payload tests (107 total).
 

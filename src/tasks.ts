@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { store } from "./db.ts";
 import { config, projectById } from "./config.ts";
 import { createWorktree, cleanupWorktree, type CleanupResult, type CleanupMode } from "./git.ts";
-import { launchTask, killExisting } from "./agent.ts";
+import { launchTask, killExisting, forgetTask } from "./agent.ts";
 import { emitUpdate } from "./bus.ts";
 import type { Task } from "./types.ts";
 
@@ -11,8 +11,16 @@ function slugify(s: string): string {
 }
 
 /** 1 task = 1 branch = 1 worktree = 1 agent. taskId is the correlation key.
- *  `projectId` picks the repo; omitted/unknown falls back to the first project. */
-export async function createTask(title: string, prompt: string, projectId?: string): Promise<Task> {
+ *  `projectId` picks the repo; omitted/unknown falls back to the first project.
+ *  `pipeline` decides whether the daemon drives this task through the gstack step
+ *  table or leaves it free-form; it is STORED on the task, so a later change to
+ *  AGENTDECK_PIPELINE never alters a task already running. */
+export async function createTask(
+  title: string,
+  prompt: string,
+  projectId?: string,
+  pipeline: boolean = config.pipelineDefault,
+): Promise<Task> {
   const project = projectById(projectId) ?? config.projects[0];
   if (!project) throw new Error("no project configured — add one to projects.json");
   const id = "t_" + randomUUID().slice(0, 8);
@@ -24,6 +32,7 @@ export async function createTask(title: string, prompt: string, projectId?: stri
     status: "running", phase: "unknown", pendingQuestion: null,
     lastActivity: now, createdAt: now, error: null,
     planReviews: { ceo: null, design: null, eng: null },
+    pipeline, step: 0, stepSkillSeen: false, pipelineMissed: 0,
   };
   store.insertTask(task);
   emitUpdate(id);
@@ -46,7 +55,9 @@ export async function removeTask(id: string, mode: CleanupMode = "safe", expecte
   // expectedSha is the merged-mode CAS guard (only delete the branch if it still
   // points where isBranchMerged proved it was merged).
   const res = await cleanupWorktree(t.worktree, t.branch, mode, expectedSha);
-  if (res.removed) { store.deleteTask(id); }
+  // Drop the in-memory retry budget with the row. taskIds are never reused, so a
+  // surviving entry would leak for the daemon's lifetime.
+  if (res.removed) { store.deleteTask(id); forgetTask(id); }
   emitUpdate(id);
   return res;
 }

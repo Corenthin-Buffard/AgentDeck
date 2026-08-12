@@ -730,3 +730,57 @@ describe("src/main.ts entry", () => {
     }
   });
 }, 30000);
+
+// ── pipeline flag coercion ──────────────────────────────────────────────────
+// POST /api/tasks accepts an optional `pipeline`. Tested through the exported
+// helper rather than the endpoint: reaching createTask would build a real git
+// worktree and spawn a real `claude`, which is not a unit test.
+describe("pipelineFlag", () => {
+  test("passes a real boolean through", async () => {
+    const { pipelineFlag } = await import("../src/server.ts");
+    expect(pipelineFlag(true)).toBe(true);
+    expect(pipelineFlag(false)).toBe(false);
+  });
+
+  test("absent means 'not specified' — createTask falls back to the config default", async () => {
+    const { pipelineFlag } = await import("../src/server.ts");
+    expect(pipelineFlag(undefined)).toBeUndefined();
+    expect(pipelineFlag(null)).toBeUndefined();
+  });
+
+  test("the STRING \"false\" must not turn the pipeline on", async () => {
+    const { pipelineFlag } = await import("../src/server.ts");
+    // The failure this guards: "false" is truthy, so a looser check would enable
+    // the pipeline for a task the operator explicitly opted out of — and that task
+    // would go on to push a branch and open a PR.
+    expect(pipelineFlag("false")).toBeUndefined();
+    expect(pipelineFlag("true")).toBeUndefined();
+    expect(pipelineFlag("")).toBeUndefined();
+  });
+
+  test("numbers and objects are ignored rather than coerced", async () => {
+    const { pipelineFlag } = await import("../src/server.ts");
+    expect(pipelineFlag(1)).toBeUndefined();
+    expect(pipelineFlag(0)).toBeUndefined();
+    expect(pipelineFlag({})).toBeUndefined();
+    expect(pipelineFlag([])).toBeUndefined();
+  });
+});
+
+// The served HTML carries the pipeline default in a meta tag. If the placeholder
+// is ever renamed or dropped, the raw `__AD_PIPELINE_DEFAULT__` ships and the
+// client's `=== "true"` read silently forces the New-task checkbox OFF on a daemon
+// configured ON — a fail-quiet with no error anywhere.
+describe("dashboard pipeline-default injection", () => {
+  test("the placeholder is substituted, and matches config", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const srv = startServer();
+    try {
+      const res = await fetch(`http://127.0.0.1:${srv.port}/`, { headers: { host: "127.0.0.1" } });
+      const html = await res.text();
+      expect(html).not.toContain("__AD_PIPELINE_DEFAULT__");
+      expect(html).toContain(`content="${config.pipelineDefault ? "true" : "false"}"`);
+    } finally { srv.stop(true); }
+  });
+});

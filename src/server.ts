@@ -16,6 +16,7 @@ import { notices, noticesTruncated, setNoticeListener } from "./notices.ts";
 import { answer, stopTask } from "./agent.ts";
 import { createTask, removeTask, findBySession } from "./tasks.ts";
 import { parseDecisionBrief } from "./detect.ts";
+import { stepSummary } from "./pipeline.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
 
@@ -130,6 +131,21 @@ export function isLoopbackBind(host: string): boolean {
 }
 
 /**
+ * Read the request body's `pipeline` field, or `undefined` for "not specified"
+ * (which lets createTask fall through to config.pipelineDefault).
+ *
+ * ONLY a real boolean counts. A stale client sending the STRING "false" would be
+ * truthy under any looser check, silently turning the pipeline ON for a task the
+ * operator asked to keep free-form — and that task would then go and open a PR.
+ * Erring toward the configured default is always recoverable; guessing `true`
+ * from a string is not. PURE + exported so the coercion is testable without
+ * creating a worktree and spawning a real agent.
+ */
+export function pipelineFlag(v: unknown): boolean | undefined {
+  return typeof v === "boolean" ? v : undefined;
+}
+
+/**
  * Tasks as the dashboard sees them: the stored row, plus the decision brief
  * parsed out of a waiting agent's question so the reply drawer can offer the
  * options as buttons instead of making you retype a letter off a wall of prose.
@@ -207,7 +223,20 @@ export function startServer() {
   // so its write fetches can carry the x-agentdeck-token header. Computed once —
   // fixed for the process. Function replacement so a `$` in a custom token isn't
   // read as a $-pattern.
-  const dashboardHtml = indexHtml.replace("__AD_TOKEN__", () => escAttr(config.dashboardToken));
+  // The pipeline default rides along in the same meta-tag mechanism. It belongs
+  // here rather than on /api/projects (it is not a property of a project) and not
+  // on /api/health (that answers "is this daemon working", not "how is it set up").
+  // The New-task checkbox needs it before the first render, so a served constant
+  // beats another round trip.
+  // The resolved step table rides along too. It was briefly written as a per-task
+  // EVENT, which was dead on arrival: recentEvents returns the newest 200 rows and
+  // a single gstack skill writes hundreds of `tool` rows, so the one row the drawer
+  // looked for was evicted before step 1 finished. The table is daemon-wide (the
+  // override file is), so it belongs here, resolved once, like the token.
+  const dashboardHtml = indexHtml
+    .replace("__AD_TOKEN__", () => escAttr(config.dashboardToken))
+    .replace("__AD_PIPELINE_DEFAULT__", () => (config.pipelineDefault ? "true" : "false"))
+    .replace("__AD_PIPELINE_STEPS__", () => escAttr(stepSummary().join(" | ")));
   // From here on, a notice raised at RUNTIME (agent.ts retracting the root-bypass
   // claim) reaches every open dashboard immediately instead of waiting for the next
   // reconnect. Registered before serve() so nothing raised during startup is lost.
@@ -341,8 +370,9 @@ export function startServer() {
         if (b.projectId != null && b.projectId !== "" && !projectById(String(b.projectId))) {
           return json({ error: "unknown project" }, 400);
         }
+        const pipeline = pipelineFlag(b.pipeline);
         try {
-          const t = await createTask(String(b.title), String(b.prompt), b.projectId ? String(b.projectId) : undefined);
+          const t = await createTask(String(b.title), String(b.prompt), b.projectId ? String(b.projectId) : undefined, pipeline);
           return json({ task: t });
         } catch (e: any) {
           return json({ error: `could not create task: ${e.message}` }, 500);

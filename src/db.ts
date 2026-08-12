@@ -39,7 +39,11 @@ db.exec(`
     last_activity INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     error TEXT,
-    plan_reviews TEXT
+    plan_reviews TEXT,
+    pipeline INTEGER NOT NULL DEFAULT 0,
+    step INTEGER NOT NULL DEFAULT 0,
+    step_skill_seen INTEGER NOT NULL DEFAULT 0,
+    pipeline_missed INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +75,26 @@ export function migrateTasks(database: Database) {
   const has = (name: string) => cols.some((c) => c.name === name);
   if (!has("project")) database.exec("ALTER TABLE tasks ADD COLUMN project TEXT");
   if (!has("plan_reviews")) database.exec("ALTER TABLE tasks ADD COLUMN plan_reviews TEXT");
+  // These four BACKFILL, unlike the two above, and the difference is deliberate.
+  // `project` and `plan_reviews` coalesce at read time so they track the live
+  // registry. `pipeline` must NOT: it records a choice made when the task was
+  // created, and a task already in flight cannot change what it is doing because
+  // the operator edited AGENTDECK_PIPELINE and restarted. Every pre-existing row
+  // predates the feature, so it is free-form.
+  //
+  // `ALTER TABLE ... NOT NULL DEFAULT 0` performs that backfill atomically — SQLite
+  // writes 0 into every existing row as part of the ALTER. An earlier version of
+  // this code followed each ALTER with `UPDATE ... WHERE col IS NULL`; those were
+  // dead by construction (the column had just been created NOT NULL, inside a guard
+  // that only runs when it was absent) and have been removed.
+  //
+  // ROLLBACK CONTRACT: every column added here MUST carry a non-NULL DEFAULT. The
+  // previous binary's INSERT names only its own columns, and relies on the defaults
+  // to satisfy NOT NULL — so a defaultless column would break downgrade at
+  // task-creation time, which no test in the new binary would ever exercise.
+  for (const col of ["pipeline", "step", "step_skill_seen", "pipeline_missed"]) {
+    if (!has(col)) database.exec(`ALTER TABLE tasks ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
+  }
 }
 migrateTasks(db);
 
@@ -82,17 +106,30 @@ function rowToTask(r: any): Task {
     pendingQuestion: r.pending_question, lastActivity: r.last_activity,
     createdAt: r.created_at, error: r.error,
     planReviews: parsePlanReviewsCol(r.plan_reviews),
+    // `=== 1` not truthiness: the column is an INTEGER and a legacy NULL must read
+    // as false, never as "whatever the config says today".
+    pipeline: r.pipeline === 1,
+    step: typeof r.step === "number" ? r.step : 0,
+    stepSkillSeen: r.step_skill_seen === 1,
+    pipelineMissed: typeof r.pipeline_missed === "number" ? r.pipeline_missed : 0,
   };
 }
 
 export const store = {
   insertTask(t: Task) {
     db.query(`INSERT INTO tasks
-      (id,project,title,prompt,branch,worktree,tmux,session_id,status,phase,pending_question,last_activity,created_at,error,plan_reviews)
-      VALUES ($id,$project,$title,$prompt,$branch,$worktree,$tmux,$sid,$status,$phase,$pq,$la,$ca,$err,$pr)`).run({
+      (id,project,title,prompt,branch,worktree,tmux,session_id,status,phase,pending_question,last_activity,created_at,error,plan_reviews,pipeline,step,step_skill_seen,pipeline_missed)
+      VALUES ($id,$project,$title,$prompt,$branch,$worktree,$tmux,$sid,$status,$phase,$pq,$la,$ca,$err,$pr,$pipe,$step,$seen,$missed)`).run({
       $id: t.id, $project: t.project, $title: t.title, $prompt: t.prompt, $branch: t.branch, $worktree: t.worktree,
       $tmux: t.tmux, $sid: t.sessionId, $status: t.status, $phase: t.phase, $pq: t.pendingQuestion,
       $la: t.lastActivity, $ca: t.createdAt, $err: t.error, $pr: JSON.stringify(t.planReviews),
+      // Booleans are bound as 0/1 explicitly — same reason setPlanReviews exists:
+      // patchTask binds raw, and the column is an INTEGER either way.
+      // `?? 0` mirrors rowToTask's coalescing: the columns carry DEFAULT 0, so a
+      // caller that predates these fields writes a free-form task at step 0 rather
+      // than tripping a NOT NULL constraint.
+      $pipe: t.pipeline ? 1 : 0, $step: t.step ?? 0, $seen: t.stepSkillSeen ? 1 : 0,
+      $missed: t.pipelineMissed ?? 0,
     });
   },
   // Dedicated setter: patchTask binds each value raw, and SQLite can't bind a plain
@@ -101,10 +138,34 @@ export const store = {
   setPlanReviews(id: string, reviews: PlanReviews) {
     db.query("UPDATE tasks SET plan_reviews = ? WHERE id = ?").run(JSON.stringify(reviews), id);
   },
+  /** Advance to a pipeline step, clearing the per-step skill observation. Both
+   *  move together on purpose — `stepSkillSeen` is a property OF the current step,
+   *  so leaving it set across an advance would credit the new step with the old
+   *  one's skill. Dedicated setter for the same reason as setPlanReviews: patchTask
+   *  binds raw and these are INTEGER columns, not booleans. */
+  setStep(id: string, step: number) {
+    db.query("UPDATE tasks SET step = ?, step_skill_seen = 0 WHERE id = ?").run(step, id);
+  },
+  /** Record that the current step invoked the gstack skill it was told to run.
+   *  Set-only: CLEARING lives exclusively in setStep(), because the flag is a
+   *  property OF the current step and must not be reset out of band. */
+  markStepSkillSeen(id: string) {
+    db.query("UPDATE tasks SET step_skill_seen = 1 WHERE id = ?").run(id);
+  },
+  /** A commanded step finished without invoking its skill. Incremented in SQL so
+   *  it cannot lose a count to a read-modify-write race between two turns. */
+  bumpPipelineMissed(id: string) {
+    db.query("UPDATE tasks SET pipeline_missed = pipeline_missed + 1 WHERE id = ?").run(id);
+  },
   patchTask(id: string, patch: Partial<Task>) {
     const map: Record<string, string> = {
       sessionId: "session_id", pendingQuestion: "pending_question",
       lastActivity: "last_activity", createdAt: "created_at",
+      // Present even though the dedicated setters are the intended path: Partial<Task>
+      // type-checks these, so a future caller passing one through patchTask would
+      // otherwise emit `SET stepSkillSeen = ...` and hit a runtime SQLite error with
+      // no compile-time signal.
+      stepSkillSeen: "step_skill_seen", pipelineMissed: "pipeline_missed",
     };
     const cols = Object.keys(patch);
     if (!cols.length) return;

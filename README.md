@@ -11,11 +11,11 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 
 <p align="center"><sub>One agent flips to <code>waiting</code>, you answer in the drawer, and it resumes — live over WebSocket.</sub></p>
 
-> Status: **v0.2.4.2** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
+> Status: **v0.2.5.1** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
 
 ## Why this and not Claude Squad / Conductor / amux
 
-Those orchestrate agents generically. AgentDeck is coupled to the **gstack workflow**: the dashboard shows exactly where each agent is in the `Plan → Run → Review → QA → Ship → Done` pipeline, and the human-in-loop moment is a first-class feature. Narrow on purpose — built for people who already run Claude Code + gstack.
+Those orchestrate agents generically. AgentDeck is coupled to the **gstack workflow**: it *drives* each agent through the `Plan → Run → Review → QA → Ship → Done` pipeline, one turn per step, and the board shows where each one is because the daemon is the thing that put it there. The human-in-loop moment is a first-class feature. Narrow on purpose — built for people who already run Claude Code + gstack.
 
 ## How it works
 
@@ -200,9 +200,58 @@ bun run daemon
 bun run build     # → dist/agentdeck, the same self-contained binary CI ships
 ```
 
-Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json`), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_REVIEW_READ_BIN` (gstack-review-read; resolved from PATH — the `[plan-reviews]` boot notice names it when missing), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_ALLOWED_HOSTS` (comma-separated Hosts accepted besides loopback — needed behind a reverse proxy, see [Upload files to the VPS](#upload-files-to-the-vps)), `AGENTDECK_AUTO_CLEAN_MERGED` (off; `true` periodically drops a done task's worktree, branch and row once its branch is merged), `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret agents use for hooks), `AGENTDECK_DASHBOARD_TOKEN` (per-session secret the browser uses for writes/uploads — injected into the served HTML), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
+Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json`), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_PIPELINE` (off — ticks the gstack-pipeline box by default on new tasks; see [The gstack pipeline](#the-gstack-pipeline)), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_REVIEW_READ_BIN` (gstack-review-read; resolved from PATH — the `[plan-reviews]` boot notice names it when missing), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_ALLOWED_HOSTS` (comma-separated Hosts accepted besides loopback — needed behind a reverse proxy, see [Upload files to the VPS](#upload-files-to-the-vps)), `AGENTDECK_AUTO_CLEAN_MERGED` (off; `true` periodically drops a done task's worktree, branch and row once its branch is merged), `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret agents use for hooks), `AGENTDECK_DASHBOARD_TOKEN` (per-session secret the browser uses for writes/uploads — injected into the served HTML), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
 
 `AGENTDECK_ALLOW_ROOT` exists too, and is deliberately not in that list: it is an escape hatch for a machine where no service account can be created, not a configuration choice — see [Don't run the daemon as root](#dont-run-the-daemon-as-root).
+
+## The gstack pipeline
+
+Tick **Follow the gstack pipeline** on a new task and the daemon runs it as a
+sequence, one `claude -p` turn per step:
+
+| # | phase | step |
+|---|-------|------|
+| 1 | plan | `/spec` — turn the request into an executable spec |
+| 2 | plan | `/autoplan` — CEO, design, eng and DX plan reviews, auto-decided |
+| 3 | run | implement the approved plan |
+| 4 | review | `/review` the diff |
+| 5 | qa | `/qa`, and fix what it finds |
+| 6 | ship | `/ship` — commit, push, open the PR |
+| 7 | ship | `/canary` |
+
+**The daemon drives it; the agent is not merely asked to.** That distinction is the
+whole design. A turn ends when the model stops, and AgentDeck reads a quiet result
+as `done` — so an agent *instructed* to follow a sequence would be marked complete
+the moment it finished step 1 and wrote a summary. Because the daemon issues each
+step, `phase` is something it knows rather than infers.
+
+Each step runs in a **fresh session**. Seven heavy skills in one context would
+compact, and a compacted agent that loses the thread just ends its turn. Steps hand
+off through gstack's own artifacts instead — the spec file, `*-reviews.jsonl`, the
+test plan.
+
+A question **does not** advance the step: answering resumes that step's session, so
+the step you were asked about is the one that finishes. A turn that *fails* (API
+error, abort) retries, bounded per step. A step that *runs* and reports it cannot
+proceed stops the task — it will not go better the second time.
+
+**`/ship` is told not to bump `VERSION` or edit `CHANGELOG.md`.** Every agent works
+in its own worktree, so there is no concurrent write; the collision is a *merge*
+conflict when the second PR lands, which no amount of scheduling prevents. Removing
+the per-task bump removes the conflict — you bump once, at merge.
+
+Leave the box unticked for a free-form task: the agent gets your instructions
+verbatim and the phase bar is inferred from activity, exactly as before. The board
+distinguishes the three cases — driven, free-form (muted, dashed), and *commanded
+but nothing happened* (amber, "pipeline did not run"), which is what you see if a
+step finishes without invoking the skill it was told to.
+
+Off by default while it earns its baseline: set `AGENTDECK_PIPELINE=true` to tick
+the box by default. Override the step table by dropping a `pipeline-steps.md` in the
+data dir — one step per paragraph, `<phase> [/skill]` on the first line, the
+instruction beneath. It is read lazily and every problem degrades to the built-in
+table with a notice on the dashboard, including one that names a skill the board
+cannot track.
 
 ## Launch requirement
 
