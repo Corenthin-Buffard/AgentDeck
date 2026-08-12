@@ -27,9 +27,39 @@ jobs:
       - name: Build binaries (cross-compiled from one runner)
         run: |
           mkdir -p dist
-          bun build src/daemon.ts --compile --target=bun-linux-x64    --outfile dist/agentdeck-linux-x64
-          bun build src/daemon.ts --compile --target=bun-linux-arm64  --outfile dist/agentdeck-linux-arm64
-          bun build src/daemon.ts --compile --target=bun-darwin-arm64 --outfile dist/agentdeck-darwin-arm64
+          bun build src/main.ts   --compile --target=bun-linux-x64    --outfile dist/agentdeck-linux-x64
+          bun build src/main.ts   --compile --target=bun-linux-arm64  --outfile dist/agentdeck-linux-arm64
+          bun build src/main.ts   --compile --target=bun-darwin-arm64 --outfile dist/agentdeck-darwin-arm64
+      # Prove the artifact we are about to publish is the right one. Nothing here
+      # ran the binary before, so when the build entry point moved to src/main.ts
+      # this workflow kept compiling the old one: CI stayed green while every
+      # released binary silently lacked --version. Asserting the version the
+      # binary REPORTS equals the VERSION file ties the tag, the file and the
+      # shipped artifact together.
+      - name: Smoke-test the artifact before publishing
+        timeout-minutes: 5
+        run: |
+          chmod +x dist/agentdeck-linux-x64
+          # `timeout` is load-bearing: if the entry point ever regresses to the
+          # daemon again, `--version` BOOTS instead of printing, never closes
+          # stdout, and the command substitution below would hang the job for its
+          # full default timeout instead of failing fast.
+          BIN_VERSION="$(timeout 20 ./dist/agentdeck-linux-x64 --version)" \
+            || { echo "binary did not answer --version (did the entry point regress to the daemon?)"; exit 1; }
+          test "$BIN_VERSION" = "$(cat VERSION)" \
+            || { echo "binary reports '$BIN_VERSION' but VERSION says '$(cat VERSION)'"; exit 1; }
+          # Printing a version proves entry-point identity and nothing else. Boot it
+          # so a broken dashboard embed or a config that throws at import cannot be
+          # published. Only linux-x64 runs natively here; arm64/darwin are
+          # cross-compiled and remain unexecuted until someone runs them.
+          mkdir -p /tmp/bin && printf '#!/bin/sh\necho stub-claude\n' > /tmp/bin/claude && chmod +x /tmp/bin/claude
+          PATH=/tmp/bin:$PATH AGENTDECK_PORT=8899 AGENTDECK_TARGET_REPO="$PWD" ./dist/agentdeck-linux-x64 &
+          PID=$!
+          for i in $(seq 1 40); do curl -fsS http://127.0.0.1:8899/api/health >/dev/null 2>&1 && break; sleep 0.25; done
+          curl -fsS http://127.0.0.1:8899/api/health | grep -q '"ok":true' \
+            || { echo "artifact booted unhealthy:"; curl -s http://127.0.0.1:8899/api/health; kill $PID 2>/dev/null; exit 1; }
+          kill $PID 2>/dev/null || true
+          echo "OK: v$BIN_VERSION boots and reports healthy"
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:

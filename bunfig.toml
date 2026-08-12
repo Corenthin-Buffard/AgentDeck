@@ -1,0 +1,5 @@
+# Point the test suite at a throwaway data dir before anything imports src/config.ts.
+# See test/setup.ts — without this, `bun test` reads and writes the operator's live
+# ~/.agentdeck/agentdeck.db.
+[test]
+preload = ["./test/setup.ts"]

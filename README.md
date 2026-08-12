@@ -85,7 +85,8 @@ Install AgentDeck (a self-hosted orchestrator for parallel Claude Code agents) a
 3. CONFIG
 - Ask me for AGENTDECK_TARGET_REPO — the ABSOLUTE path of the git repo the agents will work on. VALIDATE it is a git repo: `git -C "<path>" rev-parse --git-dir` — if not, STOP and ask me again.
 - Optionally ask for notifications: AGENTDECK_SLACK_WEBHOOK, or AGENTDECK_TG_TOKEN + AGENTDECK_TG_CHAT.
-- Write `$HOME/.config/agentdeck/env` in systemd EnvironmentFile format (one KEY=VALUE per line, no quoting/shell expansion; warn me if a value contains spaces, `%` or `#`). Include: AGENTDECK_HOST=127.0.0.1, AGENTDECK_PORT=8787, AGENTDECK_TARGET_REPO=<path>, and any notification vars.
+- CHECK `id -u`. If it is **0**, you are installing as root, and Claude Code refuses `--dangerously-skip-permissions` under uid 0 — every task would fail at spawn. Tell me plainly, and offer the two real options: (a) re-run this install as an unprivileged user (recommended), or (b) set `AGENTDECK_ALLOW_ROOT=true`, which lets agents start but runs them AS ROOT with permissions skipped — the blast radius becomes the whole box, not one worktree. Do not pick for me. If I choose (b), include `AGENTDECK_ALLOW_ROOT=true` in the env file below.
+- Write `$HOME/.config/agentdeck/env` in systemd EnvironmentFile format (one KEY=VALUE per line, no quoting/shell expansion; warn me if a value contains spaces, `%` or `#`). Include: AGENTDECK_HOST=127.0.0.1, AGENTDECK_PORT=8787, AGENTDECK_TARGET_REPO=<path>, AGENTDECK_ALLOW_ROOT (only if I chose it above), and any notification vars.
 
 4. PERSISTENCE (systemd --user)
 - First check systemd --user actually works here: `systemctl --user show-environment` (needs a user bus / XDG_RUNTIME_DIR). If it fails (bare VPS SSH session, minimal container) -> SKIP systemd, run AgentDeck in the background with the env file, and tell me plainly that persistence is NOT set up.
@@ -98,14 +99,21 @@ Install AgentDeck (a self-hosted orchestrator for parallel Claude Code agents) a
     EnvironmentFile=%h/.config/agentdeck/env
     Environment=PATH=<paste the CURRENT interactive $PATH here>:%h/.local/bin:%h/.bun/bin
     Restart=on-failure
+    RestartPreventExitStatus=78
     [Install]
     WantedBy=default.target
   CRITICAL: the `Environment=PATH=` line MUST include wherever `claude` and `bun` live, or the daemon starts but CANNOT spawn agents. Bake the current `$PATH` into it, and confirm `command -v claude` resolves within that PATH BEFORE enabling.
+  `RestartPreventExitStatus=78` matters: exit 78 means an unrecoverable config error (currently: the port is already bound). Without it, `Restart=on-failure` retries forever against a port that will still be busy.
 - Run `loginctl enable-linger "$USER"` so the service survives logout/reboot. This may need root — if it fails, warn me that the service won't survive a full logout without it (do not claim it's persistent when it isn't).
 - `systemctl --user daemon-reload && systemctl --user enable --now agentdeck`
-- Verify: `systemctl --user is-active agentdeck` is `active`, AND `curl -s http://127.0.0.1:8787/ | grep -o '<title>[^<]*</title>'` contains "AgentDeck". If port 8787 is already in use, tell me (I can set a different AGENTDECK_PORT).
+- Verify with `GET /api/health`, NOT by grepping the page title. A misconfigured daemon serves a perfectly good dashboard while every task dies — "the page loads" is not evidence that anything works.
+    systemctl --user is-active agentdeck          # must be: active
+    curl -s http://127.0.0.1:8787/api/health      # must report "ok": true
+  If `ok` is `false`, ask the daemon WHY — the diagnostic half is token-gated, because it reports the daemon's uid and the paths it reads:
+    curl -s -H "x-agentdeck-token: $(cat "$HOME/.agentdeck/dashboard-token")" http://127.0.0.1:8787/api/health
+  The `notices` array in that response says exactly what is wrong and what to do about it — read it back to me and STOP. Do NOT report a successful install. If port 8787 is already in use, the service exits 78 with a one-line reason; tell me (I can set a different AGENTDECK_PORT).
 
-5. DONE — summarize: gstack version, agentdeck path, service status, whether `claude` resolves in the service PATH, and the dashboard URL.
+5. DONE — summarize: gstack version, agentdeck path, service status, `/api/health` ok plus any notices, whether the daemon is running as root and under which option, whether `claude` resolves in the service PATH, and the dashboard URL.
 - Dashboard: http://127.0.0.1:8787 (localhost-bound). From my laptop I reach it via `ssh -L 8787:127.0.0.1:8787 user@vps` then http://localhost:8787.
 ```
 
@@ -143,11 +151,22 @@ bun run daemon
 bun run build     # → dist/agentdeck, the same self-contained binary CI ships
 ```
 
-Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json`), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret agents use for hooks), `AGENTDECK_DASHBOARD_TOKEN` (per-session secret the browser uses for writes/uploads — injected into the served HTML), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
+Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json`), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_REVIEW_READ_BIN` (gstack-review-read; resolved from PATH — the `[plan-reviews]` boot notice names it when missing), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_ALLOW_ROOT` (off; `true` lets agents start when the daemon runs as root — see [Launch requirement](#launch-requirement)), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret agents use for hooks), `AGENTDECK_DASHBOARD_TOKEN` (per-session secret the browser uses for writes/uploads — injected into the served HTML), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
 
 ## Launch requirement
 
 For gstack's skills to resolve and run inside a headless agent, agents must be started with **`--dangerously-skip-permissions`** — `--permission-mode acceptEdits` isn't enough. AgentDeck sets this by default. Each agent is confined to its own git worktree on your own box, so the blast radius is that one task's branch; set `AGENTDECK_SKIP_PERMISSIONS=false` only for a supervised, hands-on debugging run.
+
+### Don't run the daemon as root
+
+**Claude Code refuses `--dangerously-skip-permissions` under uid 0.** A daemon running as root therefore fails every task in milliseconds, at spawn. AgentDeck detects this at boot: it logs an error, shows a red banner on the dashboard, reports `ok: false` from `GET /api/health`, and refuses to create new tasks rather than leaving you a trail of dead worktrees.
+
+The fix is to run the daemon as an unprivileged user — `User=` in the systemd unit. That is the supported configuration.
+
+If it genuinely must run as root, `AGENTDECK_ALLOW_ROOT=true` makes agents carry `IS_SANDBOX=1`, which lifts Claude Code's root guard, and tasks run normally with gstack intact. Understand what you are trading:
+
+- **The worktree argument above stops holding.** An agent running as root with permissions skipped can rewrite the systemd unit, read `~/.agentdeck/dashboard-token` and `agent-settings.json` (both `0600`, both readable by root), and touch every registered project. The blast radius is the box, not one branch.
+- **`IS_SANDBOX` is an undocumented Claude Code internal**, not a supported flag, and it does more than lift the root guard. A future release can remove it. AgentDeck watches for that: if a task dies on the root refusal while `AGENTDECK_ALLOW_ROOT` is set, the banner is replaced with an error saying the escape hatch is gone, rather than continuing to claim it works.
 
 ## Multiple projects (one daemon, many repos)
 

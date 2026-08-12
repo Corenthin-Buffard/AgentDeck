@@ -37,7 +37,12 @@ export async function removeTask(id: string, mode: CleanupMode = "safe", expecte
   // commit/force/merged will destroy the worktree — stop any live agent first so we
   // don't orphan the child in the running map (leaking a concurrency slot) or race
   // its writes. safe mode refuses a dirty worktree, so it never reaches removal.
-  if (mode !== "safe") killExisting(id);
+  // Unconditional: safe mode is precisely the mode that SUCCEEDS for a task still
+  // queued (nothing ran, so the worktree is clean). Skipping the cancel there left
+  // a stale closure that later spawned `claude` into a deleted worktree, took a
+  // concurrency slot for a row that no longer exists, and wrote event rows keyed to
+  // a purged task_id that nothing would ever collect.
+  killExisting(id);
   // expectedSha is the merged-mode CAS guard (only delete the branch if it still
   // points where isBranchMerged proved it was merged).
   const res = await cleanupWorktree(t.worktree, t.branch, mode, expectedSha);

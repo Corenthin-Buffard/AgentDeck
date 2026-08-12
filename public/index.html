@@ -62,11 +62,27 @@
   .pill.err{border-color:var(--err);color:var(--err)}
   .dot{width:7px;height:7px;border-radius:50%}
   .dot.ok{background:var(--ok)}.dot.done{background:var(--done)}
+  /* Daemon notices. Amber = degraded, red = broken — the same semantics the task
+     rows and pills already carry, so the colour needs no separate legend. Body
+     text stays --text (never --err/--faint) so both themes clear the 4.5:1 floor
+     on the tinted background; the border carries the meaning. */
+  .notices{display:flex;flex-direction:column;gap:8px;margin-top:16px}
+  /* An author `display` beats the UA's [hidden]{display:none}, so without this
+     the container keeps its top margin and leaves a gap above the board on every
+     healthy install — which is the normal case. */
+  .notices[hidden]{display:none}
+  .notice{display:flex;align-items:flex-start;gap:10px;font-size:13px;line-height:1.45;padding:11px 13px;border-radius:8px;border:1px solid var(--wait);background:var(--wait-bg);color:var(--text)}
+  .notice.error{border-color:var(--err);background:var(--err-bg)}
+  .notice .ico{flex:none;font-family:var(--mono);font-weight:700;color:var(--wait);line-height:1.45}
+  .notice.error .ico{color:var(--err)}
+  .notice .msg{flex:1;min-width:0;overflow-wrap:anywhere}
+  .notice .code{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.3px;color:var(--dim);margin-right:7px}
+  .notice .x{flex:none;margin-left:auto;background:none;border:0;color:var(--dim);cursor:pointer;font-size:18px;line-height:1;padding:2px 6px;border-radius:4px}
   .newbtn{font-family:var(--sans);font-weight:600;font-size:13px;cursor:pointer;padding:6px 13px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent)}
   /* Default IS the primary style — .newbtn is the call to action in every empty
      state. The secondary header button opts out via .ghost. */
   .newbtn.ghost{border-color:var(--line);color:var(--dim)}
-  .newbtn:focus-visible,.projsel select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .newbtn:focus-visible,.projsel select:focus-visible,.notice .x:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .actions{display:flex;gap:8px;align-items:center}
   .ctlbar .actions{margin-left:auto}
   /* project switcher — a compact native select, never a card grid */
@@ -92,6 +108,10 @@
   .chip.error{color:var(--err);background:color-mix(in srgb,var(--err) 20%,transparent)}
   .chip.done,.chip.stopped,.chip.resuming{color:var(--done);background:color-mix(in srgb,var(--done) 16%,transparent)}
   .meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px;font-family:var(--mono);font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+  /* The error excerpt is now a real sentence (the agent's own stderr), not a
+     50-char stub. Let it use the row but never push it wider — the full text is
+     in the title attribute and, unabridged, in the drawer. */
+  .errtxt{flex:1 1 22ch;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   /* An SVG, not a character. This used to be U+2442 (OCR FORK), which almost no
      installed font carries — most Linux boxes rendered a .notdef box on every
      task row, including in the README's demo GIF. */
@@ -169,6 +189,7 @@
     .newbtn{min-height:44px;padding:6px 16px}
     .opt{min-height:44px}
     .projsel{flex:1 1 auto;min-width:0}
+    .notice .x{min-width:44px;min-height:44px}
     .projsel select{min-height:44px;flex:1 1 auto;max-width:none}}
 </style>
 </head>
@@ -202,6 +223,14 @@
       </div>
     </div>
   </header>
+  <!-- Daemon-level notices: running as root, an empty project registry, a host
+       gate that will 403 this browser. These used to exist only in journald,
+       which is the one place someone debugging from a browser is not looking.
+       Fed by the /ws `notices` frame, and by GET /api/health on load so it still
+       appears when the socket handshake is being refused. Hidden when empty.
+       Sits BELOW </header> on purpose: it joins neither header row, so it adds
+       no second margin-left:auto (DESIGN.md, Header). -->
+  <div id="notices" class="notices" hidden></div>
   <div id="board"></div>
 </div>
 
@@ -215,6 +244,11 @@
 
 <script>
 const PHASES=["plan","run","review","qa","ship","done"];
+// Display caps for task.error and event rows. The daemon already caps task.error at
+// 300 chars (STDERR_ERROR_MAX in src/agent.ts), so ERR_CARD sits under that budget
+// and the drawer shows the untruncated value; EV_STDERR is roomier than EV_DEFAULT
+// because a stderr row IS the crash.
+const ERR_CARD_MAX=140, EV_STDERR_MAX=800, EV_DEFAULT_MAX=120;
 // Branch mark. Drawn, not typed: the previous U+2442 character depends on a font
 // that most systems don't ship, so it degraded to an empty box next to every
 // branch name. Inherits currentColor, so it follows .branch in both themes.
@@ -250,6 +284,58 @@ function announceTransitions(next){
 }
 function ago(ts){const s=Math.max(0,Math.round((Date.now()-ts)/1000));if(s<60)return`${s}s ago`;const m=Math.round(s/60);if(m<60)return`${m}m ago`;return`${Math.round(m/60)}h ago`;}
 function esc(s){return (s||"").replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));}
+
+// ── daemon notices ──────────────────────────────────────────────────────────
+// Warnings are dismissible; errors are not. "Every task will fail" is not a
+// thing to let someone hide from themselves.
+let notices=[];
+const NOTICE_KEY="agentdeck.notices.dismissed";
+let noticesAnnounced={};
+function dismissedNotices(){try{const v=JSON.parse(localStorage.getItem(NOTICE_KEY)||"[]");return Array.isArray(v)?v:[];}catch{return [];}}
+// Keyed on code AND message: if the message changes (a different path, a new
+// reason) that is new information and must resurface rather than stay hidden
+// behind a dismissal of the old wording.
+function noticeKey(n){return n.code+"|"+n.message;}
+function dismissNotice(key){
+  const d=dismissedNotices();
+  if(!d.includes(key)){d.push(key);try{localStorage.setItem(NOTICE_KEY,JSON.stringify(d.slice(-40)));}catch{}}
+  renderNotices();
+}
+function renderNotices(){
+  const el=document.getElementById("notices");if(!el)return;
+  const d=dismissedNotices();
+  const shown=notices.filter(n=>n&&n.message&&(n.level==="error"||!d.includes(noticeKey(n))));
+  el.hidden=!shown.length;
+  el.innerHTML=shown.map(n=>{
+    const err=n.level==="error";
+    // The dismiss key travels in a data- attribute, NOT interpolated into the
+    // onclick string: esc() turns ' into &#39;, which the HTML parser decodes
+    // back to a quote before the JS is parsed, breaking out of the literal.
+    // Same reason the reply-drawer options use data-letter.
+    return `<div class="notice${err?" error":""}">`
+      +`<span class="ico" aria-hidden="true">${err?"✕":"⚠"}</span>`
+      +`<span class="msg"><span class="code">${esc(n.code)}</span>${esc(n.message)}</span>`
+      +(err?"":`<button class="x" data-key="${esc(noticeKey(n))}" onclick="dismissNotice(this.dataset.key)" aria-label="Dismiss the ${esc(n.code)} notice" title="Dismiss">×</button>`)
+      +`</div>`;
+  }).join("");
+  // Announce each error once on arrival, not on every re-render (DESIGN.md: an
+  // error the operator must act on is exactly what #live exists for).
+  for(const n of shown){
+    if(n.level!=="error")continue;
+    const k=noticeKey(n);
+    if(noticesAnnounced[k])continue;
+    noticesAnnounced[k]=1;announce(n.message);
+  }
+}
+function setNotices(list){notices=Array.isArray(list)?list:[];renderNotices();}
+// Also fetched on load, so the banner survives a refused /ws handshake — which
+// is exactly the moment you most want to read it.
+async function loadNotices(){
+  // Token-gated half of /api/health: uid + the notice messages. Without the header
+  // we would get liveness only and the banner would stay empty.
+  try{const d=await fetch("/api/health",{headers:authHeaders()}).then(r=>r.json());setNotices(d.notices);}
+  catch{ /* daemon unreachable: the connection indicator already says so */ }
+}
 // One-line preview of a prose question for the agent row: prefer the last line
 // with a "?", strip common markdown, truncate.
 function preview(text,max){max=max||120;const lines=(text||"").split("\n").map(s=>s.trim()).filter(Boolean);let q=lines.slice().reverse().find(l=>l.includes("?"))||lines[lines.length-1]||"";q=q.replace(/[*_`#>]/g,"").trim();return q.length>max?q.slice(0,max-1).trimEnd()+"…":q;}
@@ -302,7 +388,7 @@ function rowHtml(t){
         <span class="chip ${t.status}">${t.status==="waiting"?"Waiting for user":t.status}</span>
         ${currentProject==="all"?`<span class="proj">▸ ${esc(projLabel(t.project))}</span>`:""}</div>
       <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span>
-        <span>${esc(t.id)}</span>${t.error?`<span>${esc(t.error.slice(0,50))}</span>`:""}</div>
+        <span>${esc(t.id)}</span>${t.error?`<span class="errtxt" title="${esc(t.error)}">${esc(t.error.slice(0,ERR_CARD_MAX))}</span>`:""}</div>
       ${t.status==="waiting"&&t.pendingQuestion?`<div class="qprev">${esc(preview(t.pendingQuestion))}</div>`:""}
       ${phaseBar(t)}
     </div>
@@ -506,14 +592,26 @@ async function openTask(id){
   const diff=df.diff||"";
   const DIFF_CAP=4000;
   const diffShown=diff.length>DIFF_CAP?diff.slice(0,DIFF_CAP)+`\n… ${diff.length-DIFF_CAP} more chars truncated (see the worktree)`:diff;
+  // Every interpolation below is esc()'d. It used to be safe to skip phase/status/id
+  // because all three were daemon-generated (fixed enums, a t_+uuid), and TODOS.md
+  // filed it as P4 defence-in-depth on exactly that reasoning. `error` retires it:
+  // it now carries bytes an agent wrote to its own stderr, and that agent runs with
+  // permissions skipped. Escape the lot rather than track which half is trusted.
+  // Slice BEFORE esc, never after — truncating escaped text can cut `&#39;` in half.
+  const evLine=(e)=>{
+    // stderr rows are the crash itself, so give them room; the rest stay terse.
+    const cap=e.kind==="stderr"?EV_STDERR_MAX:EV_DEFAULT_MAX;
+    return `${new Date(e.ts).toLocaleTimeString()} · ${esc(e.kind)} · ${esc(String(e.data).slice(0,cap))}`;
+  };
   showDrawer(`<h2>${esc(t.title)}</h2>
-    <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span><span>phase ${t.phase}</span><span>${t.status}</span></div>
+    <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span><span>phase ${esc(t.phase)}</span><span>${esc(t.status)}</span></div>
+    ${t.error?`<label class="lbl">Error</label><div class="q">${esc(t.error)}</div>`:""}
     <label class="lbl">Diff</label><div class="q">${esc(diffShown||"(no changes)")}</div>
     <label class="lbl">Recent events</label>
-    <div class="q">${ev.events.slice(-40).map(e=>`${new Date(e.ts).toLocaleTimeString()} · ${e.kind} · ${esc(String(e.data)).slice(0,120)}`).join("\n")||"(none)"}</div>
+    <div class="q">${ev.events.slice(-40).map(evLine).join("\n")||"(none)"}</div>
     <div style="display:flex;gap:8px">
-      <button class="btn ghost" onclick="stop('${id}')">Pause</button>
-      <button class="btn danger" onclick="del('${id}')">Delete</button></div>`);
+      <button class="btn ghost" data-id="${esc(id)}" onclick="stop(this.dataset.id)">Pause</button>
+      <button class="btn danger" data-id="${esc(id)}" onclick="del(this.dataset.id)">Delete</button></div>`);
 }
 async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST",headers:authHeaders()});closeDrawer();}
 async function del(id){
@@ -563,13 +661,18 @@ function connect(){
     setConn(connAttempts>=GIVE_UP_AFTER?"daemon unreachable":"reconnecting…",connAttempts>=GIVE_UP_AFTER?"conn-err":"conn-wait");
     setTimeout(connect,connAttempts>=GIVE_UP_AFTER?GIVE_UP_MS:RECONNECT_MS);
   };
-  ws.onmessage=(m)=>{const d=JSON.parse(m.data);if(d.type==="tasks"){announceTransitions(d.tasks);tasks=d.tasks;render();}};
+  ws.onmessage=(m)=>{const d=JSON.parse(m.data);
+    if(d.type==="tasks"){announceTransitions(d.tasks);tasks=d.tasks;render();}
+    // Sent on every connect, including when empty — that empty frame is what
+    // clears a stale banner in a tab left open across the restart that fixed it.
+    else if(d.type==="notices"){setNotices(d.notices);}};
 }
 document.addEventListener("keydown",(e)=>{if(e.key!=="Escape")return;const a=document.activeElement;if(a&&a.tagName==="TEXTAREA"&&a.value.trim())return;hideToast();closeDrawer();});
 // Which deployment this tab is pointed at — the one fact no other element carries
 // when you keep several SSH tunnels open.
 document.getElementById("host").textContent=location.host;
 loadProjects();
+loadNotices();   // banner shows even if the /ws upgrade is being refused
 connect();
 setInterval(render,10000); // refresh relative times
 </script>

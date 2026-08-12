@@ -3,6 +3,10 @@ import { basename, join } from "node:path";
 import { readFileSync, mkdirSync, openSync, closeSync, fstatSync, readSync, writeSync, constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { AgentDeckConfig, Project } from "./types.ts";
+// Dependency-free by construction, so this import cannot close a cycle. See the
+// header of notices.ts — the ordering guarantee is what makes it safe to call
+// notice() from the module body below.
+import { notice } from "./notices.ts";
 
 const home = homedir();
 const dataDir = process.env.AGENTDECK_DATA_DIR ?? join(home, ".agentdeck");
@@ -24,7 +28,7 @@ export function loadProjects(dir: string, fallbackRepo: string): Project[] {
   try {
     raw = readFileSync(file, "utf8");
   } catch (e: any) {
-    if (e?.code !== "ENOENT") console.warn(`[projects] could not read ${file}: ${e.message} — using the default repo`);
+    if (e?.code !== "ENOENT") notice("warn", "projects", `could not read ${file}: ${e.message} — using the default repo`);
     return fallback();
   }
   try {
@@ -34,24 +38,24 @@ export function loadProjects(dir: string, fallbackRepo: string): Project[] {
     const out: Project[] = [];
     for (const p of arr) {
       if (!p || typeof p.id !== "string" || !p.id || typeof p.path !== "string" || !p.path) {
-        console.warn(`[projects] skipping malformed entry: ${JSON.stringify(p)}`);
+        notice("warn", "projects", `skipping malformed entry: ${JSON.stringify(p)}`);
         continue;
       }
       // The id is used as a path segment (uploads/<id>) and a DB value, so it must
       // be a simple slug — reject separators / `..` so it can't escape uploadsDir.
       if (/[/\\]|\.\./.test(p.id)) {
-        console.warn(`[projects] skipping id with path separators: '${p.id}'`);
+        notice("warn", "projects", `skipping id with path separators: '${p.id}'`);
         continue;
       }
-      if (seen.has(p.id)) { console.warn(`[projects] duplicate id '${p.id}' — keeping the first`); continue; }
+      if (seen.has(p.id)) { notice("warn", "projects", `duplicate id '${p.id}' — keeping the first`); continue; }
       seen.add(p.id);
       out.push({ id: p.id, path: p.path, label: (typeof p.label === "string" && p.label) ? p.label : (basename(p.path) || p.id) });
     }
     if (out.length) return out;
-    console.warn(`[projects] ${file} had no usable entries — using the default repo`);
+    notice("warn", "projects", `${file} had no usable entries — using the default repo`);
     return fallback();
   } catch (e: any) {
-    console.warn(`[projects] ${file} is not valid JSON (${e.message}) — using the default repo`);
+    notice("warn", "projects", `${file} is not valid JSON (${e.message}) — using the default repo`);
     return fallback();
   }
 }
@@ -114,10 +118,19 @@ function loadOrCreateDashboardToken(dir: string): string {
       const raced = readToken();
       if (raced) return raced;
     }
-    console.warn(`[auth] could not persist the dashboard token to ${file}: ${e.message} — it will change on restart, so an open dashboard needs a reload after one`);
+    notice("warn", "auth", `could not persist the dashboard token to ${file}: ${e.message} — it will change on restart, so an open dashboard needs a reload after one`);
     return token;
   }
 }
+
+/**
+ * The strict opt-in coercion, exported so it can be tested for real.
+ *
+ * `=== "true"`, deliberately NOT the `!== "false"` shape used by
+ * AGENTDECK_SKIP_PERMISSIONS: this one relaxes a security guard in someone else's
+ * binary, so anything that isn't an explicit "true" must leave it alone.
+ */
+export const isOptIn = (v: string | undefined): boolean => v === "true";
 
 export const config: AgentDeckConfig = {
   dataDir,
@@ -156,6 +169,12 @@ export const config: AgentDeckConfig = {
   // on (unattended orchestrator). Set AGENTDECK_SKIP_PERMISSIONS=false + a
   // AGENTDECK_PERMISSION_MODE only for a supervised debugging session.
   dangerouslySkipPermissions: (process.env.AGENTDECK_SKIP_PERMISSIONS ?? "true") !== "false",
+  // Claude Code REFUSES --dangerously-skip-permissions as uid 0 unless it is told
+  // it's in a deliberate sandbox, so a root daemon fails every task at spawn. This
+  // opt-in makes agents carry IS_SANDBOX=1, which lifts that guard. `=== "true"`
+  // (not `!== "false"`) on purpose: relaxing someone else's security guard is
+  // opt-in, so anything that isn't an explicit "true" leaves it alone.
+  allowRoot: isOptIn(process.env.AGENTDECK_ALLOW_ROOT),
   permissionMode: process.env.AGENTDECK_PERMISSION_MODE ?? "acceptEdits",
   extraClaudeArgs: (process.env.AGENTDECK_CLAUDE_ARGS ?? "").split(" ").filter(Boolean),
 
@@ -190,6 +209,36 @@ export const config: AgentDeckConfig = {
       : undefined,
   },
 };
+
+/**
+ * True when this daemon cannot start agents at all: uid 0, permissions skipped,
+ * and no explicit AGENTDECK_ALLOW_ROOT. Claude Code refuses the flag under root,
+ * so EVERY spawn dies in milliseconds.
+ *
+ * ONE predicate, two callers on purpose — daemon.ts raises the boot notice and
+ * server.ts refuses task creation. Duplicating the condition is how the banner
+ * and the route drift apart and start disagreeing about whether tasks can run.
+ * The uid is a parameter so the whole matrix is testable without being root.
+ */
+export function rootBlocksAgents(uid: number | undefined): boolean {
+  return uid === 0 && config.dangerouslySkipPermissions && !config.allowRoot;
+}
+
+/** The same question for THIS process. Split from the pure form above because a
+ *  default parameter cannot express "no uid": passing `undefined` explicitly
+ *  triggers the default, so the non-POSIX case was impossible to inject despite
+ *  the comment promising it was testable. */
+export function rootWillBlockAgents(): boolean {
+  return rootBlocksAgents(process.getuid?.());
+}
+
+/** The one explanation for the above, shared by the boot notice, the /api/tasks
+ *  400 and the dashboard banner, so the operator reads the same sentence
+ *  wherever they hit it first. */
+export const ROOT_BLOCKED_MESSAGE =
+  "running as root: Claude Code refuses --dangerously-skip-permissions as uid 0, so agents cannot start and new tasks are refused. " +
+  "Run the daemon as an unprivileged user (systemd: User=), or set AGENTDECK_ALLOW_ROOT=true, " +
+  "or set AGENTDECK_SKIP_PERMISSIONS=false (agents run, gstack skills won't resolve).";
 
 /** Resolve a project by id. Reads the live registry so daemon.ts boot-validation
  *  (which may drop invalid entries) is reflected. */

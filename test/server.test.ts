@@ -64,6 +64,7 @@ test("rejects every route when the Host header isn't ours", async () => {
     // The reads are the actual leak — they must 403 too, not just the writes.
     expect((await fetch(`${base}/api/tasks`, { headers: evil })).status).toBe(403);
     expect((await fetch(`${base}/api/projects`, { headers: evil })).status).toBe(403);
+  expect((await fetch(`${base}/api/health`, { headers: evil })).status).toBe(403);   // a new ungated read must not be rebinding-reachable
     expect((await fetch(`${base}/`, { headers: evil })).status).toBe(403);
     expect((await fetch(`${base}/ws`, { headers: evil })).status).toBe(403);
 
@@ -302,6 +303,7 @@ test("state-changing task endpoints require the dashboard token; reads don't", a
     // reads stay open (no token) — GET /api/tasks, /api/projects
     expect((await fetch(`${base}/api/tasks`)).status).toBe(200);
     expect((await fetch(`${base}/api/projects`)).status).toBe(200);
+    expect((await fetch(`${base}/api/health`)).status).toBe(200);   // health is a read: ungated like the others
     // with the right token, the write passes the gate (then 400 for missing fields)
     expect((await fetch(`${base}/api/tasks`, { method: "POST", headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken }, body: "{}" })).status).toBe(400);
   } finally {
@@ -315,6 +317,11 @@ test("POST /api/tasks with an unknown projectId → 400", async () => {
   config.port = 0;
   const { startServer } = await import("../src/server.ts");
   const server = startServer();
+  // This test is about projectId validation, so neutralise the unrelated root
+  // guard: on a root box it refuses creation first (correctly — nothing can run),
+  // which would mask the "unknown project" contract this exists to pin.
+  const wasAllow = config.allowRoot;
+  config.allowRoot = true;
   try {
     const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks`, {
       method: "POST", headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken },
@@ -323,6 +330,7 @@ test("POST /api/tasks with an unknown projectId → 400", async () => {
     expect(res.status).toBe(400);
     expect((await res.json()).error).toMatch(/unknown project/i);
   } finally {
+    config.allowRoot = wasAllow;
     server.stop(true);
   }
 });
@@ -494,3 +502,231 @@ describe("withBriefs", () => {
     expect((withBriefs([{ status: "waiting", pendingQuestion: null }])[0] as any).brief).toBeUndefined();
   });
 });
+
+// ── Daemon notices: /api/health and the /ws frame ───────────────────────────
+// Boot problems (running as root, an empty registry, a host gate that will 403
+// this browser) used to live in journald only — the one place someone debugging
+// from a browser is not looking. These pin the two ways they now get out.
+
+describe("daemon notices", () => {
+  test("GET /api/health reports version, uid and the notice list", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const { notice, resetNotices } = await import("../src/notices.ts");
+    const server = startServer();
+    try {
+      const j = await (await fetch(`http://127.0.0.1:${server.port}/api/health`, {
+        headers: { "x-agentdeck-token": config.dashboardToken },
+      })).json();
+      expect(typeof j.version).toBe("string");
+      expect(j.version).toMatch(/^\d+\.\d+\.\d+/);
+      expect(Array.isArray(j.notices)).toBe(true);
+      expect(typeof j.uptimeMs).toBe("number");
+      // Shape-only on the entries: another suite shares this singleton and may
+      // have provoked warnings of its own, so never assert the list is empty.
+      for (const n of j.notices) {
+        expect(["warn", "error"]).toContain(n.level);
+        expect(typeof n.code).toBe("string");
+        expect(typeof n.message).toBe("string");
+      }
+    } finally {
+      server.stop(true);
+      resetNotices();
+    }
+  });
+
+  test("ok is false with an error notice, true with only warnings", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const { notice, resetNotices } = await import("../src/notices.ts");
+    const server = startServer();
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      resetNotices();
+      notice("warn", "test-warn", "degraded but running");
+      // `ok` is in the OPEN half: a probe must be able to read it with a bare curl.
+      expect((await (await fetch(`${base}/api/health`)).json()).ok).toBe(true);
+
+      notice("error", "test-error", "nothing can run");
+      const open = await (await fetch(`${base}/api/health`)).json();
+      expect(open.ok).toBe(false);
+      expect(open.uid).toBeUndefined();       // detail withheld without the token
+      expect(open.notices).toBeUndefined();
+
+      const detail = await (await fetch(`${base}/api/health`, {
+        headers: { "x-agentdeck-token": config.dashboardToken },
+      })).json();
+      expect(detail.notices.some((n: any) => n.code === "test-error")).toBe(true);
+    } finally {
+      resetNotices();
+      server.stop(true);
+    }
+  });
+
+  // The one thing pinning "sent on open". Its absence is invisible until an
+  // operator says the banner never shows up.
+  test("/ws pushes a notices frame AND a tasks frame on connect", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    try {
+      const frames: any[] = [];
+      const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, ["agentdeck.v1", config.dashboardToken]);
+      // Await the frames themselves, not the clock: a fixed sleep fails on a loaded
+      // runner with "expected true, got false" and no hint that timing was the cause.
+      const got = new Promise<void>((resolve) => {
+        ws.onmessage = (m) => {
+          try { frames.push(JSON.parse(String(m.data))); } catch { /* ignore */ }
+          if (frames.some((f) => f.type === "notices") && frames.some((f) => f.type === "tasks")) resolve();
+        };
+      });
+      await Promise.race([got, new Promise((_, rej) => setTimeout(() => rej(new Error(`only got: ${frames.map((f) => f.type).join(",") || "nothing"}`)), 10000))]);
+      ws.close();
+      expect(frames.some((f) => f.type === "notices" && Array.isArray(f.notices))).toBe(true);
+      expect(frames.some((f) => f.type === "tasks" && Array.isArray(f.tasks))).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  // Don't create work that is guaranteed to fail: under root without the opt-in,
+  // every spawn dies in milliseconds, leaving a worktree and a branch to clean up.
+  test("POST /api/tasks refuses while root blocks agents", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    const wasSkip = config.dangerouslySkipPermissions;
+    const wasAllow = config.allowRoot;
+    try {
+      config.dangerouslySkipPermissions = true;
+      config.allowRoot = false;
+      const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken },
+        body: JSON.stringify({ title: "t", prompt: "p" }),
+      });
+      if (process.getuid?.() === 0) {
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toContain("root");
+      } else {
+        // Not root: the guard must NOT fire. 400 here would be the empty-registry
+        // or missing-field path, never the root one.
+        const body = await res.json().catch(() => ({}));
+        expect(String(body.error ?? "")).not.toContain("refuses --dangerously-skip-permissions");
+      }
+    } finally {
+      config.dangerouslySkipPermissions = wasSkip;
+      config.allowRoot = wasAllow;
+      server.stop(true);
+    }
+  });
+
+  // Same spirit as the brand-lockup test above: the banner is a design decision
+  // that could be silently dropped during a refactor with nothing to catch it.
+  test('GET "/" ships the notices banner and its socket handler', async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    try {
+      const html = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+      expect(html).toContain('id="notices"');
+      expect(html).toContain('d.type==="notices"');
+      expect(html).toContain("loadNotices()");        // survives a refused /ws upgrade
+      expect(html).toContain(".notice .x:focus-visible"); // DESIGN.md focus-ring rule
+      // No control bytes. A stray NUL (easy to introduce via a \\u0000 separator in
+      // JS) makes strict grep implementations — ugrep, busybox — treat the response
+      // as binary and report no match, while the page still renders fine in a
+      // browser. GNU grep still exits 0, so this would have broken local tooling
+      // rather than GitHub CI; it is wrong either way, and the HTML tokenizer
+      // rewrites a NUL inside <script> to U+FFFD. Caught exactly this way once.
+      expect(/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(html)).toBe(false);
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+// The systemd unit the README tells operators to write pins RestartPreventExitStatus
+// to this number. Nothing else couples them, so a change here would silently turn a
+// clean "port already in use" stop into a restart loop against a port that stays busy.
+test("EXIT_CONFIG matches the RestartPreventExitStatus the README documents", async () => {
+  const { EXIT_CONFIG } = await import("../src/server.ts");
+  expect(EXIT_CONFIG).toBe(78);
+  const readme = await Bun.file("README.md").text();
+  expect(readme).toContain(`RestartPreventExitStatus=${EXIT_CONFIG}`);
+});
+
+// The listener is the whole point of the runtime-notice path (agent.ts retracting
+// the root-bypass claim). Before this, deleting the setNoticeListener line in
+// startServer() left the entire suite green — the operator would simply never see
+// a runtime notice without reloading the page.
+test("a notice raised while a dashboard is open is pushed over /ws", async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const { notice, clearNotice, resetNotices, setNoticeListener } = await import("../src/notices.ts");
+  const server = startServer();
+  try {
+    const frames: any[] = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, ["agentdeck.v1", config.dashboardToken]);
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = () => resolve();
+      ws.onerror = () => reject(new Error("ws failed to open"));
+    });
+    const pushed = new Promise<void>((resolve) => {
+      ws.onmessage = (m) => {
+        try {
+          const d = JSON.parse(String(m.data));
+          if (d.type === "notices" && d.notices.some((n: any) => n.code === "runtime-push-test")) resolve();
+        } catch { /* ignore */ }
+      };
+    });
+    notice("error", "runtime-push-test", "raised after the socket was already open");
+    await Promise.race([pushed, new Promise((_, rej) => setTimeout(() => rej(new Error("no runtime notice frame arrived")), 10000))]);
+    ws.close();
+  } finally {
+    clearNotice("runtime-push-test");
+    resetNotices();
+    setNoticeListener(null);
+    server.stop(true);
+  }
+}, 20000);
+
+// The invariant this entry point exists for: argv is answered BEFORE the dynamic
+// import pulls in config.ts's module-scope mkdir and dashboard-token mint. CI
+// checks it only for --version, only on the compiled linux-x64 artifact.
+describe("src/main.ts entry", () => {
+  const run = (args: string[]) => {
+    const home = mkdtempSync(join(tmpdir(), "agentdeck-main-"));
+    try {
+      const r = Bun.spawnSync(["bun", "run", "src/main.ts", ...args], {
+        env: { ...process.env, HOME: home, AGENTDECK_DATA_DIR: join(home, ".agentdeck") },
+      });
+      return { ...r, out: r.stdout.toString(), err: r.stderr.toString(), touchedDisk: existsSync(join(home, ".agentdeck")) };
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  };
+
+  test("--version prints the version and touches no disk", () => {
+    const r = run(["--version"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.out.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    expect(r.touchedDisk).toBe(false);
+  });
+
+  test("--help prints the usage and touches no disk", () => {
+    const r = run(["--help"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.out).toContain("AGENTDECK_ALLOW_ROOT");
+    expect(r.touchedDisk).toBe(false);
+  });
+
+  test("an unknown flag is refused rather than booting a daemon", () => {
+    // `-V`, `--Version`, `--version=1` and any typo used to fall through to the
+    // full boot: mint a token, bind the port, resume every in-flight agent.
+    for (const bad of ["-V", "--Version", "--version=1", "--nope"]) {
+      const r = run([bad]);
+      expect(r.exitCode).toBe(2);
+      expect(r.err).toContain("unknown option");
+      expect(r.touchedDisk).toBe(false);
+    }
+  });
+}, 30000);

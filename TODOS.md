@@ -9,13 +9,22 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 - **`resuming` state visual (DT2)** — **Priority: P3**
   The daemon sets `status: "resuming"` on restart (A2). The dashboard renders it with a generic chip; give it a distinct, non-alarming indicator (spinner, not error-red) so a daemon restart doesn't look like a failure. Partially addressed in v0.2.3.0: the CONNECTION indicator now has three distinct states (live / reconnecting in amber / unreachable in red), so a restart no longer reads as a failure. The per-task `resuming` chip is still generic — that half remains open.
 
-- **Escape the remaining `openTask` interpolations** — **Priority: P4**
-  `openTask()` interpolates `${t.phase}`, `${t.status}`, and `${id}` into the drawer HTML without `esc()`. Low risk today (all daemon-generated: fixed status/phase enums, `id` = `t_`+uuid — not user input), so it's defense-in-depth, not a live hole. Wrap them in `esc()` for consistency with the rest of the render. (Adversarial review, 2026-07-21.)
-
 - **Density at scale (DT3)** — **Priority: P4**
   With 20-40 agents, the flat list gets long. Make the "Cruising" section a compact, collapsible strip; virtualize if needed. Keep the attention hierarchy (waiting/error pinned).
 
 ## Agent supervisor / core
+
+- **Run agents as an unprivileged uid instead of relying on `IS_SANDBOX`** — **Priority: P2**
+  `AGENTDECK_ALLOW_ROOT=true` (v0.2.4.1) lets a root daemon start agents by passing `IS_SANDBOX=1`, which lifts Claude Code's root guard. That is a workaround, not the fix: `IS_SANDBOX` is an undocumented internal (it also feeds Claude Code's own sandbox decision, its API-529 handling, and a registry-sweep gate), it can vanish in any auto-update, and the agents it enables run as root with permissions fully skipped — so the README's "blast radius is one worktree" argument stops holding. The real fix is to drop privileges for the spawned agent, which keeps the guard intact and also fixes root-owned files in worktrees.
+
+  Two blockers, both measured 2026-08-12, so nobody re-derives them:
+  1. **Bun's `node:child_process` silently ignores the `uid`/`gid` spawn options.** A probe requesting `uid: 1000` ran as uid 0 with no error and no warning. Privilege-drop needs an external wrapper (`setpriv`, `runuser`) or `Bun.spawn` if it ever grows real support — and whatever is used must be *verified*, since the failure mode here is silent.
+  2. **Credentials.** The agent needs Claude Code's `~/.claude` credentials, which belong to root and aren't readable by the dropped user. Needs a real answer for credential and worktree ownership, not just a uid switch.
+
+  Until then, `checkRootBypassStillWorks` in `src/agent.ts` retracts the "bypass is on" banner the moment a task proves the guard is back. (Eng review + outside voice, 2026-08-12.)
+
+- **Queued tasks display as `running`** — **Priority: P3**
+  `src/tasks.ts:24` sets `status: "running"` at creation, before any process exists. A task waiting behind `AGENTDECK_MAX_AGENTS` therefore shows on the board as live with no agent attached, so the running pill overstates what is actually executing. v0.2.4.1 fixed the *behavioural* half of this (a queued task can now be cancelled, and answering one no longer double-spawns), but not the display. Wants a real `queued` status through `Status`, the DB, the board sections and the pills. (Eng review, 2026-08-12.)
 
 - **Session-resume hardening (A2)** — **Priority: P3**
   On daemon restart, `claude --resume <sessionId>` reattaches, but only `sessionId` is persisted. Confirm cwd/worktree, pending question, and phase survive a real restart mid-run; persist whatever's missing.
