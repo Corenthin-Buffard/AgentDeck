@@ -1,8 +1,9 @@
-import { expect, test, describe } from "bun:test";
+import { afterAll, expect, test, describe } from "bun:test";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { loadProjects } from "../src/config.ts";
+import { resetNotices } from "../src/notices.ts";
 
 // loadProjects MUST NOT throw — config.ts is imported everywhere, so a throw is a
 // systemd crash-loop. Every bad input degrades to the synthesized `default`.
@@ -80,4 +81,32 @@ describe("loadProjects", () => {
       expect(got).toEqual([{ id: "api", path: "/srv/api-one", label: "api-one" }]);
     });
   });
+});
+
+// AGENTDECK_ALLOW_ROOT gates whether agents get IS_SANDBOX=1 under uid 0, which
+// relaxes a guard Claude Code put there on purpose. It must be opt-in in the
+// strictest sense: `=== "true"`, not the `!== "false"` shape used by
+// AGENTDECK_SKIP_PERMISSIONS, so a stray value never silently enables it.
+describe("allowRoot", () => {
+  const original = process.env.AGENTDECK_ALLOW_ROOT;
+  afterAll(() => {
+    if (original === undefined) delete process.env.AGENTDECK_ALLOW_ROOT;
+    else process.env.AGENTDECK_ALLOW_ROOT = original;
+    // This suite feeds loadProjects deliberately malformed input, which now lands
+    // in the shared notices singleton that server.test.ts reads back from
+    // /api/health. Leave it clean rather than rely on the other file's discipline.
+    resetNotices();
+  });
+
+  const read = (v: string | undefined) => {
+    if (v === undefined) delete process.env.AGENTDECK_ALLOW_ROOT;
+    else process.env.AGENTDECK_ALLOW_ROOT = v;
+    return process.env.AGENTDECK_ALLOW_ROOT === "true";
+  };
+
+  test("defaults to off", () => expect(read(undefined)).toBe(false));
+  test('"true" enables it', () => expect(read("true")).toBe(true));
+  test('"1" does NOT enable it', () => expect(read("1")).toBe(false));
+  test('"yes" does NOT enable it', () => expect(read("yes")).toBe(false));
+  test('"TRUE" does NOT enable it (exact match only)', () => expect(read("TRUE")).toBe(false));
 });

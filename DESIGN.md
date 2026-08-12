@@ -130,9 +130,24 @@ Every surface that can be absent, loading, empty, or broken says so.
 | Surface | States |
 |---|---|
 | Connection (`#conn`) | `live` (`--ok`) · `reconnecting…` (`--wait`) · `daemon unreachable` (`--err`, after 8 tries ≈ 12s) |
+| Notices (`#notices`) | hidden (nothing wrong) · warn (`--wait` border, dismissible) · error (`--err` border, **not** dismissible) |
 | Board, no project | dashed empty state, `projects.json` guidance, Reload action |
 | Board, no task | dashed empty state, one-line explanation, primary action |
 | Task row | waiting · error · running · resuming · done · stopped, each with a colored rail |
+
+The notice banner is the daemon's own health, not a task's. It sits between
+`</header>` and `#board` — below the header, so it joins neither row and adds no
+second `margin-left:auto`. Three rules, each learned the hard way:
+
+- **An error is not dismissible.** A warning is a degradation you may knowingly
+  accept; an error means tasks cannot run at all, and letting someone hide that
+  from themselves only moves the confusion later.
+- **Dismissal is keyed on code *and* message.** A changed message is new
+  information and must resurface rather than stay hidden behind a dismissal of
+  the old wording.
+- **Body text is `--text`, never the semantic colour.** `--err`/`--wait` on their
+  own tints fall under the 4.5:1 floor in one theme or the other; the border
+  carries the meaning and the text stays readable. See Rule 1 and Rule 3.
 
 A daemon restart is routine. It must read as *reconnecting*, never as an error.
 But an unchanging retry message hides the difference between a two-second blip

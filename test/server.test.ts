@@ -64,6 +64,7 @@ test("rejects every route when the Host header isn't ours", async () => {
     // The reads are the actual leak — they must 403 too, not just the writes.
     expect((await fetch(`${base}/api/tasks`, { headers: evil })).status).toBe(403);
     expect((await fetch(`${base}/api/projects`, { headers: evil })).status).toBe(403);
+  expect((await fetch(`${base}/api/health`, { headers: evil })).status).toBe(403);   // a new ungated read must not be rebinding-reachable
     expect((await fetch(`${base}/`, { headers: evil })).status).toBe(403);
     expect((await fetch(`${base}/ws`, { headers: evil })).status).toBe(403);
 
@@ -302,6 +303,7 @@ test("state-changing task endpoints require the dashboard token; reads don't", a
     // reads stay open (no token) — GET /api/tasks, /api/projects
     expect((await fetch(`${base}/api/tasks`)).status).toBe(200);
     expect((await fetch(`${base}/api/projects`)).status).toBe(200);
+    expect((await fetch(`${base}/api/health`)).status).toBe(200);   // health is a read: ungated like the others
     // with the right token, the write passes the gate (then 400 for missing fields)
     expect((await fetch(`${base}/api/tasks`, { method: "POST", headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken }, body: "{}" })).status).toBe(400);
   } finally {
@@ -315,6 +317,11 @@ test("POST /api/tasks with an unknown projectId → 400", async () => {
   config.port = 0;
   const { startServer } = await import("../src/server.ts");
   const server = startServer();
+  // This test is about projectId validation, so neutralise the unrelated root
+  // guard: on a root box it refuses creation first (correctly — nothing can run),
+  // which would mask the "unknown project" contract this exists to pin.
+  const wasAllow = config.allowRoot;
+  config.allowRoot = true;
   try {
     const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks`, {
       method: "POST", headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken },
@@ -323,6 +330,7 @@ test("POST /api/tasks with an unknown projectId → 400", async () => {
     expect(res.status).toBe(400);
     expect((await res.json()).error).toMatch(/unknown project/i);
   } finally {
+    config.allowRoot = wasAllow;
     server.stop(true);
   }
 });
@@ -492,5 +500,123 @@ describe("withBriefs", () => {
     const { withBriefs } = await import("../src/server.ts");
     expect(withBriefs([{ status: "waiting", pendingQuestion: null }])[0]).toHaveProperty("status", "waiting");
     expect((withBriefs([{ status: "waiting", pendingQuestion: null }])[0] as any).brief).toBeUndefined();
+  });
+});
+
+// ── Daemon notices: /api/health and the /ws frame ───────────────────────────
+// Boot problems (running as root, an empty registry, a host gate that will 403
+// this browser) used to live in journald only — the one place someone debugging
+// from a browser is not looking. These pin the two ways they now get out.
+
+describe("daemon notices", () => {
+  test("GET /api/health reports version, uid and the notice list", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const { notice, resetNotices } = await import("../src/notices.ts");
+    const server = startServer();
+    try {
+      const j = await (await fetch(`http://127.0.0.1:${server.port}/api/health`)).json();
+      expect(typeof j.version).toBe("string");
+      expect(j.version).toMatch(/^\d+\.\d+\.\d+/);
+      expect(Array.isArray(j.notices)).toBe(true);
+      expect(typeof j.uptimeMs).toBe("number");
+      // Shape-only on the entries: another suite shares this singleton and may
+      // have provoked warnings of its own, so never assert the list is empty.
+      for (const n of j.notices) {
+        expect(["warn", "error"]).toContain(n.level);
+        expect(typeof n.code).toBe("string");
+        expect(typeof n.message).toBe("string");
+      }
+    } finally {
+      server.stop(true);
+      resetNotices();
+    }
+  });
+
+  test("ok is false with an error notice, true with only warnings", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const { notice, resetNotices } = await import("../src/notices.ts");
+    const server = startServer();
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      resetNotices();
+      notice("warn", "test-warn", "degraded but running");
+      expect((await (await fetch(`${base}/api/health`)).json()).ok).toBe(true);
+
+      notice("error", "test-error", "nothing can run");
+      expect((await (await fetch(`${base}/api/health`)).json()).ok).toBe(false);
+    } finally {
+      resetNotices();
+      server.stop(true);
+    }
+  });
+
+  // The one thing pinning "sent on open". Its absence is invisible until an
+  // operator says the banner never shows up.
+  test("/ws pushes a notices frame AND a tasks frame on connect", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    try {
+      const frames: any[] = [];
+      const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, ["agentdeck.v1", config.dashboardToken]);
+      ws.onmessage = (m) => { try { frames.push(JSON.parse(String(m.data))); } catch { /* ignore */ } };
+      await new Promise((r) => setTimeout(r, 400));
+      ws.close();
+      expect(frames.some((f) => f.type === "notices" && Array.isArray(f.notices))).toBe(true);
+      expect(frames.some((f) => f.type === "tasks" && Array.isArray(f.tasks))).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  // Don't create work that is guaranteed to fail: under root without the opt-in,
+  // every spawn dies in milliseconds, leaving a worktree and a branch to clean up.
+  test("POST /api/tasks refuses while root blocks agents", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    const wasSkip = config.dangerouslySkipPermissions;
+    const wasAllow = config.allowRoot;
+    try {
+      config.dangerouslySkipPermissions = true;
+      config.allowRoot = false;
+      const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-agentdeck-token": config.dashboardToken },
+        body: JSON.stringify({ title: "t", prompt: "p" }),
+      });
+      if (process.getuid?.() === 0) {
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toContain("root");
+      } else {
+        // Not root: the guard must NOT fire. 400 here would be the empty-registry
+        // or missing-field path, never the root one.
+        const body = await res.json().catch(() => ({}));
+        expect(String(body.error ?? "")).not.toContain("refuses --dangerously-skip-permissions");
+      }
+    } finally {
+      config.dangerouslySkipPermissions = wasSkip;
+      config.allowRoot = wasAllow;
+      server.stop(true);
+    }
+  });
+
+  // Same spirit as the brand-lockup test above: the banner is a design decision
+  // that could be silently dropped during a refactor with nothing to catch it.
+  test('GET "/" ships the notices banner and its socket handler', async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    try {
+      const html = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+      expect(html).toContain('id="notices"');
+      expect(html).toContain('d.type==="notices"');
+      expect(html).toContain("loadNotices()");        // survives a refused /ws upgrade
+      expect(html).toContain(".notice .x:focus-visible"); // DESIGN.md focus-ring rule
+    } finally {
+      server.stop(true);
+    }
   });
 });

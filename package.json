@@ -1,6 +1,6 @@
 {
   "name": "agentdeck",
-  "version": "0.2.4.0",
+  "version": "0.2.4.1",
   "type": "module",
   "private": true,
   "description": "AgentDeck — self-hosted, gstack-native orchestrator for parallel Claude Code agents. Air-traffic-control board for your VPS.",
@@ -12,9 +12,9 @@
   },
   "scripts": {
     "test": "bun test",
-    "build": "bun build src/daemon.ts --compile --outfile dist/agentdeck",
-    "daemon": "bun run src/daemon.ts",
-    "dev": "bun --watch run src/daemon.ts",
+    "build": "bun build src/main.ts --compile --outfile dist/agentdeck",
+    "daemon": "bun run src/main.ts",
+    "dev": "bun --watch run src/main.ts",
     "hooks": "bun run spike/hook-server.ts",
     "spike": "bun run spike/run.ts",
     "spike:gstack": "bun run spike/run.ts --gstack"

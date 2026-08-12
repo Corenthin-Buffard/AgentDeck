@@ -56,8 +56,23 @@ export interface Task {
 export interface AgentEvent {
   taskId: string;
   ts: number;
-  kind: "phase" | "status" | "tool" | "question" | "text" | "result" | "log";
+  // "stderr" carries the tail of a dead agent's stderr. The DB column is TEXT and
+  // log() takes `kind: any`, so listing it here is documentation — but the drawer
+  // prints e.kind verbatim, so the union should name everything that can appear.
+  kind: "phase" | "status" | "tool" | "question" | "text" | "result" | "log" | "stderr";
   data: string;
+}
+
+/** Severity of a daemon-level notice. `error` means something is broken now, not
+ *  degraded: the dashboard renders it undismissable. */
+export type NoticeLevel = "warn" | "error";
+
+/** A daemon-level condition the operator should know about, surfaced in the
+ *  dashboard banner and GET /api/health as well as the log. */
+export interface BootNotice {
+  level: NoticeLevel;
+  code: string;    // stable, greppable bucket + the dedupe key: "root", "projects", "host-gate", "hooks", "auth", "plan-reviews", "claude-bin"
+  message: string; // one sentence, ending in what to DO about it
 }
 
 /** Config knobs — the A1b launch config lives here. */
@@ -77,6 +92,11 @@ export interface AgentDeckConfig {
   // The spike proved gstack only resolves + runs unattended with permissions
   // fully skipped. Default true. Set false only for a hands-on debugging run.
   dangerouslySkipPermissions: boolean;
+  // Under uid 0, spawn agents with IS_SANDBOX=1 to lift Claude Code's refusal to
+  // run --dangerously-skip-permissions as root. OFF by default: root is a mistake
+  // (an unset systemd `User=`) far more often than a decision, and the flag it
+  // relaxes is an undocumented Claude Code internal. See agentEnv() in agent.ts.
+  allowRoot: boolean;
   permissionMode: string;  // used only when dangerouslySkipPermissions=false
   extraClaudeArgs: string[]; // escape hatch for extra claude flags (--add-dir, --model, …)
   // Notification-hook wiring: launched agents POST hook events to the daemon.

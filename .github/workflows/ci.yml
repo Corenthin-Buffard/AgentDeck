@@ -22,9 +22,19 @@ jobs:
       - name: Build binaries (all release targets)
         run: |
           mkdir -p dist
-          bun build src/daemon.ts --compile --target=bun-linux-x64    --outfile dist/agentdeck-linux-x64
-          bun build src/daemon.ts --compile --target=bun-linux-arm64  --outfile dist/agentdeck-linux-arm64
-          bun build src/daemon.ts --compile --target=bun-darwin-arm64 --outfile dist/agentdeck-darwin-arm64
+          bun build src/main.ts --compile --target=bun-linux-x64    --outfile dist/agentdeck-linux-x64
+          bun build src/main.ts --compile --target=bun-linux-arm64  --outfile dist/agentdeck-linux-arm64
+          bun build src/main.ts --compile --target=bun-darwin-arm64 --outfile dist/agentdeck-darwin-arm64
+      # --version must answer WITHOUT booting or touching the disk. config.ts does
+      # I/O at import (mkdir + token mint), so this also proves src/main.ts still
+      # answers before that import happens — a regression here is silent otherwise.
+      - name: Binary answers --version without side effects
+        run: |
+          export HOME="$(mktemp -d)"
+          ./dist/agentdeck-linux-x64 --version | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' \
+            || { echo "--version did not print a version"; exit 1; }
+          [ -d "$HOME/.agentdeck" ] && { echo "--version created the data dir"; exit 1; }
+          echo "OK: --version prints, creates nothing"
       # Prove the shipped artifact actually boots and serves the embedded
       # dashboard — compiling only proves the text import bundles, not that the
       # binary runs. The x64 target runs natively on this runner.
@@ -37,6 +47,10 @@ jobs:
             if curl -fsS http://127.0.0.1:8787/ 2>/dev/null | grep -q '<title>AgentDeck'; then ok=1; break; fi
             sleep 0.25
           done
+          # A serving dashboard is not a working daemon — /api/health is what says
+          # whether tasks can actually run. CI is not root, so ok must be true.
+          curl -fsS http://127.0.0.1:8787/api/health | grep -q '"ok":true' \
+            || { echo "health reported not-ok:"; curl -s http://127.0.0.1:8787/api/health; kill $PID 2>/dev/null; exit 1; }
           kill $PID 2>/dev/null || true
           [ "$ok" = 1 ] || { echo "binary did not serve the dashboard"; exit 1; }
-          echo "smoke OK: binary boots and serves the embedded dashboard"
+          echo "smoke OK: binary boots, serves the dashboard, and reports healthy"

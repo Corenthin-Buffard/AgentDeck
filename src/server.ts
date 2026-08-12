@@ -5,9 +5,14 @@ import { randomUUID } from "node:crypto";
 // Embed the dashboard into the binary as a string so `bun build --compile`
 // yields a self-contained executable (no sibling public/ dir needed at runtime).
 import indexHtml from "../public/index.html" with { type: "text" };
-import { config, projectById } from "./config.ts";
+// package.json, not the VERSION file: VERSION is extensionless, so bun-types'
+// `declare module "*.ext"` shims don't cover it and tsc won't resolve a text
+// import of it. Both files carry the same number; keep them in step when bumping.
+import pkg from "../package.json" with { type: "json" };
+import { config, projectById, rootWillBlockAgents, ROOT_BLOCKED_MESSAGE } from "./config.ts";
 import { store } from "./db.ts";
 import { bus } from "./bus.ts";
+import { notices, setNoticeListener } from "./notices.ts";
 import { answer, stopTask } from "./agent.ts";
 import { createTask, removeTask, findBySession } from "./tasks.ts";
 import { parseDecisionBrief } from "./detect.ts";
@@ -147,14 +152,54 @@ function tasksForClient() {
   return withBriefs(store.listTasks());
 }
 
-function broadcast() {
-  const payload = JSON.stringify({ type: "tasks", tasks: tasksForClient() });
+function sendAll(payload: string) {
   for (const ws of clients) { try { ws.send(payload); } catch { /* dropped */ } }
+}
+
+function broadcast() {
+  sendAll(JSON.stringify({ type: "tasks", tasks: tasksForClient() }));
 }
 bus.on("update", broadcast);
 
+// Notices ride their OWN frame, deliberately not folded into the tasks payload.
+// broadcast() fires on every tool call and every phase change; notices are a
+// handful of strings that almost never change, so bundling them would re-send the
+// same static array hundreds of times per task per minute and tie a static
+// contract to the hot path. The dashboard ignores unknown `type`s, so an older
+// cached page degrades to "no banner" rather than a broken board.
+function noticesPayload() {
+  return JSON.stringify({ type: "notices", notices: notices() });
+}
+
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+}
+
+/**
+ * Exit code for a configuration problem the daemon cannot recover from by
+ * retrying — currently only "port already bound". 78 is sysexits' EX_CONFIG.
+ *
+ * It matters which code we pick: the README's systemd unit uses
+ * Restart=on-failure, so ANY non-zero exit restarts us, and a port that's busy
+ * now will still be busy in a second — a restart loop. The unit pairs this with
+ * RestartPreventExitStatus=78 so a config error stops cleanly and stays stopped,
+ * while a genuine crash still restarts.
+ */
+export const EXIT_CONFIG = 78;
+
+/** Bun.serve(), but a port clash prints one line instead of a raw stack trace.
+ *  Without this the throw also escapes startServer(), so startAutoCleanSweep()
+ *  in daemon.ts never runs and the failure reads like an internal error. */
+function serveOrExit(opts: Parameters<typeof Bun.serve>[0]) {
+  try {
+    return Bun.serve(opts as any);
+  } catch (e: any) {
+    if (e?.code === "EADDRINUSE" || /EADDRINUSE|address already in use/i.test(String(e?.message ?? e))) {
+      console.error(`[port] ${config.host}:${config.port} is already in use — another AgentDeck daemon may already be running. Set AGENTDECK_PORT to a free port, or stop the other instance.`);
+      process.exit(EXIT_CONFIG);
+    }
+    throw e;
+  }
 }
 
 export function startServer() {
@@ -163,7 +208,11 @@ export function startServer() {
   // fixed for the process. Function replacement so a `$` in a custom token isn't
   // read as a $-pattern.
   const dashboardHtml = indexHtml.replace("__AD_TOKEN__", () => escAttr(config.dashboardToken));
-  const server = Bun.serve({
+  // From here on, a notice raised at RUNTIME (agent.ts retracting the root-bypass
+  // claim) reaches every open dashboard immediately instead of waiting for the next
+  // reconnect. Registered before serve() so nothing raised during startup is lost.
+  setNoticeListener(() => sendAll(noticesPayload()));
+  const server = serveOrExit({
     hostname: config.host, // A3: localhost by default — do not expose the control API publicly
     port: config.port,
     // First curtain on upload size: reject an over-large body before it's buffered
@@ -240,6 +289,24 @@ export function startServer() {
       }
 
       // ── REST API ──────────────────────────────────────────────────────
+      // What you curl when the dashboard looks wrong, and what the install runbook
+      // verifies instead of grepping the page title — a broken config serves a
+      // perfectly good page while every task dies. Ungated like the other GET reads
+      // (the Host gate above is the perimeter): it discloses strictly less than
+      // GET /api/tasks, which already hands over prompts and branch names.
+      //
+      // ALWAYS 200. The daemon IS up; `ok: false` is what says the configuration
+      // isn't. A 503 here would fail `curl -fsS` probes for a non-outage.
+      if (pathname === "/api/health" && req.method === "GET") {
+        const list = notices();
+        return json({
+          ok: !list.some((n) => n.level === "error"),
+          version: pkg.version,
+          uid: process.getuid?.() ?? null,
+          uptimeMs: Math.round(process.uptime() * 1000),
+          notices: list,
+        });
+      }
       if (pathname === "/api/projects" && req.method === "GET") {
         return json({ projects: config.projects.map((p) => ({ id: p.id, label: p.label })) });
       }
@@ -250,6 +317,11 @@ export function startServer() {
         const b = await req.json().catch(() => ({}));
         if (!b.title || !b.prompt) return json({ error: "title and prompt required" }, 400);
         if (!config.projects.length) return json({ error: "no project configured — add one to projects.json" }, 400);
+        // Don't create work that cannot run. Under root without the opt-in, every
+        // spawn dies in milliseconds, so accepting the task would only leave a
+        // worktree, a branch and a dead row to clean up. Same predicate and same
+        // sentence as the boot notice, so the two can't drift.
+        if (rootWillBlockAgents()) return json({ error: ROOT_BLOCKED_MESSAGE }, 400);
         // A provided-but-unknown projectId (stale dashboard, typo) must NOT silently
         // land the agent in the first repo — reject it, like /api/upload does.
         if (b.projectId != null && b.projectId !== "" && !projectById(String(b.projectId))) {
@@ -349,12 +421,21 @@ export function startServer() {
       return new Response("not found", { status: 404 });
     },
     websocket: {
-      open(ws) { clients.add(ws); ws.send(JSON.stringify({ type: "tasks", tasks: tasksForClient() })); },
+      open(ws) {
+        clients.add(ws);
+        // Notices first, so the banner is up before the board paints. Sent even
+        // when EMPTY on purpose: that is what clears a stale banner in a tab left
+        // open across the restart that fixed the problem.
+        try { ws.send(noticesPayload()); } catch { /* dropped */ }
+        ws.send(JSON.stringify({ type: "tasks", tasks: tasksForClient() }));
+      },
       close(ws) { clients.delete(ws); },
       message() { /* dashboard is read + REST; ws is push-only */ },
     },
   });
   const projList = config.projects.map((p) => `${p.id}→${p.path}`).join(", ") || "(none)";
-  console.log(`AgentDeck daemon on http://localhost:${server.port}  (${config.projects.length} project(s): ${projList})`);
+  // Report the address we actually bound, not a hardcoded "localhost" — an
+  // operator who set AGENTDECK_HOST needs the line to match reality.
+  console.log(`AgentDeck daemon on http://${config.host}:${server.port}  (${config.projects.length} project(s): ${projList})`);
   return server;
 }

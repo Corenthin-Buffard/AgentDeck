@@ -1,13 +1,49 @@
 import { mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from "node:fs";
-import { config } from "./config.ts";
+import { config, rootWillBlockAgents, ROOT_BLOCKED_MESSAGE } from "./config.ts";
 import { store } from "./db.ts";
 import { resumeTask } from "./agent.ts";
 import { startServer, isLoopbackBind } from "./server.ts";
 import { startAutoCleanSweep } from "./cleanup.ts";
 import { hookSettings } from "./hooks-config.ts";
+import { notice } from "./notices.ts";
 
-// AgentDeck daemon entry. Runs as a systemd --user service on the VPS so agents
+// AgentDeck daemon boot. Runs as a systemd --user service on the VPS so agents
 // survive SSH/browser disconnects (they live here, not on your laptop).
+//
+// NOTE: this is NOT the process entry point — src/main.ts is, because it must
+// handle --version/--help BEFORE config.ts is imported (config.ts does real I/O
+// at module scope: it mkdirSyncs the data dir and mints the dashboard token).
+//
+// Everything below that detects a problem calls notice() rather than console.warn,
+// so the dashboard can show it too. Same text in the log; see notices.ts.
+
+// Running as root is the one condition that makes the daemon useless rather than
+// degraded, so it's the first thing in the log. Three distinct cases:
+//   uid 0 + skip-permissions + no opt-in -> nothing can run at all (error)
+//   uid 0 + opt-in                       -> everything runs, as root (warn)
+//   uid 0 + permissions not skipped      -> runs, but writes root-owned files (warn)
+const uid = process.getuid?.();
+if (uid === 0) {
+  if (rootWillBlockAgents(uid)) {
+    notice("error", "root", ROOT_BLOCKED_MESSAGE);
+  } else if (config.allowRoot && config.dangerouslySkipPermissions) {
+    // State the FACT, never a claim like "bypass active" — IS_SANDBOX is an
+    // undocumented Claude Code internal, and agent.ts retracts this notice if a
+    // task later proves the guard is still refusing.
+    notice("warn", "root", "running as root with AGENTDECK_ALLOW_ROOT=true — agents are spawned with IS_SANDBOX=1, which lifts Claude Code's root guard. Every agent runs as root with permissions skipped, so the blast radius is the whole box, not one worktree.");
+  } else {
+    notice("warn", "root", "running as root — every agent, and everything it writes into a worktree, is owned by root. Run the daemon as an unprivileged user (systemd: User=).");
+  }
+}
+
+// Agents are spawned by name, and a systemd unit's PATH is not your login shell's
+// — a missing `claude` is the single most common install mistake. Catch it once at
+// boot rather than once per task: with Restart=on-failure plus the A2 resume loop
+// below, a spawn failure that reaches the supervisor is a restart loop, not one
+// dead task. Same shape as the reviewReadBin check further down.
+if (!Bun.which(config.claudeBin)) {
+  notice("error", "claude-bin", `'${config.claudeBin}' is not on PATH — every agent will fail to start. Set AGENTDECK_CLAUDE_BIN to its absolute path, or add it to the service PATH (systemd: Environment=PATH=…).`);
+}
 
 mkdirSync(config.worktreesDir, { recursive: true });
 mkdirSync(config.uploadsDir, { recursive: true });
@@ -17,11 +53,11 @@ mkdirSync(config.uploadsDir, { recursive: true });
 // Runs here (not at config import) to keep config.ts pure and off the test path.
 config.projects = config.projects.filter((p) => {
   const r = Bun.spawnSync(["git", "-C", p.path, "rev-parse", "--git-dir"]);
-  if (r.exitCode !== 0) { console.warn(`[projects] '${p.id}' is not a git repo, skipping: ${p.path}`); return false; }
+  if (r.exitCode !== 0) { notice("warn", "projects", `'${p.id}' is not a git repo, skipping: ${p.path}`); return false; }
   return true;
 });
 if (!config.projects.length) {
-  console.error("[projects] no valid project — create-task will 400 until projects.json points at a git repo");
+  notice("error", "projects-empty", "no valid project — create-task will 400 until projects.json points at a git repo");
 }
 
 // Plan-review tracking reads a branch's gstack review log via this binary. If it's
@@ -29,7 +65,7 @@ if (!config.projects.length) {
 // tick" is an explained degradation, not a silent mystery. Not fatal — the marks
 // just stay ○ and everything else runs.
 if (!existsSync(config.reviewReadBin)) {
-  console.warn(`[plan-reviews] gstack-review-read not found (${config.reviewReadBin}) — review tracking disabled (set AGENTDECK_REVIEW_READ_BIN)`);
+  notice("warn", "plan-reviews", `gstack-review-read not found (${config.reviewReadBin}) — review tracking disabled (set AGENTDECK_REVIEW_READ_BIN)`);
 }
 
 // Bound off-loopback with no allowlist. Loopback Hosts still work, so this is
@@ -37,7 +73,7 @@ if (!existsSync(config.reviewReadBin)) {
 // or through a proxy sends THAT hostname, and the rebinding gate rejects it. Say
 // so at boot rather than leaving the operator to debug selective 403s.
 if (!isLoopbackBind(config.host) && !config.allowedHosts.length) {
-  console.warn(`[host-gate] bound to ${config.host} with an empty AGENTDECK_ALLOWED_HOSTS — only loopback Hosts (localhost, 127.x.x.x, [::1]) are accepted. Requests carrying any other Host are rejected; set AGENTDECK_ALLOWED_HOSTS=your.domain to allow them.`);
+  notice("warn", "host-gate", `bound to ${config.host} with an empty AGENTDECK_ALLOWED_HOSTS — only loopback Hosts (localhost, 127.x.x.x, [::1]) are accepted. Requests carrying any other Host are rejected; set AGENTDECK_ALLOWED_HOSTS=your.domain to allow them.`);
 }
 
 // Write the settings file that agents load via `claude --settings` so Claude
@@ -55,7 +91,7 @@ if (config.notificationHooks) {
     console.log(`[hooks] agents POST Notification/PreToolUse → ${config.hookBaseUrl}`);
   } catch (e) {
     config.notificationHooks = false; // degrade — never crash the daemon over an optional enhancement
-    console.warn(`[hooks] disabled: could not write ${config.agentSettingsPath}: ${(e as Error).message}`);
+    notice("warn", "hooks", `disabled: could not write ${config.agentSettingsPath}: ${(e as Error).message}`);
   }
 }
 

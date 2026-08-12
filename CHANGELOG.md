@@ -1,5 +1,88 @@
 # Changelog
 
+## [0.2.4.1] - 2026-08-12
+
+### Fixed
+- **A daemon running as root failed every task in milliseconds, and nothing said why.** Claude Code
+  refuses `--dangerously-skip-permissions` under uid 0 — and that flag is the one AgentDeck depends
+  on for gstack skills to resolve headlessly. So every task died at spawn with `agent exited (code 1)
+  mid-run` and no further explanation: the agent's actual message went to journald via
+  `stdio: [..., "inherit"]` and never reached the task. The worktree and branch were created
+  correctly, which made it look like a mid-run crash rather than a launch that never happened.
+
+  Three things change. The daemon now **detects root at boot** and says so — in the log, as a red
+  banner on the dashboard, and as `ok: false` from the new `GET /api/health`. It **refuses to create
+  tasks** while it knows they cannot run, instead of leaving a trail of dead worktrees. And it
+  **captures the agent's stderr**, so `task.error` ends with the real cause rather than an exit code.
+
+  If the daemon must run as root, `AGENTDECK_ALLOW_ROOT=true` passes `IS_SANDBOX=1` to agents, which
+  lifts Claude Code's guard and keeps gstack working. It is opt-in on purpose: those agents run as
+  root with permissions fully skipped, so the blast radius becomes the box rather than one worktree.
+  `IS_SANDBOX` is also an undocumented Claude Code internal that a future release can remove — so a
+  task that dies on the root refusal while the opt-in is set **retracts the banner** and says the
+  escape hatch is gone. A banner that lies is worse than no banner.
+
+- **A missing `claude` binary took down the whole daemon.** On ENOENT, Node fires `error` and never
+  fires `exit`; there was no `error` handler, so the unhandled EventEmitter error killed the process
+  — and with `Restart=on-failure` plus resume-on-boot, that is a crash loop, not one dead daemon. Now
+  it marks that one task failed and names `AGENTDECK_CLAUDE_BIN`. The daemon also checks for the
+  binary at boot, so the usual cause (a systemd unit's PATH is not your login shell's) is caught once
+  rather than once per task.
+
+- **Pausing a queued task didn't pause it, and answering one started two agents.** `killExisting`
+  only ever looked at children that already existed, so a task waiting behind `AGENTDECK_MAX_AGENTS`
+  was invisible to it: `stopTask` marked it stopped and it spawned anyway when a slot freed, and
+  `answer()` scheduled a second launch beside the pending first — two `claude --resume` on one
+  session, which is precisely what that function exists to prevent. The second registration also
+  overwrote the first, so the daemon undercounted live agents (quietly exceeding the cap) and leaked
+  a concurrency slot each time. Queued launches are now cancellable.
+
+- **An OOM-killed agent reported `code null`.** The exit handler dropped the signal; it now reads
+  `signal SIGKILL`. A task killed while `resuming` was stranded in that state for ever with no error
+  text — the exact path taken by tasks resumed after a daemon restart.
+
+- **`--version` and `--help`** are answered without booting anything. This needed a new entry module:
+  `config.ts` does real I/O at import time (it creates the data dir and mints the dashboard token),
+  so a flag check inside `daemon.ts` would already have written to disk before it ran.
+
+- **A port clash** printed a raw Bun stack trace and skipped the auto-clean sweep. It now prints one
+  line and exits 78, and the README's systemd unit pairs that with `RestartPreventExitStatus=78` so
+  a config error stops cleanly instead of restart-looping against a port that will still be busy.
+
+- **The install runbook reported success on a root VPS where every task dies.** It verified with
+  `systemctl is-active` plus a grep for the page title — both of which pass on a completely broken
+  install. It now checks `id -u` before writing the env file, and verifies with `/api/health`.
+
+### Changed
+- **Daemon problems reach the dashboard.** All thirteen boot warnings — root, an empty project
+  registry, a missing `gstack-review-read`, a host gate that will 403 your browser, a failed hooks
+  write — go through `src/notices.ts` and surface as a banner. Warnings are dismissible; errors are
+  not. They ride their own `/ws` frame rather than the task payload, which fires on every tool call.
+  `journalctl` output is unchanged: every notice still prints `[code] message`.
+- The card's error text is no longer truncated at 50 characters, and the drawer shows the full error
+  plus the stderr tail — otherwise the captured diagnostic would have been unreadable.
+
+### Security
+- **Every interpolation in the task drawer is escaped.** `openTask` built HTML from `${t.phase}`,
+  `${t.status}` and `${id}` unescaped. TODOS.md filed that as P4 defence-in-depth precisely because
+  everything on that path was daemon-generated. Putting agent stderr into `task.error` retires that
+  reasoning: it is now subprocess output, from a process running with permissions skipped, rendered
+  into the page that carries the dashboard token. Truncation also moved to before escaping — cutting
+  an escaped string can bisect an entity like `&#39;`.
+
+### Internal
+- `src/agent.ts` gets its first tests. The supervisor's process handling had none across 107 tests,
+  which is why the ENOENT crash shipped. `test/agent-spawn.test.ts` points `config.claudeBin` at
+  throwaway shell scripts, so exit codes, signals, ENOENT and a 64KiB pipe overflow are exercised
+  against real subprocesses — a mocked emitter cannot fill a pipe. 151 tests.
+- Piping stderr moved journald backpressure from the child onto the daemon's heap, where nothing
+  bounded it. Relay writes that can't be flushed are dropped and counted; the bounded tail that feeds
+  `task.error` is unaffected, so diagnosis still works while the log is stalled.
+- An earlier design picked "the first meaningful line" of stderr as the cause, with ANSI stripping and
+  carriage-return handling. Measuring the real failure killed it: the whole message is 93 bytes, one
+  line, no ANSI — and with a tty stdin Claude Code prepends a stdin warning, so the first line is the
+  wrong one. Keeping the bounded tail is both simpler and correct.
+
 ## [0.2.4.0] - 2026-08-04
 
 ### Added
