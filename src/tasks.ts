@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { store } from "./db.ts";
 import { config, projectById } from "./config.ts";
 import { createWorktree, cleanupWorktree, type CleanupResult, type CleanupMode } from "./git.ts";
-import { launchTask, killExisting } from "./agent.ts";
+import { launchTask, killExisting, forgetTask } from "./agent.ts";
 import { emitUpdate } from "./bus.ts";
 import type { Task } from "./types.ts";
 
@@ -55,7 +55,9 @@ export async function removeTask(id: string, mode: CleanupMode = "safe", expecte
   // expectedSha is the merged-mode CAS guard (only delete the branch if it still
   // points where isBranchMerged proved it was merged).
   const res = await cleanupWorktree(t.worktree, t.branch, mode, expectedSha);
-  if (res.removed) { store.deleteTask(id); }
+  // Drop the in-memory retry budget with the row. taskIds are never reused, so a
+  // surviving entry would leak for the daemon's lifetime.
+  if (res.removed) { store.deleteTask(id); forgetTask(id); }
   emitUpdate(id);
   return res;
 }

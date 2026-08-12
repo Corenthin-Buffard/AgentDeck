@@ -6,6 +6,7 @@ import { startServer, isLoopbackBind } from "./server.ts";
 import { startAutoCleanSweep } from "./cleanup.ts";
 import { hookSettings } from "./hooks-config.ts";
 import { notice } from "./notices.ts";
+import { loadSteps, validateSteps } from "./pipeline.ts";
 
 // AgentDeck daemon boot. Runs as a systemd --user service on the VPS so agents
 // survive SSH/browser disconnects (they live here, not on your laptop).
@@ -74,6 +75,18 @@ if (!config.projects.length) {
 // not where we resolved it, log ONCE at boot so "the CEO/Design/Eng marks never
 // tick" is an explained degradation, not a silent mystery. Not fatal — the marks
 // just stay ○ and everything else runs.
+// Validate the pipeline step table at BOOT. loadSteps() is lazy so it can never
+// crash-loop the daemon, but lazy also means a daemon that happens to run no
+// pipeline task never discovers that its override file is broken — the operator
+// finds out on the first task instead of at startup. Calling it here forces the
+// read (and its notices) now. Never throws: every failure path inside degrades to
+// the built-in table.
+const steps = loadSteps();
+const unknownSkills = validateSteps(steps);
+if (unknownSkills.length) {
+  notice("warn", "pipeline-steps", `step table names skills the dashboard cannot track: ${unknownSkills.join(", ")} — those steps will report no gstack activity`);
+}
+
 if (!existsSync(config.reviewReadBin)) {
   notice("warn", "plan-reviews", `gstack-review-read not found (${config.reviewReadBin}) — review tracking disabled (set AGENTDECK_REVIEW_READ_BIN)`);
 }

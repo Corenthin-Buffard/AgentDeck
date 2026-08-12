@@ -20,6 +20,11 @@ if (created) {
 // by passing values to the pure agentEnv(), and a stray `true` in the environment
 // would silently change what the spawn tests are asserting.
 delete process.env.AGENTDECK_ALLOW_ROOT;
+// Same reason, and the stakes are higher: an operator who sourced their
+// EnvironmentFile would otherwise run the whole suite with the daemon-driven
+// pipeline ARMED, so every task created by a test would try to walk seven gstack
+// steps. config.pipelineDefault is asserted explicitly via isOptIn instead.
+delete process.env.AGENTDECK_PIPELINE;
 // A test must never be able to reach an external service. The suite drives the
 // real supervisor, whose error path calls notify() — and notify() does a live
 // fetch to Telegram/Slack whenever these are set. An operator who sources their

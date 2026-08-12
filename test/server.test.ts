@@ -766,3 +766,21 @@ describe("pipelineFlag", () => {
     expect(pipelineFlag([])).toBeUndefined();
   });
 });
+
+// The served HTML carries the pipeline default in a meta tag. If the placeholder
+// is ever renamed or dropped, the raw `__AD_PIPELINE_DEFAULT__` ships and the
+// client's `=== "true"` read silently forces the New-task checkbox OFF on a daemon
+// configured ON — a fail-quiet with no error anywhere.
+describe("dashboard pipeline-default injection", () => {
+  test("the placeholder is substituted, and matches config", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const srv = startServer();
+    try {
+      const res = await fetch(`http://127.0.0.1:${srv.port}/`, { headers: { host: "127.0.0.1" } });
+      const html = await res.text();
+      expect(html).not.toContain("__AD_PIPELINE_DEFAULT__");
+      expect(html).toContain(`content="${config.pipelineDefault ? "true" : "false"}"`);
+    } finally { srv.stop(true); }
+  });
+});

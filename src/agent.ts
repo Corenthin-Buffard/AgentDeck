@@ -223,11 +223,11 @@ function retire(taskId: string, child: ChildProcess): Promise<void> {
  */
 export function killExisting(taskId: string): Promise<void> {
   bumpGen(taskId);                       // invalidate any replacement still waiting
-  // The task is leaving its current step (stop, delete, or a replacement turn), so
-  // its retry budget goes with it. taskIds are never reused, so without this the
-  // Map grows for the daemon's lifetime and a stopped-then-resumed task inherits a
-  // spent budget.
-  stepRetries.delete(taskId);
+  // NOTE: the retry budget is deliberately NOT cleared here. killExisting runs on
+  // every step transition (scheduleAfterExit), so clearing it made retryStep reset
+  // its own bound on each retry — a step that always fails respawned `claude`
+  // forever, unattended. The budget is cleared where the task actually LEAVES the
+  // pipeline: stopTask() and removeTask(), plus advancePipeline() on success.
   const cancelled = cancelQueued(taskId);
   const c = running.get(taskId);
   if (!c) {
@@ -524,7 +524,14 @@ function attach(task: Task, child: ChildProcess) {
       const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
       if (!line.trim()) continue;
       let e: any; try { e = JSON.parse(line); } catch { continue; }
-      handle(e);
+      // A throw from ONE event must not abandon the rest of the chunk. Several
+      // stream-json events usually arrive in a single read, so an exception here
+      // skipped every line after it — including the `result` that decides whether
+      // the task advances. The task then sat in `running` until its child closed
+      // and the terminal handler called it "exited mid-run", which is a lie: the
+      // agent finished fine, the supervisor dropped the event.
+      try { handle(e); }
+      catch (err) { log("log", `stream handler failed on a ${e?.type ?? "?"} event: ${(err as Error).message}`); }
     }
   });
 
@@ -859,7 +866,22 @@ const stepRetries = new Map<string, number>();
 function runStep(task: Task, index: number): void {
   const steps = loadSteps();
   const step = steps[index];
-  if (!step) return;
+  if (!step) {
+    // The stored step index is past the end of the table — an operator shrank
+    // pipeline-steps.md under a task already in flight. Returning silently here
+    // parked the task in `running` with no child, no error and nothing to see.
+    store.patchTask(task.id, { status: "error", error: `step ${index + 1} is past the end of the ${steps.length}-step table — the step table changed under a running task`, lastActivity: Date.now() });
+    emitUpdate(task.id);
+    return;
+  }
+  // Record WHAT this task is running, once. Per turn it would evict the real
+  // tool/phase/text events from the 200-row window the drawer reads.
+  if (index === 0) {
+    store.addEvent({
+      taskId: task.id, ts: Date.now(), kind: "log",
+      data: "pipeline: " + steps.map((s, i) => `${i + 1}. ${s.phase}${s.skill ? ` /${s.skill}` : ""}`).join("  "),
+    });
+  }
   // Log the phase only when it actually CHANGES. Steps 6 and 7 are both `ship`, and
   // a retry re-runs the same step, so an unconditional write filled the drawer with
   // duplicate rows that read as progress.
@@ -923,5 +945,8 @@ export function stopTask(taskId: string): void {
   emitUpdate(taskId);
   if (cancelled) pump();
 }
+
+/** Drop per-task in-memory state when the task itself goes away. */
+export function forgetTask(taskId: string): void { stepRetries.delete(taskId); }
 
 export function isRunning(taskId: string): boolean { return running.has(taskId); }
