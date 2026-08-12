@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.5.0] - 2026-08-12
 
 ### Added
 - **The daemon now drives the gstack pipeline instead of hoping the agent does.** Tick *Follow the
@@ -44,6 +44,19 @@
   handled too; skill names are normalised; `/autoplan` joins the map; and `/canary` moves from `qa`
   to `ship`, because as `qa` it arrived after `/ship` and was swallowed by the forward-only merge.
 
+- **A permanently-failing pipeline step respawned agents forever.** `retryStep` set its
+  budget and then advanced through `killExisting`, which clears per-task state on every step
+  transition — so each retry wiped its own bound. Caught by the first integration test that
+  ever drove the state machine: nine spawns instead of three. The budget is now cleared where
+  a task actually leaves the pipeline, not where it merely changes step.
+- **One malformed event no longer strands a task.** Several stream-json events arrive in a
+  single read, and a throw while handling one abandoned every remaining line in that chunk —
+  including the `result` that decides whether the task advances. The task then sat in
+  `running` until its child closed and was reported as "exited mid-run", which was a lie: the
+  agent had finished fine, the supervisor dropped the event.
+- **A step index past the end of the table** (an operator shrinks `pipeline-steps.md` under a
+  running task) now fails with the reason instead of parking the task in `running` with no
+  process, no error and nothing to see.
 - **The plan segment went dark the moment `/spec` wrote a file.** Phase signals now carry
   authoritative-ness per skill. `mergePhase` was strictly forward-only, so the Edit `/spec` makes
   writing its own spec file pushed the bar to `run`, and every later plan-phase skill was rejected
@@ -61,6 +74,13 @@
   a hundredfold busier. Real transitions still broadcast immediately.
 
 ### Internal
+- The step table is validated at BOOT, not on the first pipeline task, so a broken override is
+  visible at startup rather than at first use; the resolved table is recorded once per task and
+  shown in the drawer with the current step marked.
+- Six integration tests drive the real supervisor against a fake `claude` over real pipes and
+  exit codes: advance across steps in fresh sessions, the commanded skill credited while an
+  ad-hoc one is not, `STEP BLOCKED` halting instead of continuing to ship, a question parking
+  the task without advancing it, the retry bound, and a free-form task left alone.
 - `argvFor()` and `spawnAgent()` make the launch command line a value tests can assert on. It was
   assembled inline at three call sites and checked by nothing — which is exactly how a flag missing
   from all three at once survived eight releases.
@@ -68,8 +88,7 @@
   rather than coalescing at read, unlike `project`/`plan_reviews`: it records a choice made at
   creation, and a task already three steps in must not change what it is doing because the operator
   edited an env var and restarted.
-- **`VERSION` is intentionally not bumped in this entry.** A sibling branch is unmerged and would
-  claim the same number — the exact collision that moved the bump out of `/ship`. Bump once at merge.
+- 285 tests, up from 107 before this branch.
 
 ## [0.2.4.1] - 2026-08-12
 
