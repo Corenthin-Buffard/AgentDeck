@@ -1,5 +1,76 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **The daemon now drives the gstack pipeline instead of hoping the agent does.** Tick *Follow the
+  gstack pipeline* on a new task and AgentDeck runs it as a sequence — `/spec` → `/autoplan` →
+  implement → `/review` → `/qa` → `/ship` → `/canary` — one `claude -p` turn per step, advancing on
+  success. `phase` stops being archaeology and becomes something the daemon knows, because it is
+  what the daemon just asked for.
+
+  The first design injected a preamble telling the agent to follow the sequence. The plan review's
+  outside voice killed it, correctly: an instruction is unenforceable here. A turn ends when the
+  model stops, and the supervisor reads a quiet `result` as `done` — so an agent that finished
+  `/spec`, wrote a summary and stopped would have been marked complete for ever, half a pipeline in.
+
+  Each step runs in a **fresh session**. Resuming would pile seven heavy skills into one context,
+  which compacts, and a compacted agent that loses the thread simply ends its turn — which this
+  daemon reads as success. Steps hand off through gstack's on-disk artifacts instead. That handoff
+  is the design's central bet and the one thing only a real run can validate.
+
+  A question does not advance the step: answering resumes that step's session. A turn that *failed*
+  retries, bounded per step; a step that *ran* and reported it cannot proceed halts the task.
+
+  `/ship` is told not to bump `VERSION` or edit `CHANGELOG.md`. Agents work in sibling worktrees, so
+  there is no concurrent write — the collision is a *merge* conflict when the second PR lands, which
+  no lock on ship-entry can prevent. Removing the per-task bump removes the conflict.
+
+  Off by default (`AGENTDECK_PIPELINE`), so upgrading can never start opening PRs on its own. The
+  step table is overridable at `<dataDir>/pipeline-steps.md`, read lazily so a bad file degrades to
+  the built-in table with a dashboard notice rather than crash-looping the daemon.
+
+### Fixed
+- **The board had never once shown a gstack phase.** `src/agent.ts` read the skill name from
+  `input.skill` on a `content_block_start` event, but the Anthropic streaming protocol starts every
+  `tool_use` block with `input: {}` **by design** — the arguments follow as `input_json_delta`
+  fragments. Confirmed against a real capture: `content_block_start` gives
+  `{"name":"Skill","input":{}}`, and the name only materialises on the consolidated `assistant`
+  message as `{"skill":"careful"}`. So `SKILL_PHASE` never fired in production, and every phase on
+  every board came from the `Edit|Write` → `run` rule plus the terminal `done`. The CEO/Design/Eng
+  glyphs were never affected — they come from the `gstack-review-read` subprocess.
+
+  Also: an agent that types `/review` emits no `Skill` block at all, so the `SlashCommand` path is
+  handled too; skill names are normalised; `/autoplan` joins the map; and `/canary` moves from `qa`
+  to `ship`, because as `qa` it arrived after `/ship` and was swallowed by the forward-only merge.
+
+- **The plan segment went dark the moment `/spec` wrote a file.** Phase signals now carry
+  authoritative-ness per skill. `mergePhase` was strictly forward-only, so the Edit `/spec` makes
+  writing its own spec file pushed the bar to `run`, and every later plan-phase skill was rejected
+  as a regression. A skill knows which phase it is in; an edit is only guessing.
+  `investigate`/`design-review`/`browse` stay inferred, so debugging during `/ship` cannot drag the
+  bar backwards.
+
+### Changed
+- The dashboard tells three pipeline states apart: driven, free-form (muted and dashed — not
+  measuring, by choice), and *commanded but nothing happened* (amber, "pipeline did not run"). The
+  third is deliberately **not** `status: "error"`: the code may be fine, what failed is that it went
+  unreviewed, and overloading the loudest signal trains you to ignore it.
+- The per-tool-call liveness write is coalesced to one per 250ms per task. Every tool call used to
+  trigger a SQLite `UPDATE` plus a full-board re-serialisation; the pipeline makes that path roughly
+  a hundredfold busier. Real transitions still broadcast immediately.
+
+### Internal
+- `argvFor()` and `spawnAgent()` make the launch command line a value tests can assert on. It was
+  assembled inline at three call sites and checked by nothing — which is exactly how a flag missing
+  from all three at once survived eight releases.
+- `pipeline`, `step`, `step_skill_seen` and `pipeline_missed` columns. `pipeline` **backfills**
+  rather than coalescing at read, unlike `project`/`plan_reviews`: it records a choice made at
+  creation, and a task already three steps in must not change what it is doing because the operator
+  edited an env var and restarted.
+- **`VERSION` is intentionally not bumped in this entry.** A sibling branch is unmerged and would
+  claim the same number — the exact collision that moved the bump out of `/ship`. Bump once at merge.
+
 ## [0.2.4.1] - 2026-08-12
 
 ### Fixed

@@ -14,6 +14,25 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Agent supervisor / core
 
+- **Per-task WebSocket deltas** — **Priority: P4**
+  `broadcast()` (`src/server.ts`) serialises EVERY task on every update: a `SELECT *`, a
+  `JSON.parse` per row, a `JSON.stringify` of the whole board, then a send to each open browser. So
+  board cost scales with the number of tasks on screen — the same wall the DT3 density item runs
+  into at 20-40 agents. The v0.2.5 work fixed the *frequency* (liveness coalescing, one write per
+  250ms per task) because that was the amplification the pipeline introduced; deltas are the
+  structural answer for board *size*. Send the changed task rather than the whole board. Depends on
+  the coalescing landing first, so the two effects can be measured apart. (Eng review, 2026-08-12.)
+
+- **Merge-time versioning** — **Priority: P3**
+  The pipeline's `/ship` step deliberately tells the agent NOT to bump `VERSION` or edit
+  `CHANGELOG.md`: agents work in sibling worktrees, so the collision is a *merge* conflict when the
+  second PR lands, and no lock on ship-entry can prevent it. That removes the conflict but hands the
+  bump to a human on every PR — invisible debt that compounds as agent count rises. `src/cleanup.ts`
+  (v0.2.2.0) already proves a merged PR via `gh` with a head-SHA match, so the detection half exists;
+  what is missing is the bump itself and a rule for several PRs landing together. Depends on the
+  step-6 wording shipping. (Eng review, 2026-08-12.)
+
+
 - **Run agents as an unprivileged uid instead of relying on `IS_SANDBOX`** — **Priority: P2**
   `AGENTDECK_ALLOW_ROOT=true` (v0.2.4.1) lets a root daemon start agents by passing `IS_SANDBOX=1`, which lifts Claude Code's root guard. That is a workaround, not the fix: `IS_SANDBOX` is an undocumented internal (it also feeds Claude Code's own sandbox decision, its API-529 handling, and a registry-sweep gate), it can vanish in any auto-update, and the agents it enables run as root with permissions fully skipped — so the README's "blast radius is one worktree" argument stops holding. The real fix is to drop privileges for the spawned agent, which keeps the guard intact and also fixes root-owned files in worktrees.
 
