@@ -54,7 +54,11 @@
   install. It now checks `id -u` before writing the env file, and verifies with `/api/health`.
 
 ### Changed
-- **Daemon problems reach the dashboard.** All thirteen boot warnings — root, an empty project
+- **`GET /api/health`** answers liveness (`ok`, `version`, `uptimeMs`) to a plain `curl`, so probes
+  and the install runbook work unauthenticated; `uid` and the notice text that explains a failure
+  need the dashboard token, since together they describe the daemon's privilege level and on-disk
+  layout before any task exists.
+- **Daemon problems reach the dashboard.** Every boot warning — root, an empty project
   registry, a missing `gstack-review-read`, a host gate that will 403 your browser, a failed hooks
   write — go through `src/notices.ts` and surface as a banner. Warnings are dismissible; errors are
   not. They ride their own `/ws` frame rather than the task payload, which fires on every tool call.
@@ -71,13 +75,21 @@
   an escaped string can bisect an entity like `&#39;`.
 
 ### Internal
-- `src/agent.ts` gets its first tests. The supervisor's process handling had none across 107 tests,
+- Replacing an agent (every reply, and every resume) now waits for the outgoing `claude` to actually
+  exit before starting its successor. It used to send SIGTERM and spawn immediately, so for as long
+  as the old agent took to die two of them were appending to one session transcript and editing one
+  worktree — silently. The concurrency slot is likewise released when a child closes, not when the
+  signal is sent, so the cap is honest. A stubborn child is SIGKILL-ed after 5s.
+- `src/agent.ts` gets its first tests. The supervisor's process handling had none at all before this,
   which is why the ENOENT crash shipped. `test/agent-spawn.test.ts` points `config.claudeBin` at
   throwaway shell scripts, so exit codes, signals, ENOENT and a 64KiB pipe overflow are exercised
-  against real subprocesses — a mocked emitter cannot fill a pipe. 151 tests.
+  against real subprocesses — a mocked emitter cannot fill a pipe. The suite also stopped running
+  against the operator's live `~/.agentdeck/agentdeck.db`: a preload now points it at a temp dir.
 - Piping stderr moved journald backpressure from the child onto the daemon's heap, where nothing
-  bounded it. Relay writes that can't be flushed are dropped and counted; the bounded tail that feeds
-  `task.error` is unaffected, so diagnosis still works while the log is stalled.
+  bounded it. The relay now checks `process.stderr.writableLength` before writing and skips the
+  mirror once more than 1 MiB is unflushed, counting what it skipped. Checking `write()`'s return
+  value instead would have been useless: `false` is advisory and the chunk is queued either way. The
+  bounded tail that feeds `task.error` is unaffected, so diagnosis still works while the log stalls.
 - An earlier design picked "the first meaningful line" of stderr as the cause, with ANSI stripping and
   carriage-return handling. Measuring the real failure killed it: the whole message is 93 bytes, one
   line, no ANSI — and with a tty stdin Claude Code prepends a stdin warning, so the first line is the

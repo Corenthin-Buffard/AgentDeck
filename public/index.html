@@ -67,6 +67,10 @@
      text stays --text (never --err/--faint) so both themes clear the 4.5:1 floor
      on the tinted background; the border carries the meaning. */
   .notices{display:flex;flex-direction:column;gap:8px;margin-top:16px}
+  /* An author `display` beats the UA's [hidden]{display:none}, so without this
+     the container keeps its top margin and leaves a gap above the board on every
+     healthy install — which is the normal case. */
+  .notices[hidden]{display:none}
   .notice{display:flex;align-items:flex-start;gap:10px;font-size:13px;line-height:1.45;padding:11px 13px;border-radius:8px;border:1px solid var(--wait);background:var(--wait-bg);color:var(--text)}
   .notice.error{border-color:var(--err);background:var(--err-bg)}
   .notice .ico{flex:none;font-family:var(--mono);font-weight:700;color:var(--wait);line-height:1.45}
@@ -240,6 +244,11 @@
 
 <script>
 const PHASES=["plan","run","review","qa","ship","done"];
+// Display caps for task.error and event rows. The daemon already caps task.error at
+// 300 chars (STDERR_ERROR_MAX in src/agent.ts), so ERR_CARD sits under that budget
+// and the drawer shows the untruncated value; EV_STDERR is roomier than EV_DEFAULT
+// because a stderr row IS the crash.
+const ERR_CARD_MAX=140, EV_STDERR_MAX=800, EV_DEFAULT_MAX=120;
 // Branch mark. Drawn, not typed: the previous U+2442 character depends on a font
 // that most systems don't ship, so it degraded to an empty box next to every
 // branch name. Inherits currentColor, so it follows .branch in both themes.
@@ -322,7 +331,9 @@ function setNotices(list){notices=Array.isArray(list)?list:[];renderNotices();}
 // Also fetched on load, so the banner survives a refused /ws handshake — which
 // is exactly the moment you most want to read it.
 async function loadNotices(){
-  try{const d=await fetch("/api/health").then(r=>r.json());setNotices(d.notices);}
+  // Token-gated half of /api/health: uid + the notice messages. Without the header
+  // we would get liveness only and the banner would stay empty.
+  try{const d=await fetch("/api/health",{headers:authHeaders()}).then(r=>r.json());setNotices(d.notices);}
   catch{ /* daemon unreachable: the connection indicator already says so */ }
 }
 // One-line preview of a prose question for the agent row: prefer the last line
@@ -377,7 +388,7 @@ function rowHtml(t){
         <span class="chip ${t.status}">${t.status==="waiting"?"Waiting for user":t.status}</span>
         ${currentProject==="all"?`<span class="proj">▸ ${esc(projLabel(t.project))}</span>`:""}</div>
       <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span>
-        <span>${esc(t.id)}</span>${t.error?`<span class="errtxt" title="${esc(t.error)}">${esc(t.error.slice(0,140))}</span>`:""}</div>
+        <span>${esc(t.id)}</span>${t.error?`<span class="errtxt" title="${esc(t.error)}">${esc(t.error.slice(0,ERR_CARD_MAX))}</span>`:""}</div>
       ${t.status==="waiting"&&t.pendingQuestion?`<div class="qprev">${esc(preview(t.pendingQuestion))}</div>`:""}
       ${phaseBar(t)}
     </div>
@@ -589,7 +600,7 @@ async function openTask(id){
   // Slice BEFORE esc, never after — truncating escaped text can cut `&#39;` in half.
   const evLine=(e)=>{
     // stderr rows are the crash itself, so give them room; the rest stay terse.
-    const cap=e.kind==="stderr"?800:120;
+    const cap=e.kind==="stderr"?EV_STDERR_MAX:EV_DEFAULT_MAX;
     return `${new Date(e.ts).toLocaleTimeString()} · ${esc(e.kind)} · ${esc(String(e.data).slice(0,cap))}`;
   };
   showDrawer(`<h2>${esc(t.title)}</h2>
@@ -599,8 +610,8 @@ async function openTask(id){
     <label class="lbl">Recent events</label>
     <div class="q">${ev.events.slice(-40).map(evLine).join("\n")||"(none)"}</div>
     <div style="display:flex;gap:8px">
-      <button class="btn ghost" onclick="stop('${esc(id)}')">Pause</button>
-      <button class="btn danger" onclick="del('${esc(id)}')">Delete</button></div>`);
+      <button class="btn ghost" data-id="${esc(id)}" onclick="stop(this.dataset.id)">Pause</button>
+      <button class="btn danger" data-id="${esc(id)}" onclick="del(this.dataset.id)">Delete</button></div>`);
 }
 async function stop(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST",headers:authHeaders()});closeDrawer();}
 async function del(id){

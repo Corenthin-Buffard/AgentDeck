@@ -23,10 +23,19 @@ const list: BootNotice[] = [];
 const seen = new Set<string>();
 let truncated = false;
 
-/** Called with each new notice so the server can push it to open dashboards.
- *  Set by server.ts; unset in tests and before startServer(). */
-let onAdd: ((n: BootNotice) => void) | null = null;
-export function setNoticeListener(fn: ((n: BootNotice) => void) | null): void { onAdd = fn; }
+/**
+ * Called whenever the notice list CHANGES — added or retracted — so the server can
+ * push the current set to open dashboards. Deliberately takes no argument: the one
+ * consumer re-serialises the whole list anyway, and a per-notice payload would have
+ * forced a retraction to invent a fake notice to announce itself.
+ */
+let onChange: (() => void) | null = null;
+export function setNoticeListener(fn: (() => void) | null): void { onChange = fn; }
+
+/** Fire the change listener without ever letting it break the caller. */
+function announceChange(): void {
+  try { onChange?.(); } catch { /* a broken listener is not worth the daemon */ }
+}
 
 /**
  * Record a notice AND log it, so journald output is unchanged in substance:
@@ -45,10 +54,24 @@ export function notice(level: NoticeLevel, code: string, message: string): void 
     seen.add(code);
     const n: BootNotice = { level, code, message };
     list.push(n);
-    // Broadcast AFTER the push so a listener that reads notices() sees this one.
-    // Guarded: a throwing listener must not turn a warning into a crash.
-    try { onAdd?.(n); } catch { /* a broken listener is not worth the daemon */ }
+    // Announce AFTER the push, so a listener that reads notices() sees this one.
+    announceChange();
   } catch { /* console gone (detached service) — the daemon still boots */ }
+}
+
+/**
+ * Retract a notice by code. Without this the list is append-only, so a condition
+ * that RESOLVES at runtime keeps its banner and keeps /api/health at ok:false
+ * until the process restarts — a stale notice contradicting reality, which is the
+ * exact failure this module exists to prevent. Returns true if one was removed.
+ */
+export function clearNotice(code: string): boolean {
+  const i = list.findIndex((n) => n.code === code);
+  if (i === -1) return false;
+  list.splice(i, 1);
+  seen.delete(code); // the condition may legitimately recur
+  announceChange();
+  return true;
 }
 
 /** Snapshot for the API and the websocket. Entries are copied too, not just the
@@ -67,5 +90,7 @@ export function resetNotices(): void {
   list.length = 0;
   seen.clear();
   truncated = false;
-  onAdd = null;
+  // Deliberately does NOT clear the listener: a test file cleaning up its own
+  // notices must not silently disarm a server another file started. Use
+  // setNoticeListener(null) for that.
 }

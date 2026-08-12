@@ -24,7 +24,7 @@ const USAGE = `AgentDeck ${pkg.version} — self-hosted orchestrator for paralle
   agentdeck --version    print the version and exit
   agentdeck --help       print this and exit
 
-Configured entirely by environment (systemd: EnvironmentFile=):
+Common settings (environment; systemd: EnvironmentFile=). Full list in the README:
 
   AGENTDECK_TARGET_REPO      repo to work on when there's no projects.json
   AGENTDECK_DATA_DIR         state dir (default ~/.agentdeck)
@@ -41,18 +41,33 @@ Configured entirely by environment (systemd: EnvironmentFile=):
                              running the daemon as an unprivileged user.
   AGENTDECK_PERMISSION_MODE  used only when SKIP_PERMISSIONS=false (default acceptEdits)
   AGENTDECK_CLAUDE_ARGS      extra flags passed to every agent (--model, --add-dir, …)
+  AGENTDECK_REVIEW_READ_BIN  path to gstack-review-read (default: resolved from PATH).
+                             Named by the [plan-reviews] boot notice when it's missing.
+  AGENTDECK_WORKTREES        worktree dir (default <dataDir>/worktrees)
+  AGENTDECK_UPLOADS          upload dir (default <dataDir>/uploads)
   AGENTDECK_AUTO_CLEAN_MERGED  "true" to drop merged done tasks periodically
   AGENTDECK_HOOKS            "true" to wire the Notification/PreToolUse hooks
   AGENTDECK_TG_TOKEN + AGENTDECK_TG_CHAT   Telegram notifications
   AGENTDECK_SLACK_WEBHOOK    Slack notifications
 
-Health: GET /api/health reports {ok, version, uid, notices} — ok is false when a
-config problem means tasks cannot run. Use it to verify an install.`;
+Health: GET /api/health reports ok, version and uptime to anyone (use it to verify an
+install). Send x-agentdeck-token to also get uid and the notice detail explaining WHY
+ok is false.`;
+
+const unknownFlag = argv.find((a) => a.startsWith("-") && !["--version", "-v", "--help", "-h"].includes(a));
 
 if (has("--version", "-v")) {
   console.log(pkg.version);
 } else if (has("--help", "-h")) {
   console.log(USAGE);
+} else if (unknownFlag) {
+  // Refuse rather than boot. Matching was exact-string only, so `-V`, `--Version`,
+  // `--version=1` or any typo fell straight through to the daemon: someone probing
+  // an unfamiliar binary for its version would mint a token, bind the port and
+  // resume a fleet of agents by mistyping one character.
+  console.error(`agentdeck: unknown option '${unknownFlag}'\n`);
+  console.error(USAGE);
+  process.exit(2);
 } else {
   // Dynamic: this is the first thing that pulls in config.ts and its side effects.
   await import("./daemon.ts");

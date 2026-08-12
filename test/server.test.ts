@@ -515,7 +515,9 @@ describe("daemon notices", () => {
     const { notice, resetNotices } = await import("../src/notices.ts");
     const server = startServer();
     try {
-      const j = await (await fetch(`http://127.0.0.1:${server.port}/api/health`)).json();
+      const j = await (await fetch(`http://127.0.0.1:${server.port}/api/health`, {
+        headers: { "x-agentdeck-token": config.dashboardToken },
+      })).json();
       expect(typeof j.version).toBe("string");
       expect(j.version).toMatch(/^\d+\.\d+\.\d+/);
       expect(Array.isArray(j.notices)).toBe(true);
@@ -542,10 +544,19 @@ describe("daemon notices", () => {
     try {
       resetNotices();
       notice("warn", "test-warn", "degraded but running");
+      // `ok` is in the OPEN half: a probe must be able to read it with a bare curl.
       expect((await (await fetch(`${base}/api/health`)).json()).ok).toBe(true);
 
       notice("error", "test-error", "nothing can run");
-      expect((await (await fetch(`${base}/api/health`)).json()).ok).toBe(false);
+      const open = await (await fetch(`${base}/api/health`)).json();
+      expect(open.ok).toBe(false);
+      expect(open.uid).toBeUndefined();       // detail withheld without the token
+      expect(open.notices).toBeUndefined();
+
+      const detail = await (await fetch(`${base}/api/health`, {
+        headers: { "x-agentdeck-token": config.dashboardToken },
+      })).json();
+      expect(detail.notices.some((n: any) => n.code === "test-error")).toBe(true);
     } finally {
       resetNotices();
       server.stop(true);
@@ -561,8 +572,15 @@ describe("daemon notices", () => {
     try {
       const frames: any[] = [];
       const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, ["agentdeck.v1", config.dashboardToken]);
-      ws.onmessage = (m) => { try { frames.push(JSON.parse(String(m.data))); } catch { /* ignore */ } };
-      await new Promise((r) => setTimeout(r, 400));
+      // Await the frames themselves, not the clock: a fixed sleep fails on a loaded
+      // runner with "expected true, got false" and no hint that timing was the cause.
+      const got = new Promise<void>((resolve) => {
+        ws.onmessage = (m) => {
+          try { frames.push(JSON.parse(String(m.data))); } catch { /* ignore */ }
+          if (frames.some((f) => f.type === "notices") && frames.some((f) => f.type === "tasks")) resolve();
+        };
+      });
+      await Promise.race([got, new Promise((_, rej) => setTimeout(() => rej(new Error(`only got: ${frames.map((f) => f.type).join(",") || "nothing"}`)), 10000))]);
       ws.close();
       expect(frames.some((f) => f.type === "notices" && Array.isArray(f.notices))).toBe(true);
       expect(frames.some((f) => f.type === "tasks" && Array.isArray(f.tasks))).toBe(true);
@@ -620,3 +638,88 @@ describe("daemon notices", () => {
     }
   });
 });
+
+// The systemd unit the README tells operators to write pins RestartPreventExitStatus
+// to this number. Nothing else couples them, so a change here would silently turn a
+// clean "port already in use" stop into a restart loop against a port that stays busy.
+test("EXIT_CONFIG matches the RestartPreventExitStatus the README documents", async () => {
+  const { EXIT_CONFIG } = await import("../src/server.ts");
+  expect(EXIT_CONFIG).toBe(78);
+  const readme = await Bun.file("README.md").text();
+  expect(readme).toContain(`RestartPreventExitStatus=${EXIT_CONFIG}`);
+});
+
+// The listener is the whole point of the runtime-notice path (agent.ts retracting
+// the root-bypass claim). Before this, deleting the setNoticeListener line in
+// startServer() left the entire suite green — the operator would simply never see
+// a runtime notice without reloading the page.
+test("a notice raised while a dashboard is open is pushed over /ws", async () => {
+  config.port = 0;
+  const { startServer } = await import("../src/server.ts");
+  const { notice, clearNotice, resetNotices, setNoticeListener } = await import("../src/notices.ts");
+  const server = startServer();
+  try {
+    const frames: any[] = [];
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, ["agentdeck.v1", config.dashboardToken]);
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = () => resolve();
+      ws.onerror = () => reject(new Error("ws failed to open"));
+    });
+    const pushed = new Promise<void>((resolve) => {
+      ws.onmessage = (m) => {
+        try {
+          const d = JSON.parse(String(m.data));
+          if (d.type === "notices" && d.notices.some((n: any) => n.code === "runtime-push-test")) resolve();
+        } catch { /* ignore */ }
+      };
+    });
+    notice("error", "runtime-push-test", "raised after the socket was already open");
+    await Promise.race([pushed, new Promise((_, rej) => setTimeout(() => rej(new Error("no runtime notice frame arrived")), 10000))]);
+    ws.close();
+  } finally {
+    clearNotice("runtime-push-test");
+    resetNotices();
+    setNoticeListener(null);
+    server.stop(true);
+  }
+}, 20000);
+
+// The invariant this entry point exists for: argv is answered BEFORE the dynamic
+// import pulls in config.ts's module-scope mkdir and dashboard-token mint. CI
+// checks it only for --version, only on the compiled linux-x64 artifact.
+describe("src/main.ts entry", () => {
+  const run = (args: string[]) => {
+    const home = mkdtempSync(join(tmpdir(), "agentdeck-main-"));
+    try {
+      const r = Bun.spawnSync(["bun", "run", "src/main.ts", ...args], {
+        env: { ...process.env, HOME: home, AGENTDECK_DATA_DIR: join(home, ".agentdeck") },
+      });
+      return { ...r, out: r.stdout.toString(), err: r.stderr.toString(), touchedDisk: existsSync(join(home, ".agentdeck")) };
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  };
+
+  test("--version prints the version and touches no disk", () => {
+    const r = run(["--version"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.out.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    expect(r.touchedDisk).toBe(false);
+  });
+
+  test("--help prints the usage and touches no disk", () => {
+    const r = run(["--help"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.out).toContain("AGENTDECK_ALLOW_ROOT");
+    expect(r.touchedDisk).toBe(false);
+  });
+
+  test("an unknown flag is refused rather than booting a daemon", () => {
+    // `-V`, `--Version`, `--version=1` and any typo used to fall through to the
+    // full boot: mint a token, bind the port, resume every in-flight agent.
+    for (const bad of ["-V", "--Version", "--version=1", "--nope"]) {
+      const r = run([bad]);
+      expect(r.exitCode).toBe(2);
+      expect(r.err).toContain("unknown option");
+      expect(r.touchedDisk).toBe(false);
+    }
+  });
+}, 30000);

@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { emitUpdate } from "./bus.ts";
-import { notice } from "./notices.ts";
+import { clearNotice, notice } from "./notices.ts";
 import { notify } from "./notify.ts";
 import { phaseFromSignal, mergePhase, canStillReview } from "./phase.ts";
 import { looksLikeQuestion } from "./detect.ts";
@@ -169,15 +169,75 @@ function cancelQueued(taskId: string): number {
   return n;
 }
 
-// One live child per task, WHETHER OR NOT it has spawned yet. A resume/answer
-// while a child is still alive (e.g. a Notification-driven `waiting` fires
-// mid-turn) must NOT spawn a second `claude --resume` on the same session — kill
-// the old one first. Removing it from `running` here means its exit handler
-// (identity-guarded) becomes a no-op.
-export function killExisting(taskId: string): void {
-  cancelQueued(taskId);
+// Children that were superseded and are on their way out. Marked rather than
+// forgotten, so their terminal handler still frees the concurrency slot and pumps
+// the queue, but does NOT touch the task's status — the replacement owns that now.
+const supersededChildren = new WeakSet<ChildProcess>();
+const dying = new Map<string, Promise<void>>();
+// A child that ignores SIGTERM (mid tool-call, blocked syscall) must not hold a
+// replacement forever. Escalate, then proceed regardless.
+const SIGKILL_AFTER_MS = 5000;
+
+// Launch generation per task. Every kill invalidates any replacement that was
+// waiting on an earlier one, so two answers in quick succession spawn once, not
+// twice, and a stop or delete cancels a replacement that hasn't spawned yet.
+const launchGen = new Map<string, number>();
+function bumpGen(taskId: string): number {
+  const g = (launchGen.get(taskId) ?? 0) + 1;
+  launchGen.set(taskId, g);
+  return g;
+}
+
+/** SIGTERM a child and resolve once it is actually gone (or SIGKILL-ed). */
+function retire(taskId: string, child: ChildProcess): Promise<void> {
+  const inFlight = dying.get(taskId);
+  if (inFlight) return inFlight;
+  const p = new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { finish(); } }, SIGKILL_AFTER_MS);
+    timer.unref?.(); // never hold the process open just to wait on a corpse
+    child.once("close", finish);
+    child.once("error", finish);
+    try { child.kill("SIGTERM"); } catch { finish(); } // already dead
+  });
+  dying.set(taskId, p);
+  void p.then(() => { if (dying.get(taskId) === p) dying.delete(taskId); });
+  return p;
+}
+
+/**
+ * Retire the task's current agent, whether it has spawned yet or not, and resolve
+ * once it is GONE.
+ *
+ * Awaiting the exit is the point. It used to SIGTERM and return in the same tick,
+ * so the replacement spawned while the old `claude` was still alive — two agents
+ * appending to one session transcript and editing one worktree for however long
+ * the old one took to die. Nothing errored; the transcript and the worktree simply
+ * disagreed with themselves. The concurrency slot is likewise released when the
+ * child actually closes, not when the signal is sent, so the cap stays honest.
+ */
+export function killExisting(taskId: string): Promise<void> {
+  bumpGen(taskId);                       // invalidate any replacement still waiting
+  const cancelled = cancelQueued(taskId);
   const c = running.get(taskId);
-  if (c) { running.delete(taskId); try { c.kill("SIGTERM"); } catch { /* already gone */ } }
+  if (!c) {
+    // Nothing live, but a cancelled queue entry still freed intent — let the queue move.
+    if (cancelled) pump();
+    return Promise.resolve();
+  }
+  supersededChildren.add(c);
+  return retire(taskId, c);
+}
+
+/** Schedule `spawnFn` once the outgoing agent is gone, unless a newer kill wins. */
+function scheduleAfterExit(taskId: string, spawnFn: () => void): void {
+  const gone = killExisting(taskId);
+  const gen = launchGen.get(taskId);
+  void gone.then(() => {
+    if (launchGen.get(taskId) !== gen) return; // a newer answer/stop/delete superseded us
+    schedule(taskId, spawnFn);
+  });
 }
 
 // ── A1b (proven): the launch config that lets an agent run gstack headlessly ──
@@ -225,12 +285,32 @@ function spawnOpts(cwd: string): SpawnOptions {
   };
 }
 
-// How much of a dead agent's stderr we keep. TAIL_MAX matches the 2000-char cap
-// used for `text` events below, so no single event row is an outlier. ERROR_MAX is
-// the task.error budget — enough for the whole of a real failure (the root refusal
-// is 93 bytes) without turning a card into a wall.
-const STDERR_TAIL_MAX = 2000;
+// How much of a dead agent's stderr we keep. STDERR_ERROR_MAX is the task.error
+// budget — enough for the whole of a real failure (the root refusal is 93 bytes)
+// without turning a card into a wall.
+// One cap for every event row we persist, so no single row is an outlier and the
+// coupling is enforced rather than asserted in a comment. Used by the stderr tail
+// and by the `text` event below.
+export const EVENT_TEXT_MAX = 2000;
+const STDERR_TAIL_MAX = EVENT_TEXT_MAX;
 const STDERR_ERROR_MAX = 300;
+// How much unflushed relay we tolerate on our OWN stderr before we stop mirroring
+// a chatty agent. Only reachable when the log sink (journald) has stalled; 1 MiB
+// is generous for a transient hiccup and small enough that four agents hitting it
+// at once can't matter.
+const STDERR_RELAY_MAX_QUEUE = 1 << 20;
+
+/**
+ * Should we mirror this chunk to our own stderr?
+ *
+ * PURE + exported so the rule is testable against the SHIPPED code. The first
+ * implementation keyed on `process.stderr.write()` returning false, which drops
+ * nothing — `false` is an advisory "past the high-water mark" and the chunk is
+ * queued either way. Only the already-queued length can bound the heap.
+ */
+export function shouldRelay(queuedBytes: number, max = STDERR_RELAY_MAX_QUEUE): boolean {
+  return queuedBytes <= max;
+}
 
 /**
  * Bounded stderr accumulator. PURE (no I/O, no timers) + exported so eviction and
@@ -269,10 +349,40 @@ export function exitReason(code: number | null, signal: NodeJS.Signals | null): 
   return signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
 }
 
+/**
+ * Strip secrets out of captured stderr before it is persisted.
+ *
+ * This matters BECAUSE of the capture: stderr used to be `inherit`, so it reached
+ * journald and nothing else. It now lands in `task.error` and the events table,
+ * both of which are served by GET reads that carry no dashboard token (only the
+ * Host gate). An agent inherits the daemon's environment and can read the 0600
+ * agent-settings.json, whose hook URLs embed the hook token as `?token=…` — so a
+ * single failed hook POST echoing its URL would publish that token to any reader.
+ *
+ * PURE + exported so the redaction is testable without spawning. Secrets are
+ * passed in rather than read from `config` so a test can't be fooled by ordering.
+ */
+export function scrubSecrets(text: string, secrets: Array<string | undefined>): string {
+  let out = text;
+  for (const s of secrets) {
+    // Guard against short/empty values: a 1-char "secret" would redact everything.
+    if (!s || s.length < 8) continue;
+    out = out.split(s).join("[redacted]");
+  }
+  // Belt and braces for anything token-shaped we didn't know to look for.
+  return out.replace(/([?&](?:token|api[-_]?key|secret)=)[^&\s"']+/gi, "$1[redacted]");
+}
+
 // Claude Code's root refusal, matched loosely on purpose. Anchoring on the exact
 // English sentence would be brittle in exactly the scenario this detects: whatever
 // upstream change removes IS_SANDBOX can also reword the message.
 const ROOT_REFUSAL = /root\/sudo privileges/i;
+
+/** A task whose currently-registered child dying should mark it failed. Both
+ *  terminal handlers use this: 'exit' had an allowlist and 'error' a denylist for
+ *  the same decision, so a new Status had to be remembered in two shapes and a
+ *  `waiting` task was treated differently depending on which handler fired. */
+const isLive = (s: Status): boolean => s === "running" || s === "resuming";
 
 /**
  * The bypass must never be able to lie. IS_SANDBOX is an undocumented Claude Code
@@ -283,7 +393,9 @@ const ROOT_REFUSAL = /root\/sudo privileges/i;
  * failing tasks add exactly one.
  */
 function checkRootBypassStillWorks(stderr: string): void {
-  if (!config.allowRoot || !ROOT_REFUSAL.test(stderr)) return;
+  // uid guard: without it, a NON-root daemon that merely inherits ALLOW_ROOT from a
+  // shared EnvironmentFile would publish a flatly false "no task can start".
+  if (process.getuid?.() !== 0 || !config.allowRoot || !ROOT_REFUSAL.test(stderr)) return;
   notice("error", "root-bypass-failed",
     "AGENTDECK_ALLOW_ROOT is set, but Claude Code still refused --dangerously-skip-permissions as root — the IS_SANDBOX escape hatch this relies on is undocumented and appears to have been removed upstream. No task can start. Run the daemon as an unprivileged user, or set AGENTDECK_SKIP_PERMISSIONS=false (agents run, gstack skills won't resolve).");
 }
@@ -319,6 +431,10 @@ function attach(task: Task, child: ChildProcess) {
   let text = "";
   const err = createStderrTail();
   let droppedStderr = 0;
+  // Did this child ever get far enough to report a session? A launch the root
+  // guard refused never does. Used to keep agent prose from impersonating a
+  // daemon-level failure — see captureStderr.
+  let sawInit = false;
   const now = () => Date.now();
 
   const patch = (p: Partial<Task>) => { store.patchTask(task.id, { ...p, lastActivity: now() }); emitUpdate(task.id); };
@@ -351,11 +467,18 @@ function attach(task: Task, child: ChildProcess) {
   // into this process: under systemd our stderr is a socket, which Node writes to
   // asynchronously and buffers without limit. Four chatty agents plus a stuck
   // journald would grow the heap of the one process that owns every running agent.
-  // Dropping relay bytes costs nothing that matters — the bounded tail below still
-  // has the diagnosis.
+  //
+  // Check writableLength BEFORE writing. Reacting to write()'s return value does
+  // NOT work: `false` is an advisory "you're past the high-water mark", and the
+  // chunk is queued either way — so treating it as a drop bounds nothing and
+  // miscounts. Skipping the write is the only thing that actually caps the heap,
+  // and it costs nothing that matters: the bounded tail below still has the
+  // diagnosis, and journald is only missing bytes while it is already stalled.
   child.stderr?.on("data", (d: Buffer) => {
-    try { if (!process.stderr.write(d)) droppedStderr += d.length; }
-    catch { droppedStderr += d.length; } // our own stderr is gone; keep observing
+    try {
+      if (shouldRelay(process.stderr.writableLength ?? 0)) process.stderr.write(d);
+      else droppedStderr += d.length;
+    } catch { droppedStderr += d.length; } // our own stderr is gone; keep observing
     err.push(d.toString());
   });
   // A dead pipe (EPIPE on a killed child) must not surface as an unhandled 'error'
@@ -372,32 +495,49 @@ function attach(task: Task, child: ChildProcess) {
    * entry, a child that fires BOTH 'error' and 'exit' (Node promises neither way)
    * is handled exactly once. The guard doubles as once-semantics.
    */
-  const claim = (): boolean => {
-    if (running.get(task.id) !== child) return false;
-    running.delete(task.id);
-    return true;
+  const release = (): { held: boolean; owns: boolean } => {
+    const held = running.get(task.id) === child;
+    if (held) running.delete(task.id);
+    // A superseded child still gives its slot back, but the replacement owns the
+    // task's status — otherwise the outgoing agent would mark it error under the
+    // incoming one's feet.
+    return { held, owns: held && !supersededChildren.has(child) };
   };
 
-  /** Record what the child said before it died, and hand back the one-line excerpt. */
-  const captureStderr = (): string => {
-    const tail = err.tail();
-    if (tail) log("stderr", droppedStderr ? `${tail}\n… (${droppedStderr} more bytes dropped while the log was stalled)` : tail);
-    checkRootBypassStillWorks(tail);
-    return err.excerpt();
+  /** Record what the child said before it died, and hand back the one-line excerpt.
+   *  Everything persisted here is readable over ungated GET reads, so it is
+   *  scrubbed first — see scrubSecrets. */
+  const captureStderr = (code: number | null, signal: NodeJS.Signals | null): string => {
+    const raw = err.tail();
+    const tail = scrubSecrets(raw, [config.dashboardToken, config.hookToken]);
+    if (tail) log("stderr", droppedStderr ? `${tail}\n… (${droppedStderr} more bytes dropped while our log was stalled)` : tail);
+    // Only a child that died BEFORE reaching the init event can be evidence that
+    // the root guard refused the launch. Without that condition, an agent merely
+    // printing the phrase — reviewing this repo, say, where it appears in the
+    // README and the CHANGELOG — would raise an undismissable daemon-wide error.
+    if (!sawInit && !signal && code !== 0) checkRootBypassStillWorks(raw);
+    return scrubSecrets(err.excerpt(), [config.dashboardToken, config.hookToken]);
   };
 
-  child.on("exit", (code, signal) => {
-    if (!claim()) return;
+  // "close", not "exit". 'exit' fires when the child ends, while its stdio streams
+  // may still hold buffered data — so reading the stderr tail there can truncate
+  // the very message we captured it for, and `sawInit` can be read before the
+  // stdout handler that sets it has run. 'close' is emitted only once the stdio
+  // streams are closed, and carries the same (code, signal).
+  child.on("close", (code, signal) => {
+    const { held, owns } = release();
+    if (!held) { pump(); return; }   // already released; still let the queue move
+    if (!owns) { pump(); return; }   // superseded: slot returned, status is not ours
     const t = store.getTask(task.id);
     // "resuming" as well as "running": a task whose `claude --resume` dies before
     // the init event never reaches "running", and used to sit in "resuming" for
     // ever with no error text. That is exactly the root-failure path for tasks the
     // A2 loop resumes at daemon restart.
-    if (t && (t.status === "running" || t.status === "resuming")) {
+    if (t && isLive(t.status)) {
       // Log the tail BEFORE the patch, so a dashboard that opens the drawer the
       // instant the error appears already has the context. Only on an abnormal
       // exit — a clean exit's warnings are journald's business.
-      const why = (signal || code !== 0) ? captureStderr() : "";
+      const why = (signal || code !== 0) ? captureStderr(code, signal) : "";
       patch({ status: "error", error: `agent exited (${exitReason(code, signal)}) mid-run${why ? `: ${why}` : ""}` });
       notify(store.getTask(task.id)!, "error");
     }
@@ -410,13 +550,14 @@ function attach(task: Task, child: ChildProcess) {
   // down, killing every other running agent with it — and under Restart=on-failure
   // plus the A2 resume loop, that is a crash loop rather than one dead process.
   child.on("error", (e: NodeJS.ErrnoException) => {
-    if (!claim()) return;
+    const { held, owns } = release();
+    if (!held || !owns) { pump(); return; }
     const why = e.code === "ENOENT"
       ? `'${config.claudeBin}' not found — set AGENTDECK_CLAUDE_BIN to its absolute path`
       : `${e.code ?? "spawn failed"}: ${e.message}`;
     log("log", `spawn failed: ${why}`);
     const t = store.getTask(task.id);
-    if (t && t.status !== "stopped") {
+    if (t && isLive(t.status)) {
       patch({ status: "error", error: `agent could not start — ${why}` });
       notify(store.getTask(task.id)!, "error");
     }
@@ -427,6 +568,11 @@ function attach(task: Task, child: ChildProcess) {
 
   function handle(e: any) {
     if (e.type === "system" && e.subtype === "init") {
+      sawInit = true; // the launch got past Claude Code's startup checks
+      // Proof that agents CAN start. Retract any standing claim to the contrary,
+      // so one bad launch can't pin /api/health to ok:false for the process
+      // lifetime while tasks are visibly running fine.
+      clearNotice("root-bypass-failed");
       patch({ sessionId: e.session_id, status: "running" });
       log("log", `session ${e.session_id}`);
       return;
@@ -462,7 +608,7 @@ function attach(task: Task, child: ChildProcess) {
       const cur = store.getTask(task.id);
       if (cur && canStillReview(cur.phase)) void refreshPlanReviews(cur);
       const finalText = (text || e.result || "").trim();
-      log("text", finalText.slice(0, 2000));
+      log("text", finalText.slice(0, EVENT_TEXT_MAX));
       if (e.subtype !== "success") {
         patch({ status: "error", error: `result: ${e.subtype}` });
         notify(store.getTask(task.id)!, "error");
@@ -470,7 +616,7 @@ function attach(task: Task, child: ChildProcess) {
         // The agent's ask sits at the END of the turn; for a long turn (a heavy
         // gstack skill) keep the TAIL, not the head, so the drawer shows the
         // actual question/decision briefs instead of the intro.
-        const shown = finalText.length > 2000 ? "…" + finalText.slice(-1999) : finalText;
+        const shown = finalText.length > EVENT_TEXT_MAX ? "…" + finalText.slice(-(EVENT_TEXT_MAX - 1)) : finalText;
         patch({ status: "waiting", pendingQuestion: shown });
         log("question", shown);
         notify(store.getTask(task.id)!, "waiting");
@@ -496,10 +642,10 @@ export function launchTask(task: Task): void {
 export function answer(taskId: string, text: string): void {
   const t = store.getTask(taskId);
   if (!t?.sessionId) throw new Error("no session id to resume");
-  killExisting(taskId); // never run two claude --resume on one session
   store.patchTask(taskId, { status: "running", pendingQuestion: null, lastActivity: Date.now() });
   emitUpdate(taskId);
-  schedule(taskId, () => {
+  // Waits for the outgoing agent to exit first — never two `claude --resume` on one session.
+  scheduleAfterExit(taskId, () => {
     const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), text], spawnOpts(t.worktree));
     attach(t, child);
   });
@@ -509,10 +655,9 @@ export function answer(taskId: string, text: string): void {
 export function resumeTask(taskId: string): void {
   const t = store.getTask(taskId);
   if (!t?.sessionId) return;
-  killExisting(taskId);
   store.patchTask(taskId, { status: "resuming", lastActivity: Date.now() });
   emitUpdate(taskId);
-  schedule(taskId, () => {
+  scheduleAfterExit(taskId, () => {
     const child = spawn(config.claudeBin, ["--resume", t.sessionId!, ...baseArgs(), "continue where you left off"], spawnOpts(t.worktree));
     attach(t, child);
   });
@@ -523,6 +668,7 @@ export function stopTask(taskId: string): void {
   // concurrency cap was marked "stopped" and then started anyway when a slot freed.
   // Not killExisting(): leaving a LIVE child in `running` lets its exit handler run
   // normally, see status "stopped", skip the error patch, and pump() the queue.
+  bumpGen(taskId);  // a replacement still waiting on a dying child must not fire
   const cancelled = cancelQueued(taskId);
   running.get(taskId)?.kill("SIGTERM");
   store.patchTask(taskId, { status: "stopped", lastActivity: Date.now() });

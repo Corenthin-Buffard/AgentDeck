@@ -123,6 +123,15 @@ function loadOrCreateDashboardToken(dir: string): string {
   }
 }
 
+/**
+ * The strict opt-in coercion, exported so it can be tested for real.
+ *
+ * `=== "true"`, deliberately NOT the `!== "false"` shape used by
+ * AGENTDECK_SKIP_PERMISSIONS: this one relaxes a security guard in someone else's
+ * binary, so anything that isn't an explicit "true" must leave it alone.
+ */
+export const isOptIn = (v: string | undefined): boolean => v === "true";
+
 export const config: AgentDeckConfig = {
   dataDir,
   // A3: bind localhost only. Reach the dashboard via SSH tunnel, not public exposure.
@@ -165,7 +174,7 @@ export const config: AgentDeckConfig = {
   // opt-in makes agents carry IS_SANDBOX=1, which lifts that guard. `=== "true"`
   // (not `!== "false"`) on purpose: relaxing someone else's security guard is
   // opt-in, so anything that isn't an explicit "true" leaves it alone.
-  allowRoot: process.env.AGENTDECK_ALLOW_ROOT === "true",
+  allowRoot: isOptIn(process.env.AGENTDECK_ALLOW_ROOT),
   permissionMode: process.env.AGENTDECK_PERMISSION_MODE ?? "acceptEdits",
   extraClaudeArgs: (process.env.AGENTDECK_CLAUDE_ARGS ?? "").split(" ").filter(Boolean),
 
@@ -209,10 +218,18 @@ export const config: AgentDeckConfig = {
  * ONE predicate, two callers on purpose — daemon.ts raises the boot notice and
  * server.ts refuses task creation. Duplicating the condition is how the banner
  * and the route drift apart and start disagreeing about whether tasks can run.
- * `uid` is injectable so it's testable without being root.
+ * The uid is a parameter so the whole matrix is testable without being root.
  */
-export function rootWillBlockAgents(uid: number | undefined = process.getuid?.()): boolean {
+export function rootBlocksAgents(uid: number | undefined): boolean {
   return uid === 0 && config.dangerouslySkipPermissions && !config.allowRoot;
+}
+
+/** The same question for THIS process. Split from the pure form above because a
+ *  default parameter cannot express "no uid": passing `undefined` explicitly
+ *  triggers the default, so the non-POSIX case was impossible to inject despite
+ *  the comment promising it was testable. */
+export function rootWillBlockAgents(): boolean {
+  return rootBlocksAgents(process.getuid?.());
 }
 
 /** The one explanation for the above, shared by the boot notice, the /api/tasks

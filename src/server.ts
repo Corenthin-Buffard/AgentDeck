@@ -12,7 +12,7 @@ import pkg from "../package.json" with { type: "json" };
 import { config, projectById, rootWillBlockAgents, ROOT_BLOCKED_MESSAGE } from "./config.ts";
 import { store } from "./db.ts";
 import { bus } from "./bus.ts";
-import { notices, setNoticeListener } from "./notices.ts";
+import { notices, noticesTruncated, setNoticeListener } from "./notices.ts";
 import { answer, stopTask } from "./agent.ts";
 import { createTask, removeTask, findBySession } from "./tasks.ts";
 import { parseDecisionBrief } from "./detect.ts";
@@ -299,12 +299,26 @@ export function startServer() {
       // isn't. A 503 here would fail `curl -fsS` probes for a non-outage.
       if (pathname === "/api/health" && req.method === "GET") {
         const list = notices();
-        return json({
+        // SPLIT payload. Liveness stays open so a plain `curl` works for the
+        // install runbook and any monitoring probe — that is what this endpoint is
+        // for. The DETAIL needs the dashboard token, because uid plus the notice
+        // messages amount to "this box runs an agent orchestrator as root, and
+        // here is where its files live", answerable before any task exists.
+        const base = {
           ok: !list.some((n) => n.level === "error"),
           version: pkg.version,
-          uid: process.getuid?.() ?? null,
           uptimeMs: Math.round(process.uptime() * 1000),
+        };
+        if (req.headers.get("x-agentdeck-token") !== config.dashboardToken) {
+          // Say that detail exists and how to get it, so a failing probe isn't a dead end.
+          return json({ ...base, detail: "send x-agentdeck-token for uid and notices" });
+        }
+        return json({
+          ...base,
+          uid: process.getuid?.() ?? null,
           notices: list,
+          // Otherwise hitting the cap drops notices with nothing to observe it by.
+          noticesTruncated: noticesTruncated(),
         });
       }
       if (pathname === "/api/projects" && req.method === "GET") {

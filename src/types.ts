@@ -71,7 +71,9 @@ export type NoticeLevel = "warn" | "error";
  *  dashboard banner and GET /api/health as well as the log. */
 export interface BootNotice {
   level: NoticeLevel;
-  code: string;    // stable, greppable bucket + the dedupe key: "root", "projects", "host-gate", "hooks", "auth", "plan-reviews", "claude-bin"
+  code: string;    // stable, greppable bucket AND the dedupe key — one notice per code.
+                   // Not enumerated here on purpose: the list grows with every new
+                   // check, so grep the notice() call sites rather than trust a comment.
   message: string; // one sentence, ending in what to DO about it
 }
 

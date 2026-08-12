@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { agentEnv, createStderrTail, exitReason } from "../src/agent.ts";
+import { agentEnv, createStderrTail, exitReason, scrubSecrets, shouldRelay } from "../src/agent.ts";
 
 // Pure helpers extracted from the supervisor so the parts that decide whether an
 // agent can start — and what the operator is told when it can't — are testable
@@ -122,5 +122,70 @@ describe("createStderrTail", () => {
     expect(t.excerpt()).toBe("");
     t.push("   \n\n  ");
     expect(t.excerpt()).toBe("");
+  });
+});
+
+describe("shouldRelay — stderr relay backpressure", () => {
+  // Regression for a bug that shipped in this very branch: the first version keyed
+  // the drop on `process.stderr.write()` returning false. That is only an advisory
+  // "past the high-water mark" — the chunk is buffered regardless — so it dropped
+  // nothing, counted bytes that WERE written, and left the heap growth it claimed
+  // to fix completely unbounded. These assert the SHIPPED predicate, so reverting
+  // agent.ts to the write()-return form turns them red.
+  test("relays while the queue is under the cap", () => {
+    expect(shouldRelay(0, 1024)).toBe(true);
+    expect(shouldRelay(1024, 1024)).toBe(true); // at the cap is still fine
+  });
+
+  test("stops relaying once the queue is over the cap", () => {
+    expect(shouldRelay(1025, 1024)).toBe(false);
+    expect(shouldRelay(50 * 1024 * 1024, 1024)).toBe(false);
+  });
+
+  test("the default cap is generous but finite", () => {
+    expect(shouldRelay(512 * 1024)).toBe(true);        // a transient hiccup relays
+    expect(shouldRelay(64 * 1024 * 1024)).toBe(false); // a wedged log sink does not
+  });
+
+  test("bounds the queue when driven like the real handler", () => {
+    // Model the shipped loop: only write when shouldRelay says so.
+    const CAP = 128;
+    let queued = 0, dropped = 0;
+    for (let i = 0; i < 100; i++) {
+      if (shouldRelay(queued, CAP)) queued += 64;  // nothing drains it
+      else dropped += 64;
+    }
+    expect(dropped).toBeGreaterThan(0);
+    expect(queued).toBeLessThanOrEqual(CAP + 64);
+  });
+});
+
+describe("scrubSecrets", () => {
+  // Captured stderr is persisted to task.error and the events table, both served
+  // by GET reads that carry no dashboard token. Agents inherit the daemon env and
+  // can read agent-settings.json, whose hook URLs embed the token as ?token=… —
+  // so one failed hook POST echoing its URL would publish it to any reader.
+  const TOKEN = "8f14e45f-ceea-467a-9c1a-2f0c1b3d4e5f";
+
+  test("redacts a known token wherever it appears", () => {
+    const out = scrubSecrets(`POST http://127.0.0.1:8787/hooks/notification?token=${TOKEN} failed`, [TOKEN]);
+    expect(out).not.toContain(TOKEN);
+    expect(out).toContain("[redacted]");
+  });
+
+  test("redacts token-shaped query params it was never told about", () => {
+    const out = scrubSecrets("GET /x?api_key=zzzUNKNOWNzzz&next=1", []);
+    expect(out).not.toContain("zzzUNKNOWNzzz");
+    expect(out).toContain("next=1"); // non-secret params survive
+  });
+
+  test("ignores short or empty secrets so it can't redact everything", () => {
+    // A 1-char "secret" would otherwise turn the whole message into [redacted].
+    expect(scrubSecrets("the agent could not start", ["a", "", undefined])).toBe("the agent could not start");
+  });
+
+  test("leaves an ordinary failure message untouched", () => {
+    const msg = "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons";
+    expect(scrubSecrets(msg, [TOKEN])).toBe(msg);
   });
 });

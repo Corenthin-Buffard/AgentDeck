@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from "node:fs";
-import { config, rootWillBlockAgents, ROOT_BLOCKED_MESSAGE } from "./config.ts";
+import { config, rootBlocksAgents, rootWillBlockAgents, ROOT_BLOCKED_MESSAGE } from "./config.ts";
 import { store } from "./db.ts";
 import { resumeTask } from "./agent.ts";
 import { startServer, isLoopbackBind } from "./server.ts";
@@ -17,6 +17,16 @@ import { notice } from "./notices.ts";
 // Everything below that detects a problem calls notice() rather than console.warn,
 // so the dashboard can show it too. Same text in the log; see notices.ts.
 
+// We now RELAY agent stderr through our own stdio (see attach() in agent.ts), so
+// a dead log reader is our problem rather than the child's. A broken pipe surfaces
+// asynchronously as an 'error' EVENT on the stream — a try/catch around write()
+// cannot see it — and with no listener that becomes an uncaughtException that
+// kills the daemon and every running agent with it. Anyone piping us (`agentdeck
+// 2>&1 | tee log`, `| logger`, a supervisor whose reader restarts) would otherwise
+// have a one-EPIPE kill switch on the whole fleet. Degrade to silence instead.
+process.stderr.on("error", () => { /* the log sink went away; keep running */ });
+process.stdout.on("error", () => { /* ditto */ });
+
 // Running as root is the one condition that makes the daemon useless rather than
 // degraded, so it's the first thing in the log. Three distinct cases:
 //   uid 0 + skip-permissions + no opt-in -> nothing can run at all (error)
@@ -24,7 +34,7 @@ import { notice } from "./notices.ts";
 //   uid 0 + permissions not skipped      -> runs, but writes root-owned files (warn)
 const uid = process.getuid?.();
 if (uid === 0) {
-  if (rootWillBlockAgents(uid)) {
+  if (rootBlocksAgents(uid)) {
     notice("error", "root", ROOT_BLOCKED_MESSAGE);
   } else if (config.allowRoot && config.dangerouslySkipPermissions) {
     // State the FACT, never a claim like "bypass active" — IS_SANDBOX is an
@@ -95,16 +105,34 @@ if (config.notificationHooks) {
   }
 }
 
+// Bind the port BEFORE anything with side effects. A second instance — or an
+// overlapping `systemctl restart` — would otherwise run the A2 resume loop first,
+// spawning `claude --resume` on sessions and worktrees the LIVE daemon owns, and
+// only then hit EADDRINUSE and exit. process.exit() does not reap spawned
+// children, so those duplicates would be orphaned: still running with permissions
+// skipped, writing into the first daemon's worktrees, invisible to both.
+startServer();
+
 // A2 durability: on (re)start, resume any task that was mid-run. Injection and
 // resume are the same operation, proven by the spike.
-for (const t of store.listTasks()) {
-  if (t.status === "running" || t.status === "resuming") {
-    console.log(`[A2] resuming ${t.id} (${t.title}) from session ${t.sessionId ?? "—"}`);
-    resumeTask(t.id);
+//
+// SKIPPED when we already know a spawn cannot succeed. Resuming into a guaranteed
+// failure is worse than not resuming: the exit handler marks each task `error`,
+// and an errored task is terminal — the loop below only picks up running/resuming,
+// and the dashboard offers it no Reply and no Resume. So one restart with an unset
+// systemd `User=` or a wrong PATH would permanently strand every in-flight agent.
+// Left as-is, they are recovered by the next restart that can actually run them.
+const canSpawn = !rootWillBlockAgents() && !!Bun.which(config.claudeBin);
+if (!canSpawn) {
+  console.warn("[A2] not resuming in-flight tasks — agents cannot start on this daemon (see the notices above). They stay recoverable; fix the cause and restart.");
+} else {
+  for (const t of store.listTasks()) {
+    if (t.status === "running" || t.status === "resuming") {
+      console.log(`[A2] resuming ${t.id} (${t.title}) from session ${t.sessionId ?? "—"}`);
+      resumeTask(t.id);
+    }
   }
 }
-
-startServer();
 
 // Opt-in: periodically drop merged done tasks (worktree + branch + row). No-op
 // unless AGENTDECK_AUTO_CLEAN_MERGED=true. Started after the server so a slow
