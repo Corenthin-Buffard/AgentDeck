@@ -133,9 +133,17 @@
      not a problem, the board simply is not measuring it. `missed` is NOT quiet:
      the pipeline was commanded and did not happen, which is the one failure that
      must never look like ordinary progress. Dashed, so it reads without color. */
+  /* Specificity matters here: `.row.waiting .seg.active .bar` (0,5,0) beats a bare
+     `.phases.missed .seg .bar` (0,3,0), so on the two row states an operator looks
+     at most the active segment kept its solid colour and the warning vanished.
+     These are written to outrank it on every row state. */
   .phases.inferred{opacity:.45}
-  .phases.inferred .seg .bar{background:repeating-linear-gradient(90deg,var(--line-soft) 0 3px,transparent 3px 6px)}
-  .phases.missed .seg .bar{background:repeating-linear-gradient(90deg,var(--wait) 0 3px,transparent 3px 6px)}
+  .row .phases.inferred .seg .bar,
+  .row.waiting .phases.inferred .seg.active .bar,
+  .row.error .phases.inferred .seg.active .bar{background:repeating-linear-gradient(90deg,var(--line-soft) 0 3px,transparent 3px 6px)}
+  .row .phases.missed .seg .bar,
+  .row.waiting .phases.missed .seg.active .bar,
+  .row.error .phases.missed .seg.active .bar{background:repeating-linear-gradient(90deg,var(--wait) 0 3px,transparent 3px 6px)}
   .pipewarn{font-family:var(--mono);font-size:9.5px;letter-spacing:.3px;color:var(--wait);margin-top:5px}
   /* Plan-review marks: a calm, monochrome CEO/Design/Eng row under the plan
      segment. Glyph SHAPE carries state (○ not-run, ✓ clean, ⚠ not-clean, trailing

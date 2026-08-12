@@ -84,7 +84,8 @@ export function phaseFromSignal(sig: { skill?: string; tool?: string; shipped?: 
   return null;
 }
 
-const ORDER: Phase[] = ["plan", "run", "review", "qa", "ship", "done"];
+/** Pipeline order, exported so the step-table parser cannot drift from it. */
+export const ORDER: Phase[] = ["plan", "run", "review", "qa", "ship", "done"];
 
 /**
  * Merge a new signal into the current phase.

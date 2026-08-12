@@ -1,4 +1,4 @@
-import { expect, test, describe } from "bun:test";
+import { afterEach, expect, test, describe } from "bun:test";
 import { argvFor, RESUME_PROMPT } from "../src/agent.ts";
 import { config } from "../src/config.ts";
 
@@ -8,6 +8,13 @@ import { config } from "../src/config.ts";
 // extracting argvFor() out of the three call sites.
 
 describe("argvFor", () => {
+  // `config` is a mutable singleton shared across suites — restore what we change.
+  const saved = { extra: config.extraClaudeArgs, skip: config.dangerouslySkipPermissions };
+  afterEach(() => {
+    config.extraClaudeArgs = saved.extra;
+    config.dangerouslySkipPermissions = saved.skip;
+  });
+
   test("a fresh launch carries no --resume", () => {
     const argv = argvFor({ prompt: "do the thing" });
     expect(argv).not.toContain("--resume");
@@ -61,20 +68,25 @@ describe("argvFor", () => {
     }
   });
 
-  test("the permission flag reflects config, and only one form is ever passed", () => {
-    const argv = argvFor({ prompt: "P" });
-    const skip = argv.includes("--dangerously-skip-permissions");
-    const mode = argv.includes("--permission-mode");
-    expect(skip || mode).toBe(true);
-    expect(skip && mode).toBe(false); // never both — they contradict each other
-    expect(skip).toBe(config.dangerouslySkipPermissions);
+  // Both of these DRIVE config rather than reading it. Asserting against the same
+  // ambient value argvFor just read passes for any value (and `config` is a mutable
+  // global other suites write to); and an `if (!configured) return` guard makes a
+  // test a silent no-op on exactly the machine that runs it — CI.
+  test("the permission flag follows the setting in BOTH directions", () => {
+    config.dangerouslySkipPermissions = true;
+    let argv = argvFor({ prompt: "P" });
+    expect(argv).toContain("--dangerously-skip-permissions");
+    expect(argv).not.toContain("--permission-mode");
+
+    config.dangerouslySkipPermissions = false;
+    argv = argvFor({ prompt: "P" });
+    expect(argv).toContain("--permission-mode");
+    expect(argv).not.toContain("--dangerously-skip-permissions"); // never both
   });
 
-  test("the operator's extra flags stay last, so they can override", () => {
-    if (!config.extraClaudeArgs.length) return; // nothing configured in this env
-    const argv = argvFor({ prompt: "P" });
-    const tail = argv.slice(-1 - config.extraClaudeArgs.length, -1);
-    expect(tail).toEqual(config.extraClaudeArgs);
+  test("the operator's extra flags land immediately before the prompt, in order", () => {
+    config.extraClaudeArgs = ["--model", "opus", "--add-dir", "/srv"];
+    expect(argvFor({ prompt: "P" }).slice(-5)).toEqual(["--model", "opus", "--add-dir", "/srv", "P"]);
   });
 
   test("the prompt is passed as one argument, never split on whitespace", () => {

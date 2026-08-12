@@ -28,13 +28,14 @@ function fakeBin(name: string, body: string): string {
   return p;
 }
 
-function makeTask(id: string): Task {
+function makeTask(id: string, pipeline = false): Task {
   const t: Task = {
     id, project: "default", title: `spawn test ${id}`, prompt: "noop",
     branch: `test/${id}`, worktree: dir, tmux: null, sessionId: null,
     status: "running", phase: "unknown", pendingQuestion: null,
     lastActivity: Date.now(), createdAt: Date.now(), error: null,
     planReviews: { ceo: null, design: null, eng: null },
+    pipeline, step: 0, stepSkillSeen: false, pipelineMissed: 0,
   };
   store.insertTask(t);
   made.push(id);

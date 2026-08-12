@@ -130,15 +130,6 @@ export function isLoopbackBind(host: string): boolean {
 }
 
 /**
- * Tasks as the dashboard sees them: the stored row, plus the decision brief
- * parsed out of a waiting agent's question so the reply drawer can offer the
- * options as buttons instead of making you retype a letter off a wall of prose.
- *
- * DERIVED, never persisted. It's a view of `pendingQuestion`, so re-parsing on
- * every send costs nothing measurable and means a parser improvement applies to
- * agents that are already waiting, with no migration and nothing to backfill.
- */
-/**
  * Read the request body's `pipeline` field, or `undefined` for "not specified"
  * (which lets createTask fall through to config.pipelineDefault).
  *
@@ -153,6 +144,15 @@ export function pipelineFlag(v: unknown): boolean | undefined {
   return typeof v === "boolean" ? v : undefined;
 }
 
+/**
+ * Tasks as the dashboard sees them: the stored row, plus the decision brief
+ * parsed out of a waiting agent's question so the reply drawer can offer the
+ * options as buttons instead of making you retype a letter off a wall of prose.
+ *
+ * DERIVED, never persisted. It's a view of `pendingQuestion`, so re-parsing on
+ * every send costs nothing measurable and means a parser improvement applies to
+ * agents that are already waiting, with no migration and nothing to backfill.
+ */
 export function withBriefs<T extends { status: string; pendingQuestion?: string | null }>(tasks: T[]) {
   return tasks.map((t) => {
     // Only a WAITING agent is asking anything. Parsing a running or done task's

@@ -157,3 +157,21 @@ describe("rootWillBlockAgents", () => {
     expect(ROOT_BLOCKED_MESSAGE).toContain("unprivileged user");
   });
 });
+
+// ── AGENTDECK_PIPELINE arms autonomous behaviour, so it is opt-IN ────────────
+// The first version used `(env ?? "false") !== "false"`, copied from
+// AGENTDECK_SKIP_PERMISSIONS — a flag that defaults ON, where that shape is
+// right. Here it inverted the guard: "0", "off", "no", "FALSE" and an empty
+// value (a bare `Environment=AGENTDECK_PIPELINE=` line) all resolved to TRUE,
+// arming a pipeline whose last steps are `git push` and opening a PR.
+describe("the pipeline opt-in", () => {
+  test("only the exact string 'true' arms it", () => {
+    expect(isOptIn("true")).toBe(true);
+  });
+
+  test("every value an operator would write to DISABLE it leaves it off", () => {
+    for (const v of [undefined, "", "0", "off", "no", "false", "FALSE", "1", "yes", "TRUE"]) {
+      expect(isOptIn(v)).toBe(false);
+    }
+  });
+});

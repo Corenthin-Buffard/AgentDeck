@@ -1,12 +1,15 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { emitUpdate } from "./bus.ts";
 import { clearNotice, notice } from "./notices.ts";
 import { notify } from "./notify.ts";
 import { phaseFromSignal, mergePhase, canStillReview, slashToSkill } from "./phase.ts";
-import { loadSteps, stepPrompt } from "./pipeline.ts";
+import {
+  loadSteps, stepPrompt, creditsStep, stepOutcome, blockedReason, nextStep, retryDecision,
+} from "./pipeline.ts";
 import { looksLikeQuestion } from "./detect.ts";
 import type { Task, Phase, Status, PlanReviews, PlanReviewState } from "./types.ts";
 
@@ -220,6 +223,11 @@ function retire(taskId: string, child: ChildProcess): Promise<void> {
  */
 export function killExisting(taskId: string): Promise<void> {
   bumpGen(taskId);                       // invalidate any replacement still waiting
+  // The task is leaving its current step (stop, delete, or a replacement turn), so
+  // its retry budget goes with it. taskIds are never reused, so without this the
+  // Map grows for the daemon's lifetime and a stopped-then-resumed task inherits a
+  // spent budget.
+  stepRetries.delete(taskId);
   const cancelled = cancelQueued(taskId);
   const c = running.get(taskId);
   if (!c) {
@@ -464,8 +472,10 @@ function attach(task: Task, child: ChildProcess) {
   const now = () => Date.now();
 
   const patch = (p: Partial<Task>) => { store.patchTask(task.id, { ...p, lastActivity: now() }); emitUpdate(task.id); };
-  // Liveness-only writes are coalesced; see shouldBumpLiveness. Any patch() above
-  // also refreshes lastActivity, so a real transition resets the window for free.
+  // Liveness-only writes are coalesced; see shouldBumpLiveness. A real transition
+  // refreshes lastActivity anyway, so a liveness write suppressed just after one
+  // costs the operator nothing. (It does NOT reset this window — patch() doesn't
+  // touch lastLiveness — which is why the wording is "costs nothing", not "resets".)
   let lastLiveness = 0;
   const bumpLiveness = () => {
     const t = now();
@@ -474,8 +484,10 @@ function attach(task: Task, child: ChildProcess) {
     patch({});
   };
   const log = (kind: any, data: string) => store.addEvent({ taskId: task.id, ts: now(), kind, data });
-  const setPhase = (next: Phase, authoritative = false) => {
-    const t = store.getTask(task.id); if (!t) return;
+  /** `pre` lets a caller that has ALREADY read the row pass it in, so a single
+   *  stream signal costs one SELECT rather than two. */
+  const setPhase = (next: Phase, authoritative = false, pre?: Task) => {
+    const t = pre ?? store.getTask(task.id); if (!t) return;
     const merged = mergePhase(t.phase, next, authoritative);
     if (merged !== t.phase) { patch({ phase: merged }); log("phase", merged); }
   };
@@ -488,11 +500,18 @@ function attach(task: Task, child: ChildProcess) {
     // the agent actually ran the skill it was told to; a step that completes
     // without one is the pipeline silently not happening.
     const t = store.getTask(task.id);
-    if (t?.pipeline) {
-      if (sig.skill && !t.stepSkillSeen) store.setStepSkillSeen(task.id, true);
+    if (!t) return;
+    if (t.pipeline) {
+      // Only the COMMANDED skill counts. Crediting any mapped skill let an agent
+      // that ran /browse during the `review` step mark the step as having happened,
+      // so pipelineMissed stayed 0 and the board reported a pipeline that did not
+      // run as ordinary progress — the exact failure this feature exists to show.
+      if (sig.skill && !t.stepSkillSeen && creditsStep(loadSteps()[t.step], sig.skill)) {
+        store.markStepSkillSeen(task.id);
+      }
       return;
     }
-    setPhase(s.phase, s.authoritative);
+    setPhase(s.phase, s.authoritative, t); // reuse the row we just read
   };
 
   // `?.` not `!`: on Bun these streams exist even for a spawn that never started,
@@ -617,9 +636,13 @@ function attach(task: Task, child: ChildProcess) {
   });
 
   /**
-   * Retry the CURRENT pipeline step after a transient failure. Returns false when
-   * the caller should mark the task failed instead — not a pipeline task, or the
-   * budget is spent.
+   * Retry the CURRENT pipeline step after a transient failure.
+   *
+   * Returns FALSE only for a non-pipeline task, where the caller must mark it
+   * failed. Returns TRUE whenever this function handled it — either a retry was
+   * scheduled, or the budget was exhausted and the error was already patched here.
+   * (An earlier version of this comment claimed the exhausted branch returned
+   * false, which would have had the caller patch and notify a second time.)
    *
    * Bounded, and the bound is per step: a step that succeeds resets it, so a long
    * pipeline cannot accumulate retries into an unbounded loop, and a step that is
@@ -630,7 +653,7 @@ function attach(task: Task, child: ChildProcess) {
     const t = store.getTask(task.id);
     if (!t?.pipeline) return false;
     const used = stepRetries.get(task.id) ?? 0;
-    if (used >= MAX_STEP_RETRIES) {
+    if (retryDecision(used, MAX_STEP_RETRIES) === "fail") {
       stepRetries.delete(task.id);
       patch({ status: "error", error: `step ${t.step + 1} failed ${used + 1}× (${why})` });
       notify(store.getTask(task.id)!, "error");
@@ -660,10 +683,10 @@ function attach(task: Task, child: ChildProcess) {
       store.bumpPipelineMissed(task.id);
       log("log", `step ${t.step + 1} finished without invoking /${finished.skill}`);
     }
-    const next = t.step + 1;
-    if (next >= steps.length) return false; // pipeline complete → caller marks done
-    store.setStep(task.id, next);
-    runStep(store.getTask(task.id)!, next);
+    const where = nextStep(t, steps);
+    if ("done" in where) return false; // pipeline complete → caller marks done
+    store.setStep(task.id, where.step);
+    runStep(store.getTask(task.id)!, where.step);
     return true;
   }
 
@@ -750,6 +773,15 @@ function attach(task: Task, child: ChildProcess) {
         patch({ status: "waiting", pendingQuestion: shown });
         log("question", shown);
         notify(store.getTask(task.id)!, "waiting");
+      } else if (stepOutcome(finalText) === "blocked" && store.getTask(task.id)?.pipeline) {
+        // The step ran and said it could not proceed. Advancing would send /review,
+        // /qa and /ship after work that just declared itself blocked — the one
+        // outcome the pipeline exists to prevent. Not a retry either: a blocked
+        // step reports a reason, and reasons do not resolve themselves.
+        const why = blockedReason(finalText);
+        log("log", `step ${store.getTask(task.id)!.step + 1} reported STEP BLOCKED: ${why}`);
+        patch({ status: "error", error: `step ${store.getTask(task.id)!.step + 1} blocked: ${why}` });
+        notify(store.getTask(task.id)!, "error");
       } else if (!advancePipeline()) {
         setPhase("done", true);
         patch({ status: "done" });
@@ -794,7 +826,13 @@ export function argvFor(spec: LaunchSpec): string[] {
  * carry operator-supplied flags, and a daemon log is not a place to leak a token.
  */
 function spawnAgent(task: Task, argv: string[]): void {
-  console.error(`[agent ${task.id}] ${config.claudeBin} ${scrubSecrets(argv.join(" "), [config.dashboardToken, config.hookToken])}`);
+  // FLAGS ONLY. The final positional is the raw task prompt, or the operator's
+  // typed reply — and scrubSecrets is a known-value scrubber, not a secret
+  // detector: it removes our two tokens and `?token=`-shaped query strings, and
+  // would sail straight past an `sk-…` pasted into the reply drawer. journald
+  // typically outlives the DB and is not 0600, so the prompt does not go there.
+  const flags = scrubSecrets(argv.slice(0, -1).join(" "), [config.dashboardToken, config.hookToken]);
+  console.error(`[agent ${task.id}] ${config.claudeBin} ${flags} <prompt ${argv.at(-1)?.length ?? 0}b>`);
   const child = spawn(config.claudeBin, argv, currentSpawnOpts(task.worktree));
   attach(task, child);
 }
@@ -822,14 +860,20 @@ function runStep(task: Task, index: number): void {
   const steps = loadSteps();
   const step = steps[index];
   if (!step) return;
+  // Log the phase only when it actually CHANGES. Steps 6 and 7 are both `ship`, and
+  // a retry re-runs the same step, so an unconditional write filled the drawer with
+  // duplicate rows that read as progress.
+  const prev = store.getTask(task.id)?.phase;
   store.patchTask(task.id, { status: "running", phase: step.phase, lastActivity: Date.now() });
-  store.addEvent({ taskId: task.id, ts: Date.now(), kind: "phase", data: step.phase });
+  if (prev !== step.phase) store.addEvent({ taskId: task.id, ts: Date.now(), kind: "phase", data: step.phase });
   emitUpdate(task.id);
   // scheduleAfterExit, not schedule: the turn that just ended may still have a
   // live child for a few milliseconds, and two `claude` processes in one worktree
   // would edit the same files at once.
+  // A fresh fence per turn: a task prompt cannot close a delimiter it cannot guess.
+  const fence = `<<<TASK-${randomUUID().slice(0, 8)}>>>`;
   scheduleAfterExit(task.id, () =>
-    spawnAgent(task, argvFor({ prompt: stepPrompt(step, task.prompt) })));
+    spawnAgent(task, argvFor({ prompt: stepPrompt(step, task.prompt, fence) })));
 }
 
 /** Launch a fresh agent for a task (turn 1). */
@@ -852,8 +896,9 @@ export function answer(taskId: string, text: string): void {
 
 /** What a task is told after a daemon restart interrupted it mid-turn. Named
  *  rather than inline so a test can assert the A2 path without duplicating the
- *  string, and so the pipeline state machine can replace it with the step it was
- *  actually on rather than a vague nudge. */
+ *  string. NOTE: a pipeline task gets this same nudge today — resumeTask does not
+ *  re-issue the step it was on. Re-issuing stepPrompt() there is an open follow-up,
+ *  not something this constant already does. */
 export const RESUME_PROMPT = "continue where you left off";
 
 /** A2 durability: after a daemon restart, resume any task that was mid-run. */
@@ -871,6 +916,7 @@ export function stopTask(taskId: string): void {
   // Not killExisting(): leaving a LIVE child in `running` lets its exit handler run
   // normally, see status "stopped", skip the error patch, and pump() the queue.
   bumpGen(taskId);  // a replacement still waiting on a dying child must not fire
+  stepRetries.delete(taskId);
   const cancelled = cancelQueued(taskId);
   running.get(taskId)?.kill("SIGTERM");
   store.patchTask(taskId, { status: "stopped", lastActivity: Date.now() });

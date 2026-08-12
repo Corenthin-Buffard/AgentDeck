@@ -75,29 +75,25 @@ export function migrateTasks(database: Database) {
   const has = (name: string) => cols.some((c) => c.name === name);
   if (!has("project")) database.exec("ALTER TABLE tasks ADD COLUMN project TEXT");
   if (!has("plan_reviews")) database.exec("ALTER TABLE tasks ADD COLUMN plan_reviews TEXT");
-  // The pipeline columns BACKFILL, unlike the two above, and the difference is
-  // deliberate. `project` and `plan_reviews` coalesce at read time so they track
-  // the live registry. `pipeline` must NOT: it records a choice made when the task
-  // was created, and a task already in flight cannot be allowed to change what it
-  // is doing because the operator edited AGENTDECK_PIPELINE and restarted. Every
-  // pre-existing row predates the feature, so it is free-form: 0.
-  // `ALTER TABLE ... DEFAULT 0` already writes 0 into existing rows, so the
-  // UPDATE is belt-and-braces for a column added by an earlier build without one.
-  if (!has("pipeline")) {
-    database.exec("ALTER TABLE tasks ADD COLUMN pipeline INTEGER NOT NULL DEFAULT 0");
-    database.exec("UPDATE tasks SET pipeline = 0 WHERE pipeline IS NULL");
-  }
-  if (!has("step")) {
-    database.exec("ALTER TABLE tasks ADD COLUMN step INTEGER NOT NULL DEFAULT 0");
-    database.exec("UPDATE tasks SET step = 0 WHERE step IS NULL");
-  }
-  if (!has("step_skill_seen")) {
-    database.exec("ALTER TABLE tasks ADD COLUMN step_skill_seen INTEGER NOT NULL DEFAULT 0");
-    database.exec("UPDATE tasks SET step_skill_seen = 0 WHERE step_skill_seen IS NULL");
-  }
-  if (!has("pipeline_missed")) {
-    database.exec("ALTER TABLE tasks ADD COLUMN pipeline_missed INTEGER NOT NULL DEFAULT 0");
-    database.exec("UPDATE tasks SET pipeline_missed = 0 WHERE pipeline_missed IS NULL");
+  // These four BACKFILL, unlike the two above, and the difference is deliberate.
+  // `project` and `plan_reviews` coalesce at read time so they track the live
+  // registry. `pipeline` must NOT: it records a choice made when the task was
+  // created, and a task already in flight cannot change what it is doing because
+  // the operator edited AGENTDECK_PIPELINE and restarted. Every pre-existing row
+  // predates the feature, so it is free-form.
+  //
+  // `ALTER TABLE ... NOT NULL DEFAULT 0` performs that backfill atomically — SQLite
+  // writes 0 into every existing row as part of the ALTER. An earlier version of
+  // this code followed each ALTER with `UPDATE ... WHERE col IS NULL`; those were
+  // dead by construction (the column had just been created NOT NULL, inside a guard
+  // that only runs when it was absent) and have been removed.
+  //
+  // ROLLBACK CONTRACT: every column added here MUST carry a non-NULL DEFAULT. The
+  // previous binary's INSERT names only its own columns, and relies on the defaults
+  // to satisfy NOT NULL — so a defaultless column would break downgrade at
+  // task-creation time, which no test in the new binary would ever exercise.
+  for (const col of ["pipeline", "step", "step_skill_seen", "pipeline_missed"]) {
+    if (!has(col)) database.exec(`ALTER TABLE tasks ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
   }
 }
 migrateTasks(db);
@@ -150,9 +146,11 @@ export const store = {
   setStep(id: string, step: number) {
     db.query("UPDATE tasks SET step = ?, step_skill_seen = 0 WHERE id = ?").run(step, id);
   },
-  /** Record that the current step invoked a gstack skill. */
-  setStepSkillSeen(id: string, seen: boolean) {
-    db.query("UPDATE tasks SET step_skill_seen = ? WHERE id = ?").run(seen ? 1 : 0, id);
+  /** Record that the current step invoked the gstack skill it was told to run.
+   *  Set-only: CLEARING lives exclusively in setStep(), because the flag is a
+   *  property OF the current step and must not be reset out of band. */
+  markStepSkillSeen(id: string) {
+    db.query("UPDATE tasks SET step_skill_seen = 1 WHERE id = ?").run(id);
   },
   /** A commanded step finished without invoking its skill. Incremented in SQL so
    *  it cannot lose a count to a read-modify-write race between two turns. */
@@ -163,6 +161,11 @@ export const store = {
     const map: Record<string, string> = {
       sessionId: "session_id", pendingQuestion: "pending_question",
       lastActivity: "last_activity", createdAt: "created_at",
+      // Present even though the dedicated setters are the intended path: Partial<Task>
+      // type-checks these, so a future caller passing one through patchTask would
+      // otherwise emit `SET stepSkillSeen = ...` and hit a runtime SQLite error with
+      // no compile-time signal.
+      stepSkillSeen: "step_skill_seen", pipelineMissed: "pipeline_missed",
     };
     const cols = Object.keys(patch);
     if (!cols.length) return;
