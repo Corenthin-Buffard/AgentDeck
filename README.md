@@ -104,9 +104,12 @@ Install AgentDeck (a self-hosted orchestrator for parallel Claude Code agents) a
 2. CLAUDE CODE — for RUN_USER (DEDICATED mode)
 - Install `claude` under $RUN_HOME as RUN_USER and make sure it resolves on the service PATH ($RUN_HOME/.local/bin). Do NOT point a symlink at my own installation: it depends on `/root` being traversable, and root's auto-update will move the target out from under it.
 - CREDENTIALS — STOP, my decision. Present both, pick neither:
-    (a) `claude login` as RUN_USER — its own session, durable. I have to do the device flow myself.
-        Give it the PATH, per the RUN-AS convention, or you get `claude: command not found`:
-          su -s /bin/bash agentdeck -c 'HOME=/var/lib/agentdeck PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/agentdeck/.local/bin claude login'
+    (a) `claude auth login` as RUN_USER — its own session, durable. I do the device flow myself.
+        The subcommand is `auth login`, not `login`, and it needs the PATH per the RUN-AS convention:
+        without it you get `claude: command not found`, and with the wrong subcommand the word is
+        parsed as a PROMPT, so you get an authentication error that looks like a broken session.
+          su -s /bin/bash agentdeck -c 'HOME=/var/lib/agentdeck PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/agentdeck/.local/bin claude auth login'
+        Verify with `claude auth status`, which reports `"loggedIn": true` — this is what --check reads.
     (b) copy my `~/.claude/.credentials.json` to $RUN_HOME/.claude/.credentials.json (chown to RUN_USER, mode 0600).
   Immediate, and it ROTS: the OAuth refresh token rotates, so the copy keeps working only until MY
   session refreshes, after which every agent fails at authentication. Measured here — the copy was

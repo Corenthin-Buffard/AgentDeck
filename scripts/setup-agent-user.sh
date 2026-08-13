@@ -270,31 +270,32 @@ check() {
 
   # Its own credentials. Copied from yours or minted by `claude login` under this
   # account; either way, without them the agent authenticates against nothing.
-  if run_as "test -s ~/.claude/.credentials.json"; then
-    # PRESENT is not USABLE, and the difference is the trap in copied credentials:
-    # the OAuth refresh token ROTATES, so a file copied from your own account works
-    # only until YOUR session refreshes — after that the agent's copy is dead and
-    # every task fails at authentication. Seen here hours after the copy, with the
-    # daemon reporting the failed task as done.
-    # The grep runs INSIDE run_as so the token itself never crosses back out.
-    local exp now login_cmd
-    # A pasteable command, not "run claude login as X": under `su -s` there is no
-    # .bashrc, so a PATH-less invocation dies with `claude: command not found` —
-    # which is the very trap the RUN-AS convention exists to warn about, and it
-    # caught the author of this script.
-    login_cmd="su -s /bin/bash $AD_USER -c 'HOME=$AD_HOME PATH=$SERVICE_PATH claude login'"
-    exp="$(run_as "grep -o '\"expiresAt\":[0-9]*' ~/.claude/.credentials.json | head -1 | cut -d: -f2" 2>/dev/null || echo "")"
-    now="$(( $(date +%s) * 1000 ))"
-    if [ -z "$exp" ] || [ "$exp" = "0" ]; then
-      fail "claude creds" "$AD_HOME/.claude/.credentials.json has no usable expiry — likely a stale copy. Fix: $login_cmd"
-    elif [ "$exp" -lt "$now" ] 2>/dev/null; then
-      fail "claude creds" "expired at $(date -u -d "@$((exp/1000))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$exp") — fix: $login_cmd"
-    else
-      ok "claude creds" "valid until $(date -u -d "@$((exp/1000))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$exp")"
-    fi
-  else
-    fail "claude creds" "no ~/.claude/.credentials.json for $AD_USER — agents cannot authenticate"
-  fi
+  # Ask Claude Code itself instead of reverse-engineering ~/.claude/.credentials.json.
+  # `claude auth status` is the vendor's own answer, and it catches the state a file
+  # check cannot: credentials COPIED from another account keep looking like a perfect
+  # file long after the OAuth refresh token has rotated out from under them, and then
+  # every task dies at authentication while --check reports the file present. Measured
+  # here — the copy was dead within hours and the daemon called the failed task done.
+  local login_cmd authj
+  # Pasteable, not "run claude auth login as X": under `su -s` there is no .bashrc, so
+  # a PATH-less invocation dies with `claude: command not found` — the very trap the
+  # RUN-AS convention warns about, which caught the author of this script.
+  login_cmd="su -s /bin/bash $AD_USER -c 'HOME=$AD_HOME PATH=$SERVICE_PATH claude auth login'"
+  authj="$(run_as "claude auth status 2>/dev/null" 2>/dev/null || true)"
+  case "$authj" in
+    *'"loggedIn":true'*|*'"loggedIn": true'*)
+      ok "claude auth" "logged in" ;;
+    *'"loggedIn"'*)
+      fail "claude auth" "$AD_USER is NOT logged in — every task will fail at authentication. Fix: $login_cmd" ;;
+    *)
+      # Older claude, or one that cannot answer: fall back to the file, and say that
+      # this is the weaker check rather than pretending it proves a working session.
+      if run_as "test -s ~/.claude/.credentials.json"; then
+        warn "claude auth" "'claude auth status' gave no verdict; ~/.claude/.credentials.json exists but was NOT proven usable"
+      else
+        fail "claude auth" "no credentials for $AD_USER — agents cannot authenticate. Fix: $login_cmd"
+      fi ;;
+  esac
 
   if run_as "test -f ~/.claude/skills/gstack/VERSION"; then
     ok "gstack" "$(run_as 'cat ~/.claude/skills/gstack/VERSION')"

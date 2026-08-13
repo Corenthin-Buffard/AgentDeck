@@ -28,12 +28,14 @@
   service PATH. It exits 0 (ready), 2 (the daemon will run but a flagged part of the workflow will
   not, e.g. `/ship` without `gh`) or 1 (broken; don't start it). Checking with your own PATH is how
   an install gets certified and then fails on first contact.
-- **A credentials check that validates the expiry, not just the file.** Copying `~/.claude/.credentials.json`
-  to the service account is the obvious way to give it a session, and it rots: the OAuth refresh token
-  rotates, so the copy works until your own session refreshes and then every agent fails at
-  authentication. Measured — the copy was dead within hours while `--check` happily reported the file
-  as present. The runbook now leads with `claude login` under the service account and marks copying a
-  stopgap.
+- **A credentials check that asks Claude Code, instead of reading its credentials file.** `--check`
+  now runs `claude auth status` as the service user and reads `loggedIn`. Copying
+  `~/.claude/.credentials.json` to the service account is the obvious way to give it a session, and it
+  rots: the OAuth refresh token rotates, so the copy works until your own session refreshes and then
+  every agent fails at authentication. Measured — the copy was dead within hours, `--check` reported
+  the file as present the whole time, and the daemon marked the failed task `done`. A file check
+  cannot see that; the CLI's own verdict can. The runbook now leads with `claude auth login` under the
+  service account and marks copying a stopgap.
 - **A home-ownership check.** A service account that does not own its own `$HOME` is the quiet
   failure: the daemon only *reads* most of it, so every other line of `--check` stays green and the
   dashboard looks healthy, until an agent *writes*. Found the hard way on a hand-built install where
