@@ -58,7 +58,10 @@ jobs:
           sudo mkdir -p /var/lib/adci/.claude/skills/gstack/bin
           printf '#!/bin/sh\necho stub-claude\n' | sudo tee /var/lib/adci/.local/bin/claude >/dev/null
           sudo chmod +x /var/lib/adci/.local/bin/claude
-          echo '{"stub":true}'  | sudo tee /var/lib/adci/.claude/.credentials.json >/dev/null
+          # A far-future expiry: --check refuses credentials with none, because a
+          # copied file whose refresh token has rotated is exactly how an install
+          # passes every check and then fails every task.
+          echo '{"claudeAiOauth":{"expiresAt":4102444800000}}' | sudo tee /var/lib/adci/.claude/.credentials.json >/dev/null
           echo '1.0.0.0'        | sudo tee /var/lib/adci/.claude/skills/gstack/VERSION >/dev/null
           sudo chown -R adci:adci /var/lib/adci /srv/adrepo
           echo 'AGENTDECK_TARGET_REPO=/srv/adrepo' | sudo tee -a /var/lib/adci/.config/agentdeck/env >/dev/null

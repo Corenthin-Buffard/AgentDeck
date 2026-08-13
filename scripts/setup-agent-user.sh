@@ -271,7 +271,22 @@ check() {
   # Its own credentials. Copied from yours or minted by `claude login` under this
   # account; either way, without them the agent authenticates against nothing.
   if run_as "test -s ~/.claude/.credentials.json"; then
-    ok "claude creds" "$AD_HOME/.claude/.credentials.json"
+    # PRESENT is not USABLE, and the difference is the trap in copied credentials:
+    # the OAuth refresh token ROTATES, so a file copied from your own account works
+    # only until YOUR session refreshes — after that the agent's copy is dead and
+    # every task fails at authentication. Seen here hours after the copy, with the
+    # daemon reporting the failed task as done.
+    # The grep runs INSIDE run_as so the token itself never crosses back out.
+    local exp now
+    exp="$(run_as "grep -o '\"expiresAt\":[0-9]*' ~/.claude/.credentials.json | head -1 | cut -d: -f2" 2>/dev/null || echo "")"
+    now="$(( $(date +%s) * 1000 ))"
+    if [ -z "$exp" ] || [ "$exp" = "0" ]; then
+      fail "claude creds" "$AD_HOME/.claude/.credentials.json has no usable expiry — likely a stale copy. Run 'claude login' as $AD_USER"
+    elif [ "$exp" -lt "$now" ] 2>/dev/null; then
+      fail "claude creds" "expired at $(date -u -d "@$((exp/1000))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$exp") — run 'claude login' as $AD_USER"
+    else
+      ok "claude creds" "valid until $(date -u -d "@$((exp/1000))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$exp")"
+    fi
   else
     fail "claude creds" "no ~/.claude/.credentials.json for $AD_USER — agents cannot authenticate"
   fi

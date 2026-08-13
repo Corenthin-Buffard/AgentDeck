@@ -14,6 +14,20 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Agent supervisor / core
 
+- **An authentication failure is reported as `done`** — **Priority: P1**
+  Observed end to end on 2026-08-13 with task `t_c4d6e593`. The agent's entire output was
+  `Failed to authenticate: OAuth session expired and could not be refreshed`; `claude -p` exited **1**;
+  the board showed **done**, the notifier sent `✅ done`, and the worktree was empty. Nothing anywhere
+  said the task had failed.
+  The close handler in `src/agent.ts` only patches `error` `if (t && isLive(t.status))`, and by then it
+  isn't: the turn-end result arrives first and `detect.ts` reads that one sentence as a completed turn,
+  so the non-zero exit lands on a task that is already terminal and is dropped. This is the same family
+  as the v0.2.4.1 root bug — an invisible failure — except it now presents as **success**, which is
+  strictly worse than the error it replaced. Two candidate fixes, not exclusive: treat a non-zero exit
+  as authoritative over an earlier `done` within the same turn, and classify a result that is only an
+  authentication error as a failure. Needs a regression test that drives the real shape (result then
+  exit 1), since a stub that exits 0 would pass either way.
+
 - **Session ids don't survive a change of `HOME`** — **Priority: P3**
   Claude Code stores transcripts under `$HOME/.claude/projects/<encoded-cwd>`. The DB persists a `sessionId` as if it were portable; it isn't. Move the daemon to another account (or move the worktrees), and every stored `sessionId` becomes unresolvable — `claude --resume` finds nothing, and A2 durability loses those tasks **silently**, because the daemon can't even attribute the failure. Observed 2026-08-12: `/root/.claude/projects/-root--agentdeck-worktrees-t-703ad468` was orphaned by the migration to a service account. The README's migration section works around it by requiring a drain first. Open question: should the daemon detect an unresolvable `sessionId` and say so, instead of failing without explanation?
 

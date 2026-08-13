@@ -104,9 +104,16 @@ Install AgentDeck (a self-hosted orchestrator for parallel Claude Code agents) a
 2. CLAUDE CODE — for RUN_USER (DEDICATED mode)
 - Install `claude` under $RUN_HOME as RUN_USER and make sure it resolves on the service PATH ($RUN_HOME/.local/bin). Do NOT point a symlink at my own installation: it depends on `/root` being traversable, and root's auto-update will move the target out from under it.
 - CREDENTIALS — STOP, my decision. Present both, pick neither:
-    (a) copy my `~/.claude/.credentials.json` to $RUN_HOME/.claude/.credentials.json (same account, immediate, chown it to RUN_USER, mode 0600);
-    (b) `claude login` as RUN_USER (separate account, interactive, I have to do it myself).
-  Without credentials, every agent fails at authentication rather than at spawn — a different error with the same outcome.
+    (a) `claude login` as RUN_USER — its own session, durable. I have to do the device flow myself:
+          su -s /bin/bash agentdeck -c 'HOME=/var/lib/agentdeck claude login'
+    (b) copy my `~/.claude/.credentials.json` to $RUN_HOME/.claude/.credentials.json (chown to RUN_USER, mode 0600).
+  Immediate, and it ROTS: the OAuth refresh token rotates, so the copy keeps working only until MY
+  session refreshes, after which every agent fails at authentication. Measured here — the copy was
+  dead within hours, and `--check` reported the file as present the whole time. Treat (b) as a
+  stopgap, and re-run `--check` (it validates the expiry, not just the file) before trusting it.
+  Without WORKING credentials, agents fail at authentication rather than at spawn — and today the
+  daemon marks such a task `done` rather than `error`, so it fails green. That is the worst-looking
+  failure mode there is, which is why the witness task at the end is not optional.
 
 3. AGENTDECK — download the binary from Releases
 - Pick the asset for this platform: Linux x86_64 -> agentdeck-linux-x64 ; Linux aarch64/arm64 -> agentdeck-linux-arm64 ; macOS arm64 -> agentdeck-darwin-arm64 ; anything else (Windows, Intel Mac) -> build from source (below).
