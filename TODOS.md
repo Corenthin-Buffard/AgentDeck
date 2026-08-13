@@ -14,20 +14,6 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Agent supervisor / core
 
-- **An authentication failure is reported as `done`** — **Priority: P1**
-  Observed end to end on 2026-08-13 with task `t_c4d6e593`. The agent's entire output was
-  `Failed to authenticate: OAuth session expired and could not be refreshed`; `claude -p` exited **1**;
-  the board showed **done**, the notifier sent `✅ done`, and the worktree was empty. Nothing anywhere
-  said the task had failed.
-  The close handler in `src/agent.ts` only patches `error` `if (t && isLive(t.status))`, and by then it
-  isn't: the turn-end result arrives first and `detect.ts` reads that one sentence as a completed turn,
-  so the non-zero exit lands on a task that is already terminal and is dropped. This is the same family
-  as the v0.2.4.1 root bug — an invisible failure — except it now presents as **success**, which is
-  strictly worse than the error it replaced. Two candidate fixes, not exclusive: treat a non-zero exit
-  as authoritative over an earlier `done` within the same turn, and classify a result that is only an
-  authentication error as a failure. Needs a regression test that drives the real shape (result then
-  exit 1), since a stub that exits 0 would pass either way.
-
 - **Session ids don't survive a change of `HOME`** — **Priority: P3**
   Claude Code stores transcripts under `$HOME/.claude/projects/<encoded-cwd>`. The DB persists a `sessionId` as if it were portable; it isn't. Move the daemon to another account (or move the worktrees), and every stored `sessionId` becomes unresolvable — `claude --resume` finds nothing, and A2 durability loses those tasks **silently**, because the daemon can't even attribute the failure. Observed 2026-08-12: `/root/.claude/projects/-root--agentdeck-worktrees-t-703ad468` was orphaned by the migration to a service account. The README's migration section works around it by requiring a drain first. Open question: should the daemon detect an unresolvable `sessionId` and say so, instead of failing without explanation?
 
@@ -94,6 +80,8 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
   `DESIGN.md` ships at the repo root: tokens with their roles, the three color rules, the mono-as-identity decision, the two-row header invariants, interaction states, and the a11y floors. Written after the design review that found the approved brand lockup had been dropped during implementation — the failure mode DT5 existed to prevent.
 
 ## Completed
+
+- **v0.2.5.2** (2026-08-13) — **An authentication failure is no longer reported as `done`.** The supervisor decided from `subtype` alone, and a real auth failure emits `{"subtype":"success","is_error":true,"terminal_reason":"api_error"}` — so a task whose agent never ran was marked done, with an empty worktree and a ✅ notification (observed: `t_c4d6e593`, 7.5s). A turn is now failed when `subtype` is not success OR `is_error` is true, and the agent's own words reach `task.error`. Two regression tests replay the captured event shape through a real subprocess, including the exit-1 that arrives too late to help; both fail without the fix.
 
 - **v0.2.5.1** (2026-08-12) — **The install runbook stopped producing root installs**, which also closed the P2 above ("run agents as an unprivileged uid instead of relying on `IS_SANDBOX`") — *differently than planned*. The plan was to keep a root daemon and drop privileges per spawned agent; the answer was to not run the daemon as root at all. Measured on the way there, so nobody re-derives it: Bun's `node:child_process` **silently ignores** the `uid`/`gid` spawn options (asked for 65534, ran as 0, no error); `setpriv` does work, and a `feat/agent-user` branch implementing the drop was written and abandoned because it kept a root daemon and duplicated credentials, skills and permissions across two identities to solve what one unprivileged identity removes. Verified end to end: agent at uid 999, `--dangerously-skip-permissions` accepted, gstack resolving. New `scripts/setup-agent-user.sh` (+ `--check`, + a CI job that runs it for real), a runbook that branches on `uname -s` then `id -u`, and a migration section gated on a drain. `AGENTDECK_ALLOW_ROOT` survives unchanged as a last resort. Surfaced a P3: `sessionId`s don't survive a change of `HOME`.
 
