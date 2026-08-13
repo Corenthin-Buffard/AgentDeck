@@ -60,100 +60,35 @@ Run this **in a Claude Code session on the machine where AgentDeck should live**
 <summary><b>📋 Copy this prompt into Claude Code →</b></summary>
 
 ```text
-Install AgentDeck (a self-hosted orchestrator for parallel Claude Code agents) and gstack (its required workflow toolkit) on THIS machine. Be idempotent, print each step, and STOP with a clear message if a prerequisite is missing or a check fails. Use absolute paths — do not assume PATH changes persist between your shell commands.
+Install AgentDeck (a self-hosted orchestrator for parallel Claude Code agents) and gstack (its required workflow toolkit) on THIS machine. Be idempotent, print each step, and STOP with a clear message if a check fails. Use absolute paths — do not assume PATH changes persist between your shell commands.
 
-0. PREFLIGHT — decide WHICH ACCOUNT runs the daemon. This is the first decision, not a detail.
-- Detect OS/arch: `uname -s` / `uname -m`. Confirm `git` is present.
+This runbook is deliberately short. `scripts/setup-agent-user.sh --check` enumerates everything the daemon and its agents need, and every line it fails prints the exact command that fixes it. Your job is the handful of things a script cannot decide: which account, which credentials, which repo, which key. Let the tool tell you the rest.
+
+0. PREFLIGHT — decide WHICH ACCOUNT runs the daemon. First decision, not a detail.
+- Detect OS/arch (`uname -s` / `uname -m`) and confirm `git` is present.
 - Run `id -u` and pick the mode:
     not 0                -> MODE = SELF.      The daemon runs as me, under `systemd --user`.
                             RUN_USER=$USER, RUN_HOME=$HOME.
     0 and uname -s=Linux -> MODE = DEDICATED. Create an unprivileged service account and a SYSTEM unit.
                             RUN_USER=agentdeck, RUN_HOME=/var/lib/agentdeck.
-    0 and not Linux      -> STOP. There is no `useradd`/systemd here; tell me to re-run as an unprivileged user.
-- Tell me the mode and WHY, in one line: Claude Code refuses `--dangerously-skip-permissions` under uid 0, so a daemon running as root fails every task at spawn — a root install is not something this runbook produces.
-- RUN-AS CONVENTION (DEDICATED mode). Every step below that says "as RUN_USER" means exactly this shape:
-    su -s /bin/bash agentdeck -c "export HOME=/var/lib/agentdeck PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/agentdeck/.local/bin; <command>"
-  Do NOT drop the `HOME=` or the `PATH=`, and do not assume either is inherited:
-    * `su` without `-` keeps ROOT's HOME, so a `curl | bash` installer happily writes into /root and then fails on permissions;
-    * a non-interactive shell never sources `.bashrc`, so `~/.local/bin` is not on PATH unless you put it there.
-  The account's shell is `nologin` on purpose — `su -s /bin/bash` still works, and that is the only way in.
-  In SELF mode, "as RUN_USER" just means: run it normally.
-- TOOLCHAIN — for RUN_USER. In DEDICATED mode the account does not exist yet, so do this right after 0b, not now; just tell me what is missing.
-    * `bun` — install it AS RUN_USER (`curl -fsSL https://bun.sh/install | bash`, with `BUN_INSTALL=$RUN_HOME/.bun` in DEDICATED mode), then symlink BOTH `bun` and `bunx` into `$RUN_HOME/.local/bin`. gstack's setup calls `bunx`, so a `bun`-only link fails it halfway through.
-    * `node` — gstack's setup uses it to install Playwright's Chromium. Without it, gstack still installs and every plan/review/ship skill works, but `/browse` and `/qa` do not. Say which of the two you ended up with.
-    * `claude` (Claude Code) — installed AND authenticated for RUN_USER. Not for you, for RUN_USER: the daemon spawns `claude` as itself at runtime. In DEDICATED mode that is step 2 below.
+    0 and not Linux      -> STOP. No `useradd`/systemd here; tell me to re-run as an unprivileged user.
+- Tell me the mode and WHY, in one line: Claude Code refuses `--dangerously-skip-permissions` under uid 0, so a daemon running as root fails every task at spawn. A root install is not something this runbook produces.
 
-0b. DEDICATED MODE ONLY — create the service account
+- RUN-AS CONVENTION (DEDICATED). Every step that says "as RUN_USER" means exactly this shape:
+    su -s /bin/bash agentdeck -c "export HOME=/var/lib/agentdeck PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/agentdeck/.local/bin; <command>"
+  Never drop the `HOME=` or the `PATH=`; neither is inherited. `su` without `-` keeps ROOT's HOME, so a `curl | bash` installer writes into /root and then fails on permissions. And a non-interactive shell never sources `.bashrc`, so `~/.local/bin` is not on PATH unless you put it there — that is where `claude: command not found` comes from. The account's shell is `nologin` on purpose; `su -s /bin/bash` is the way in.
+  In SELF mode, "as RUN_USER" just means: run it normally.
+
+- HUMAN-ONLY RULE. NEVER run an interactive authentication flow yourself: `claude auth login`, `gh auth login`. They wait for a human to open a URL and paste a code back, for minutes. Run by an agent they blow past the timeout and get killed, and the error that comes out looks like a broken account rather than an interactive flow with nobody to answer it. PRINT the full command — HOME and PATH included — and STOP.
+  When I run one and it prints a sign-in URL: that URL is wrapped in a terminal hyperlink escape, so it appears TWICE back to back. Copying the whole thing gives a truncated URL missing `scope=`, and the browser answers "Invalid OAuth request: missing scope parameter" — which looks like a broken account and is just a bad paste. Take the first copy only.
+
+1. PROVISION — the mechanical half (DEDICATED)
 - Get the script (from a clone: `scripts/setup-agent-user.sh`; or download it):
     curl -fsSL https://raw.githubusercontent.com/Corenthin-Buffard/AgentDeck/main/scripts/setup-agent-user.sh -o /tmp/setup-agent-user.sh && chmod +x /tmp/setup-agent-user.sh
 - Run it: `sudo /tmp/setup-agent-user.sh --user agentdeck --home /var/lib/agentdeck`
-  It creates the account, its directories, `/etc/systemd/system/agentdeck.service`, and reloads systemd. It deliberately does NOT enable or start anything — the daemon cannot work before credentials and a repo, and a service that boots into failure is exactly what this whole install avoids.
-- It is idempotent: re-running it is safe and changes nothing that already exists.
-
-1. GSTACK — for RUN_USER (not for you)
-- Check: `[ -f "$RUN_HOME/.claude/skills/gstack/VERSION" ] && echo "gstack INSTALLED $(cat ...)" || echo "gstack NOT INSTALLED"`
-- If INSTALLED: print the version, do NOT reinstall (I can run `/gstack-upgrade` later). Continue.
-- If `$RUN_HOME/.claude/skills/gstack` exists but has NO `VERSION` file: broken/partial install — STOP and ask me to inspect/remove it (do not clone over it).
-- If NOT installed, AS RUN_USER:
-    git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git "$RUN_HOME/.claude/skills/gstack"
-    cd "$RUN_HOME/.claude/skills/gstack" && GSTACK_SKIP_FONTS=1 ./setup --no-prefix --no-plan-tune-hooks --quiet
-  In DEDICATED mode do NOT symlink my own `~/.claude/skills/gstack` into the service account: it would depend on `/root` staying traversable, and my next gstack upgrade would move what the link points at. Give it its own clone.
-- Verify: `VERSION` exists AND `bin/gstack-config get telemetry` succeeds, both AS RUN_USER.
-- NOTE on testing skill resolution later: gstack skills only resolve inside a REAL git workspace. Checking from a bare directory like `/tmp` gives a false negative — test from the target repo.
-
-2. CLAUDE CODE — for RUN_USER (DEDICATED mode)
-- Install `claude` under $RUN_HOME as RUN_USER and make sure it resolves on the service PATH ($RUN_HOME/.local/bin). Do NOT point a symlink at my own installation: it depends on `/root` being traversable, and root's auto-update will move the target out from under it.
-- CREDENTIALS — STOP, my decision. Present both, pick neither:
-    (a) `claude auth login` as RUN_USER — its own session, durable. I do the device flow myself.
-        The subcommand is `auth login`, not `login`, and it needs the PATH per the RUN-AS convention:
-        without it you get `claude: command not found`, and with the wrong subcommand the word is
-        parsed as a PROMPT, so you get an authentication error that looks like a broken session.
-          su -s /bin/bash agentdeck -c 'HOME=/var/lib/agentdeck PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/agentdeck/.local/bin claude auth login'
-        Verify with `claude auth status`, which reports `"loggedIn": true` — this is what --check reads.
-        The CLI prints its sign-in URL wrapped in a terminal hyperlink escape (OSC 8), so the URL
-        appears TWICE back to back and copying it out of a log gives you a truncated one. The
-        truncation drops `scope=`, and the browser then says "Invalid OAuth request: missing scope
-        parameter" — which looks like a broken account, not a bad copy-paste. Take the first copy
-        only, or extract it: `tr '\007' '\n' < out | sed 's/\x1b]8;;//' | grep -m1 -o 'https://[^ ]*'`
-    (b) copy my `~/.claude/.credentials.json` to $RUN_HOME/.claude/.credentials.json (chown to RUN_USER, mode 0600).
-  Immediate, and it ROTS: the OAuth refresh token rotates, so the copy keeps working only until MY
-  session refreshes, after which every agent fails at authentication. Measured here — the copy was
-  dead within hours, and `--check` reported the file as present the whole time. Treat (b) as a
-  stopgap, and re-run `--check` (it validates the expiry, not just the file) before trusting it.
-  Without WORKING credentials, agents fail at authentication rather than at spawn — and today the
-  daemon marks such a task `done` rather than `error`, so it fails green. That is the worst-looking
-  failure mode there is, which is why the witness task at the end is not optional.
-
-3. AGENTDECK — download the binary from Releases
-- Pick the asset for this platform: Linux x86_64 -> agentdeck-linux-x64 ; Linux aarch64/arm64 -> agentdeck-linux-arm64 ; macOS arm64 -> agentdeck-darwin-arm64 ; anything else (Windows, Intel Mac) -> build from source (below).
-- Install it to `/usr/local/bin/agentdeck` in DEDICATED mode (the service no longer runs as the account that installed it), or `$HOME/.local/bin/agentdeck` in SELF mode:
-    curl -fsSL "https://github.com/Corenthin-Buffard/AgentDeck/releases/latest/download/<ASSET>" -o <TARGET>
-    chmod +x <TARGET>
-- VALIDATE the download before continuing: `file <TARGET>` must report an executable (ELF/Mach-O) and the file must be > 1 MB. If not (e.g. a 404 HTML page saved as the binary), STOP with a clear message.
-- Source fallback (no prebuilt binary for this platform): clone into a fresh dir (if `~/AgentDeck` already exists, `git -C ~/AgentDeck pull` instead of cloning), then `bun install && bun run build`, then `install -m 755 dist/agentdeck <TARGET>`.
-
-4. THE TARGET REPO — STOP, my decision
-- Ask me for AGENTDECK_TARGET_REPO — the ABSOLUTE path of the git repo the agents will work on. VALIDATE it is a git repo: `git -C "<path>" rev-parse --git-dir` — if not, STOP and ask me again.
-- In DEDICATED mode, RUN_USER must be able to write it. Present both options, pick neither:
-    (a) share the existing repo: `chown -R agentdeck: <repo>` — and then ALSO run `git config --global --add safe.directory <repo>` for every other user who still works in it, or git answers them `fatal: detected dubious ownership` and I will think you broke my repo;
-    (b) clone it somewhere neutral (e.g. /srv/<project>) owned by RUN_USER, leaving my copy untouched.
-- Then verify access and traversal SEPARATELY — they fail for different reasons and need different fixes:
-    su -s /bin/bash agentdeck -c 'test -w <repo>/.git'          # can it write the repo?
-    su -s /bin/bash agentdeck -c 'test -x <parent-of-repo>'     # can it even reach it? /root at 0700 kills this
-  If the parent is not traversable, STOP and offer option (b) rather than opening up my home directory.
-
-5. CONFIG
-- Optionally ask for notifications: AGENTDECK_SLACK_WEBHOOK, or AGENTDECK_TG_TOKEN + AGENTDECK_TG_CHAT.
-- Write `$RUN_HOME/.config/agentdeck/env` in systemd EnvironmentFile format (one KEY=VALUE per line, no quoting/shell expansion; warn me if a value contains spaces, `%` or `#`). Include: AGENTDECK_HOST=127.0.0.1, AGENTDECK_PORT=8787, AGENTDECK_TARGET_REPO=<path>, and any notification vars. In DEDICATED mode the setup script has already seeded this file — edit it, keep it owned by RUN_USER, mode 0600.
-- Do NOT set AGENTDECK_ALLOW_ROOT. It exists for a machine where no service account can be created, and this install has one.
-
-6. GIT IDENTITY FOR THE AGENT — STOP, my action
-- SSH: generate a DEDICATED key as RUN_USER (`ssh-keygen -t ed25519 -C "agentdeck@$(hostname)"`), print the public key, and tell me to add it as a **deploy key with write access** on the repos the agents will push to. Do not copy my own account key onto the box: it grants write access to EVERY repo I can touch, not just this one.
-- `gh`: the agent needs it installed AND authenticated, or it does the whole task and then fails at `/ship` — and AgentDeck's auto-clean, which proves a merge via `gh`, can never prove anything. Authenticate as RUN_USER (`gh auth login`, or a GH_TOKEN in the env file).
-
-7. PERSISTENCE
-- DEDICATED mode: the unit is already written. GATE FIRST — `sudo /tmp/setup-agent-user.sh --user agentdeck --home /var/lib/agentdeck --check`. It exits 0 (good), 2 (the daemon will run but a flagged part of the workflow will not), or 1 (broken — do NOT start it; fix what it lists and re-run). Read the output back to me. Then: `systemctl enable --now agentdeck`.
-- SELF mode: first check `systemctl --user show-environment` works (needs a user bus / XDG_RUNTIME_DIR). If it fails (bare VPS SSH session, minimal container) -> SKIP systemd, run AgentDeck in the background with the env file, and tell me plainly that persistence is NOT set up. Otherwise write `$HOME/.config/systemd/user/agentdeck.service` with REAL newlines, one directive per line:
+  It creates the account, its directories, `/etc/systemd/system/agentdeck.service`, and reloads systemd. It is idempotent, and it deliberately does NOT enable or start anything — the daemon cannot work before credentials and a repo.
+- Do NOT create anything else in that home with `sudo` afterwards: root-owned directories under RUN_HOME read as healthy until an agent writes. `--check` catches it.
+- SELF mode: no script. Write `$HOME/.config/systemd/user/agentdeck.service` yourself, with REAL newlines:
     [Unit]
     Description=AgentDeck daemon
     After=default.target
@@ -165,26 +100,75 @@ Install AgentDeck (a self-hosted orchestrator for parallel Claude Code agents) a
     RestartPreventExitStatus=78
     [Install]
     WantedBy=default.target
-  Then `loginctl enable-linger "$USER"` so it survives logout/reboot (may need root — if it fails, warn me that the service won't survive a full logout; do not claim it's persistent when it isn't), and `systemctl --user daemon-reload && systemctl --user enable --now agentdeck`.
-- BOTH modes, CRITICAL: the service PATH must include wherever `claude` lives, or the daemon starts but CANNOT spawn agents. Confirm `command -v claude` resolves within that exact PATH, as RUN_USER, BEFORE enabling.
-- `RestartPreventExitStatus=78` matters: exit 78 means an unrecoverable config error (currently: the port is already bound). Without it, `Restart=on-failure` retries forever against a port that will still be busy.
+  `RestartPreventExitStatus=78`: exit 78 is an unrecoverable config error (today, the port is already bound). Without it `Restart=on-failure` retries forever against a port that stays busy. Then `loginctl enable-linger "$USER"` so it survives logout — if that fails, say plainly that persistence is NOT set up rather than claiming it is.
 
-8. VERIFY — with `GET /api/health`, NOT by grepping the page title. A misconfigured daemon serves a perfectly good dashboard while every task dies; "the page loads" is not evidence that anything works.
-    systemctl [--user] is-active agentdeck        # must be: active
-    curl -s http://127.0.0.1:8787/api/health      # must report "ok": true
-- If `ok` is `false`, ask the daemon WHY — the diagnostic half is token-gated, because it reports the daemon's uid and the paths it reads. The token lives in RUN_HOME, so in DEDICATED mode it is not in my home directory:
-    TOKEN=$(cat "$RUN_HOME/.agentdeck/dashboard-token")     # DEDICATED: read it as root, or via su -s /bin/bash agentdeck
+2. STOP — Claude Code credentials for RUN_USER. My decision, my hands.
+  Present both, pick neither:
+    (a) `claude auth login` as RUN_USER — its own session, durable. The subcommand is `auth login`, NOT `login`: the bare word is parsed as a PROMPT, and the authentication error it returns looks exactly like a dead session.
+          su -s /bin/bash agentdeck -c 'HOME=/var/lib/agentdeck PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/agentdeck/.local/bin claude auth login'
+    (b) copy my `~/.claude/.credentials.json` to $RUN_HOME/.claude/.credentials.json (chown to RUN_USER, 0600).
+        Immediate, and it ROTS: the OAuth refresh token rotates, so the copy works only until MY session refreshes, after which every agent fails at authentication. Measured — dead within hours. A stopgap, nothing more.
+  Per the HUMAN-ONLY rule: print the command, do not run it. `--check` reads `claude auth status`, so it will tell us whether this actually worked.
+
+3. STOP — the target repo. My decision.
+- Ask me for the ABSOLUTE path, and VALIDATE it: `git -C "<path>" rev-parse --git-dir`.
+- In DEDICATED mode, RUN_USER must be able to write it. Present both, pick neither:
+    (a) share it: `chown -R agentdeck: <repo>` — and then ALSO `git config --global --add safe.directory <repo>` for every other user who works in it, or git answers them `fatal: detected dubious ownership` and I will think you broke my repo;
+    (b) clone it somewhere neutral (e.g. /srv/<project>) owned by RUN_USER, leaving my copy alone.
+- Write `$RUN_HOME/.config/agentdeck/env` (systemd EnvironmentFile format: one KEY=VALUE per line, no quoting, no shell expansion; warn me if a value contains spaces, `%` or `#`): AGENTDECK_HOST=127.0.0.1, AGENTDECK_PORT=8787, AGENTDECK_TARGET_REPO=<path>, plus any of AGENTDECK_SLACK_WEBHOOK / AGENTDECK_TG_TOKEN + AGENTDECK_TG_CHAT. In DEDICATED mode the script already seeded this file — edit it, keep it owned by RUN_USER at 0600.
+- Do NOT set AGENTDECK_ALLOW_ROOT. It exists for a machine where no service account can be created, and this install has one.
+
+4. STOP — the agent's git identity. My action.
+- SSH key: generate a DEDICATED one as RUN_USER (`ssh-keygen -t ed25519 -C "agentdeck@$(hostname)"`), print the public key, and tell me to add it as a **deploy key with write access** on the repos agents will push to. Do not copy my own account key onto the box: it grants write access to EVERY repo I can touch.
+- Host key: seed it, as RUN_USER — `ssh-keyscan github.com >> ~/.ssh/known_hosts`. The daemon runs under systemd with no tty, and SSH's default is to ASK before trusting an unknown host. Unseeded, the agent's first push dies on `Host key verification failed` with nobody to answer.
+- `gh`: the agent needs it authenticated, or it does the whole task and falls over at `/ship`. Prefer a **fine-grained token limited to the target repo**, set as GH_TOKEN in the env file. The `gh auth login` device flow is the fallback, and it mints a token carrying `repo` — write access to ALL my repos, wider than the deploy key we just scoped to one. `--check` warns when that is what it finds.
+
+5. GATE — let the tool say what is missing.
+    sudo /tmp/setup-agent-user.sh --user agentdeck --home /var/lib/agentdeck --check   # DEDICATED
+    ./setup-agent-user.sh --user "$USER" --home "$HOME" --check                        # SELF (no sudo)
+  It exits 0 (ready), 2 (the daemon will run but a flagged part of the workflow will not) or 1 (broken). EVERY failing line prints the command that fixes it — run it, then run `--check` again. Repeat until it stops finding things. Read the final state back to me; do not proceed past a 1.
+
+6. ENABLE
+    systemctl enable --now agentdeck            # DEDICATED
+    systemctl --user daemon-reload && systemctl --user enable --now agentdeck   # SELF
+
+7. VERIFY, then prove it with a real task.
+- `GET /api/health`, not the page title: a misconfigured daemon serves a perfectly good dashboard while every task dies.
+    curl -s http://127.0.0.1:8787/api/health      # "ok": true, and uid NOT 0
+  If `ok` is false, the diagnostic half is token-gated (it reports the daemon's uid and the paths it reads). The token lives in RUN_HOME:
+    TOKEN=$(cat "$RUN_HOME/.agentdeck/dashboard-token")
     curl -s -H "x-agentdeck-token: $TOKEN" http://127.0.0.1:8787/api/health
-  The `notices` array says exactly what is wrong and what to do — read it back to me and STOP. Do NOT report a successful install. Also confirm `uid` in that response is NOT 0. If port 8787 is already in use, the service exits 78 with a one-line reason (I can set a different AGENTDECK_PORT).
-- WITNESS TASK — the real acceptance test. Create one task on the target repo asking the agent to: print `id -u`, list its `plan-*` skills, and run the project's test command. It must return a non-zero uid, all five plan skills, and a real test result. A daemon that boots proves nothing; this proves identity, skills and toolchain at once.
+  The `notices` array says what is wrong. Read it back to me and STOP.
+- WITNESS TASK — the acceptance test. Create ONE task on the target repo that: prints `id -u`, lists its `plan-*` skills, writes a file, commits it, and PUSHES it.
+  **Verify the ARTIFACT, not the task status.** A task whose agent fails to authenticate is currently marked `done`, with no error and an empty worktree — a green board is not evidence:
+    cat <worktree>/witness.txt                                          # the service uid
+    su -s /bin/bash agentdeck -c 'git -C <worktree> log --oneline -1'   # the commit exists
+    git -C <repo> ls-remote origin 'refs/heads/agentdeck/*'             # same SHA on the remote
+  The `su` is not decoration: the worktree belongs to the agent, so git answers root `dubious ownership`.
+  If the three do not agree, the install is not finished no matter what the board says.
 
-9. DONE — summarize: mode (SELF/DEDICATED) and WHICH USER the daemon runs as, gstack version, agentdeck path, service status, `/api/health` ok + uid + any notices, what `--check` reported, whether `claude` resolves in the service PATH, what the witness task returned, and whether the deploy key still needs to be added on GitHub.
-- Dashboard: http://127.0.0.1:8787 (localhost-bound). From my laptop I reach it via `ssh -L 8787:127.0.0.1:8787 user@vps` then http://localhost:8787.
+8. DONE — summarize: mode and WHICH USER the daemon runs as, what `--check` finally reported, `/api/health` ok + uid + notices, what the witness task actually left on the remote, and anything still on me (the deploy key, a fine-grained token).
+- Dashboard: http://127.0.0.1:8787 (localhost-bound). From my laptop: `ssh -L 8787:127.0.0.1:8787 user@vps` then http://localhost:8787.
 ```
 
 </details>
 
-Prereqs on the box: `git`, plus `claude` (authenticated) and gstack **for the account the daemon runs as** — which, if you install as root, is the service account the prompt creates, not you. `bun`, `bunx` and `node` are needed by gstack's own setup (and by the source-build fallback). Not on Linux with systemd? The prompt still installs everything and runs the daemon — it just tells you persistence isn't wired up (set up `launchd`/a process manager yourself).
+Prereqs on the box: `git`, plus `claude` (authenticated) and gstack **for the account the daemon runs as** — which, if you install as root, is the service account the prompt creates, not you. `bun`, `bunx` and `node` are needed by gstack's own setup (and by the source-build fallback). You don't have to track that list: `scripts/setup-agent-user.sh --check` does, and prints the command for whatever is missing. Not on Linux with systemd? The prompt still installs everything and runs the daemon — it just tells you persistence isn't wired up (set up `launchd`/a process manager yourself).
+
+### When it breaks, start from the message
+
+Every one of these cost a round trip during a real install, because each message points somewhere other than its cause. This is an index — the explanation lives at the step named on the right.
+
+| What you see | What it is | Where |
+|---|---|---|
+| `claude: command not found` under `su` | the PATH wasn't passed | step 0, RUN-AS convention |
+| `Failed to authenticate: OAuth session expired` | dead session, **or** `claude login` instead of `claude auth login` | step 2 |
+| `Invalid OAuth request: missing scope parameter` | truncated sign-in URL (it is printed twice) | step 0, HUMAN-ONLY rule |
+| `mkdir: permission denied` under the agent's home | root-owned directories from a `sudo` | step 1, and `--check` → *home ownership* |
+| `Permission denied (publickey)` on push | deploy key not registered | step 4, and `--check` → *remote* |
+| `Host key verification failed` | `known_hosts` never seeded, and no tty to accept | step 4, and `--check` → *remote* |
+| `fatal: detected dubious ownership` | `chown -R` without `safe.directory` for the other users | step 3 |
+| Task `done` in seconds, empty worktree | the agent failed to authenticate; reported as success | step 7 — verify the artifact |
 
 ## Install manually (binary)
 

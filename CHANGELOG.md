@@ -17,6 +17,19 @@
   `AGENTDECK_ALLOW_ROOT` is no longer offered there; it remains documented as a last resort for
   machines where no service account can be created, and its behaviour is unchanged.
 
+### Changed
+- **The runbook shrank to what a script cannot decide.** It was followed on a real machine and took
+  nine round trips: wrong step order, `claude login` instead of `claude auth login`, a command
+  missing its PATH, copied credentials that rot, a sign-in URL printed twice, root-owned directories
+  under the service home, an unregistered deploy key, and a witness task marked `done` in 7.5 seconds
+  having produced nothing. Each was patched into the prose as it happened.
+
+  The diagnosis: three artifacts describe the same requirements and only one can lie. The script and
+  `--check` are executed, so they are true by construction; the runbook is a narrative nobody runs.
+  So the prose now keeps only the decisions — which account, which credentials, which repo, which key
+  — and **every failing `--check` line prints the command that fixes it**. Installing gstack, bun,
+  bunx, node and the binary left the text entirely: the tool asks for them and hands you the command.
+
 ### Added
 - **`scripts/setup-agent-user.sh`** — the mechanical half of the root path: creates the account and
   its directories, writes `/etc/systemd/system/agentdeck.service`, reloads systemd. Idempotent, and
@@ -42,6 +55,23 @@
   `.config` was left root-owned — `gh auth login` died on `mkdir: permission denied` while nothing
   else complained. The check scans the whole top level of the home rather than the three directories
   the script happens to create, because any later `sudo mkdir` recreates the state.
+- **A remote-reachability probe.** `--check` verified the agent could write the repo *locally* and
+  never that it could reach it, so an install passed every line and then died on its first task with
+  `Permission denied (publickey)`. It now runs `git ls-remote` as the service user with
+  `BatchMode=yes` — not decoration: `--check` runs from a terminal, the daemon runs under systemd with
+  none, and SSH's default is to ASK before trusting an unknown host, so without it the probe goes green
+  where the daemon's push dies on `Host key verification failed`. Distinguishes an unregistered deploy
+  key (and prints the `gh repo deploy-key add` line, repo slug derived from the remote URL) from an
+  unseeded host key, a local path that isn't there, a timeout, and a repo with no remote at all.
+- **`--check` runs unprivileged when you are the service account.** The root guard covered both modes,
+  so a SELF-mode install — you installing for yourself — could not open the gate the runbook tells it
+  to open. The guard moved to provisioning, where root is actually needed.
+- **A warning when the agent's `gh` token is wider than its deploy key.** The device flow mints `repo`
+  scope: write access to every repo the account owns, which quietly undoes the reason the deploy key
+  was scoped to one. A warning, not a failure — a broad token works, it is only broader than intended.
+- **A "when it breaks, start from the message" index** in the README: eight symptoms, each pointing at
+  the step that explains it. Every row cost a round trip during the real install, because each message
+  points somewhere other than its cause.
 - **A CI job that runs the script for real**, twice, and asserts the generated unit parses
   (`systemd-analyze verify`) — plus a case asserting `--check` still *fails* on an unfinished
   install, so the gate can't silently become inert.

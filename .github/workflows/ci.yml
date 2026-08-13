@@ -72,6 +72,30 @@ jobs:
           set -e
           [ "$code" = 2 ] || { echo "expected exit 2 (degraded), got $code"; exit 1; }
           echo "OK: --check reports 2 — runs, but the flagged half of the workflow would not"
+      # The probe decides ok vs FAIL vs WARN, and those branches are the whole value
+      # of the gate. Local bare repos exercise them with no network, no SSH and no
+      # secret. Deliberately out of reach here: a real `Permission denied (publickey)`
+      # and a real timeout both need a live host, so they are covered by hand.
+      - name: The remote probe separates reachable from unreachable
+        run: |
+          chk() { sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci --check 2>&1 \
+                    | sed 's/\x1b\[[0-9;]*m//g' | grep -E '^ +(OK|WARN|FAIL) +remote' || true; }
+          # a) a local bare repo is a legitimate remote — must report reachable
+          sudo git init -q --bare /srv/adbare && sudo chown -R adci:adci /srv/adbare
+          sudo -u adci git -C /srv/adrepo remote add origin /srv/adbare
+          a=$(chk); echo "$a"
+          case "$a" in *"OK"*reachable*) ;; *) echo "reachable branch did not report ok"; exit 1 ;; esac
+          # b) a local path that isn't there must FAIL — and must NOT advise a deploy
+          #    key, because git says "could not read from remote" for both cases
+          sudo -u adci git -C /srv/adrepo remote set-url origin /srv/nope
+          b=$(chk); echo "$b"
+          case "$b" in *FAIL*unreachable*) ;; *) echo "missing the unreachable FAIL"; exit 1 ;; esac
+          case "$b" in *"deploy key"*) echo "offered deploy-key advice for a local path"; exit 1 ;; esac
+          # c) no origin at all is a valid local-only repo, not a failure
+          sudo -u adci git -C /srv/adrepo remote remove origin
+          c=$(chk); echo "$c"
+          case "$c" in *"OK"*"no origin"*) ;; *) echo "no-origin branch did not report ok"; exit 1 ;; esac
+          echo "OK: reachable, unreachable and no-origin are three distinct verdicts"
       # The failure this check exists for: a home the service account does not own.
       # Every other line stays green (the daemon only READS most of the home), so
       # the install reads as healthy right up until an agent writes — which is how
