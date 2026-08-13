@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck scripts/setup-agent-user.sh
+        run: shellcheck scripts/setup-agent-user.sh scripts/check-release-current.sh
       - name: Provision (twice — must be idempotent)
         run: |
           sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci
@@ -112,6 +112,28 @@ jobs:
           [ "$code" = 1 ] || { echo "expected exit 1 (broken), got $code"; exit 1; }
           sudo chown -R adci:adci /var/lib/adci/.config
           echo "OK: a root-owned .config is reported broken, not healthy"
+
+  # release.yml fires on a tag, and pushing that tag is a human step: forgotten for
+  # v0.2.5.0 and again for v0.2.5.1, so releases/latest served a binary two feature
+  # releases behind while the README told people to curl exactly that URL. Nothing
+  # noticed. This is the noticing.
+  #
+  # On main ONLY: inside a pull request the VERSION is deliberately ahead of every
+  # tag, so checking there would fail every PR by construction.
+  #
+  # The logic lives in a script, not here, because a main-only job is unexercisable
+  # by any PR — its branches are covered by test/release-current.test.ts instead.
+  release-current:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # the fallback age reads the VERSION file's history
+      - name: Is main's VERSION published?
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/check-release-current.sh
 
   test:
     runs-on: ubuntu-latest
