@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.2.5.2] - 2026-08-13
+
+### Fixed
+- **An authentication failure was reported as `done`.** The agent produced one line — `Not logged in
+  · Please run /login` — `claude -p` exited 1, and the board showed **done**: no error, an empty
+  worktree, and a ✅ notification. Observed end to end on task `t_c4d6e593`, which "completed" in 7.5
+  seconds having produced nothing.
+
+  The supervisor decided from `subtype` alone. Captured from a real failure, the terminal event is:
+
+  ```json
+  {"type":"result","subtype":"success","is_error":true,
+   "terminal_reason":"api_error","result":"Not logged in · Please run /login"}
+  ```
+
+  `subtype` says `success` on a turn that never ran. A clean turn carries `is_error:false` and
+  `terminal_reason:"completed"`, so either of those discriminates and `subtype` does not. The
+  non-zero exit arrives afterwards and is dropped, because by then the close handler finds a task
+  that is already terminal — the ordering is why the exit code could never have saved it.
+
+  Now a turn is failed when `subtype` is not success **or** `is_error` is true, and the agent's own
+  words carry into `task.error`: `result: api_error: Not logged in · Please run /login` instead of a
+  bare code. Pipeline tasks treat it as any other failed turn — bounded per-step retries, no advance,
+  since a turn that never ran cannot have completed its step.
+
+  This is the same family as the v0.2.4.1 root bug — an invisible failure — except it presented as
+  **success**, which is strictly worse than the error it replaced. Two regression tests replay the
+  captured shape (result first, then exit 1) through a real subprocess; both fail without the fix.
+
 ## [0.2.5.1] - 2026-08-12
 
 ### Fixed

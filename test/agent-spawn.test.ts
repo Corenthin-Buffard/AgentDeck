@@ -459,6 +459,58 @@ test("a transient failure retries the step, then gives up exactly once", async (
   rmSync(counter, { force: true });
 });
 
+// The exact terminal event a real authentication failure produces, captured from
+// `claude -p --output-format stream-json` run as an account with no credentials:
+// subtype "success" AND is_error true. Reading only subtype marked the task DONE
+// with an empty worktree and sent a ✅ notification (observed: t_c4d6e593, 7.5s).
+//
+// The fake exits 1 like the real CLI does, so this also pins the ordering: the
+// result arrives first and decides, and the non-zero exit lands on a task that is
+// already terminal. If the result is mishandled, the exit code cannot save it.
+const AUTH_FAILURE_RESULT =
+  '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error",' +
+  '"result":"Not logged in · Please run /login"}';
+
+test("an authentication failure is an error, not a done — subtype alone lies", async () => {
+  config.claudeBin = fakeBin("noauth", [
+    `printf '%s\\n' '{"type":"system","subtype":"init","session_id":"s"}'`,
+    `printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Not logged in · Please run /login"}]},"error":"authentication_failed"}'`,
+    `printf '%s\\n' '${AUTH_FAILURE_RESULT}'`,
+    `exit 1`,
+  ].join("\n"));
+  const t = makeTask("t_auth_fail", false);
+
+  launchTask(t);
+  expect(await until(() => store.getTask(t.id)?.status === "error")).toBe(true);
+
+  const done = store.getTask(t.id)!;
+  expect(done.status).not.toBe("done");
+  // The agent's own words survive into the error: "result: api_error" alone tells
+  // the operator nothing they can act on.
+  expect(done.error).toContain("api_error");
+  expect(done.error).toContain("Not logged in");
+});
+
+test("a pipeline task treats it as a failed turn, bounded by the retry budget", async () => {
+  twoStepTable("plan /spec\nWrite the spec.\n\nreview /review\nReview the diff.\n");
+  const counter = join(dir, "auth-tries.log");
+  config.claudeBin = fakeBin("noauth-pipe", [
+    `printf 'x\\n' >> "${counter}"`,
+    `printf '%s\\n' '{"type":"system","subtype":"init","session_id":"s"}'`,
+    `printf '%s\\n' '${AUTH_FAILURE_RESULT}'`,
+    `exit 1`,
+  ].join("\n"));
+  const t = makeTask("t_auth_pipe", true);
+
+  launchTask(t);
+  expect(await until(() => store.getTask(t.id)?.status === "error", 10000)).toBe(true);
+  // Never advances: a turn that never ran cannot have completed its step.
+  expect(store.getTask(t.id)!.step).toBe(0);
+  const tries = readFileSync(counter, "utf8").trim().split("\n").length;
+  expect(tries).toBeLessThanOrEqual(3);   // bounded, not a permanent respawn loop
+  rmSync(counter, { force: true });
+});
+
 test("a free-form task is untouched by any of this", async () => {
   config.claudeBin = fakeAgent("plain", { final: "all done" });
   const t = makeTask("t_freeform", false);

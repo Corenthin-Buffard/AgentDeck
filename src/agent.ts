@@ -785,14 +785,31 @@ function attach(task: Task, child: ChildProcess) {
       if (cur && canStillReview(cur.phase)) void refreshPlanReviews(cur);
       const finalText = (text || e.result || "").trim();
       log("text", finalText.slice(0, EVENT_TEXT_MAX));
-      if (e.subtype !== "success") {
-        // TRANSIENT: the turn itself failed (API error, aborted). For a pipeline
-        // task, retrying the step is worth it — losing six completed steps to one
-        // blip would be the daemon's fault, not the agent's. A step that RAN and
-        // reported it could not proceed exits successfully and is handled below,
-        // so this branch never retries something that will fail again forever.
-        if (!retryStep(`result: ${e.subtype}`)) {
-          patch({ status: "error", error: `result: ${e.subtype}` });
+      // `subtype` ALONE does not mean the turn worked. Captured from a real
+      // authentication failure, the terminal event is:
+      //   {"type":"result","subtype":"success","is_error":true,
+      //    "terminal_reason":"api_error","result":"Not logged in · Please run /login"}
+      // Reading only `subtype` sent that straight down the success path: the text
+      // is not a question, the pipeline had nothing to advance, so the task was
+      // marked DONE — no error, empty worktree, and a ✅ notification. Worse than
+      // the failure it replaced, because it reported success. A clean turn carries
+      // is_error:false / terminal_reason:"completed", so the two discriminate;
+      // subtype does not.
+      const failed = e.subtype !== "success" || e.is_error === true;
+      if (failed) {
+        // TRANSIENT: the turn itself failed (API error, auth, aborted). For a
+        // pipeline task, retrying the step is worth it — losing six completed steps
+        // to one blip would be the daemon's fault, not the agent's. A step that RAN
+        // and reported it could not proceed exits successfully with is_error false
+        // and is handled below, so this branch never retries something that will
+        // fail again forever. A permanently-failing turn (auth) still costs only
+        // the bounded per-step retries, each of which dies in about a second.
+        const why = e.subtype !== "success" ? String(e.subtype) : String(e.terminal_reason || "is_error");
+        // The agent's own words are the actionable half — "Not logged in · Please
+        // run /login" tells the operator what to do; "result: api_error" does not.
+        const reason = finalText ? `result: ${why}: ${finalText.slice(0, EVENT_TEXT_MAX)}` : `result: ${why}`;
+        if (!retryStep(reason)) {
+          patch({ status: "error", error: reason });
           notify(store.getTask(task.id)!, "error");
         }
       } else if (looksLikeQuestion(finalText)) {
