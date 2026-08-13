@@ -68,6 +68,22 @@ jobs:
           set -e
           [ "$code" = 2 ] || { echo "expected exit 2 (degraded), got $code"; exit 1; }
           echo "OK: --check reports 2 — runs, but the flagged half of the workflow would not"
+      # The failure this check exists for: a home the service account does not own.
+      # Every other line stays green (the daemon only READS most of the home), so
+      # the install reads as healthy right up until an agent writes — which is how
+      # a root-owned .config survived unnoticed until `gh auth login` hit it.
+      - name: --check catches a home the agent does not own
+        run: |
+          sudo chown root:root /var/lib/adci/.config
+          set +e
+          sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci --check > /tmp/chk.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/chk.txt
+          grep -q "home ownership" /tmp/chk.txt || { echo "no home-ownership line in the report"; exit 1; }
+          [ "$code" = 1 ] || { echo "expected exit 1 (broken), got $code"; exit 1; }
+          sudo chown -R adci:adci /var/lib/adci/.config
+          echo "OK: a root-owned .config is reported broken, not healthy"
 
   test:
     runs-on: ubuntu-latest

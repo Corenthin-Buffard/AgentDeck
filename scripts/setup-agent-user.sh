@@ -196,6 +196,23 @@ check() {
 
   if [ -d "$AD_HOME" ]; then ok "home" "$AD_HOME"; else fail "home" "$AD_HOME is missing"; fi
 
+  # A home the service account does not fully OWN is the quiet killer. The daemon
+  # only reads most of it, so every check above stays green and the dashboard looks
+  # healthy — until an agent WRITES. Observed here: `.config` was left root-owned by
+  # a hand-built install, and `gh auth login` died on `mkdir: permission denied`
+  # while everything else reported fine. Any `sudo mkdir` in someone's home
+  # recreates it, so check the whole top level rather than the dirs we happen to
+  # create.
+  if [ -d "$AD_HOME" ]; then
+    local foreign
+    foreign="$(find "$AD_HOME" -maxdepth 1 -mindepth 1 ! -user "$AD_USER" -printf '%p ' 2>/dev/null)"
+    if [ -z "$foreign" ]; then
+      ok "home ownership" "everything directly under $AD_HOME belongs to $AD_USER"
+    else
+      fail "home ownership" "$AD_USER does not own: ${foreign% } — fix with: chown -R $AD_USER: ${foreign% }"
+    fi
+  fi
+
   if [ -f "$UNIT" ]; then
     if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze verify "$UNIT" 2>&1 | grep -q .; then
       ok "unit" "$UNIT (verified)"

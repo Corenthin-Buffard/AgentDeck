@@ -28,6 +28,12 @@
   service PATH. It exits 0 (ready), 2 (the daemon will run but a flagged part of the workflow will
   not, e.g. `/ship` without `gh`) or 1 (broken; don't start it). Checking with your own PATH is how
   an install gets certified and then fails on first contact.
+- **A home-ownership check.** A service account that does not own its own `$HOME` is the quiet
+  failure: the daemon only *reads* most of it, so every other line of `--check` stays green and the
+  dashboard looks healthy, until an agent *writes*. Found the hard way on a hand-built install where
+  `.config` was left root-owned — `gh auth login` died on `mkdir: permission denied` while nothing
+  else complained. The check scans the whole top level of the home rather than the three directories
+  the script happens to create, because any later `sudo mkdir` recreates the state.
 - **A CI job that runs the script for real**, twice, and asserts the generated unit parses
   (`systemd-analyze verify`) — plus a case asserting `--check` still *fails* on an unfinished
   install, so the gate can't silently become inert.
