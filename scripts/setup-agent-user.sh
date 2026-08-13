@@ -277,13 +277,18 @@ check() {
     # every task fails at authentication. Seen here hours after the copy, with the
     # daemon reporting the failed task as done.
     # The grep runs INSIDE run_as so the token itself never crosses back out.
-    local exp now
+    local exp now login_cmd
+    # A pasteable command, not "run claude login as X": under `su -s` there is no
+    # .bashrc, so a PATH-less invocation dies with `claude: command not found` —
+    # which is the very trap the RUN-AS convention exists to warn about, and it
+    # caught the author of this script.
+    login_cmd="su -s /bin/bash $AD_USER -c 'HOME=$AD_HOME PATH=$SERVICE_PATH claude login'"
     exp="$(run_as "grep -o '\"expiresAt\":[0-9]*' ~/.claude/.credentials.json | head -1 | cut -d: -f2" 2>/dev/null || echo "")"
     now="$(( $(date +%s) * 1000 ))"
     if [ -z "$exp" ] || [ "$exp" = "0" ]; then
-      fail "claude creds" "$AD_HOME/.claude/.credentials.json has no usable expiry — likely a stale copy. Run 'claude login' as $AD_USER"
+      fail "claude creds" "$AD_HOME/.claude/.credentials.json has no usable expiry — likely a stale copy. Fix: $login_cmd"
     elif [ "$exp" -lt "$now" ] 2>/dev/null; then
-      fail "claude creds" "expired at $(date -u -d "@$((exp/1000))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$exp") — run 'claude login' as $AD_USER"
+      fail "claude creds" "expired at $(date -u -d "@$((exp/1000))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$exp") — fix: $login_cmd"
     else
       ok "claude creds" "valid until $(date -u -d "@$((exp/1000))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$exp")"
     fi
