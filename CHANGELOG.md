@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.2.5.3] - 2026-08-13
+
+### Fixed
+- **The install URL served a binary two feature releases behind.** `releases/latest` handed out
+  **v0.2.4.1** while `main` was at 0.2.5.1 — no pipeline, no non-root work — paired with an installer
+  the runbook fetched from `main`, describing features that binary did not have. Cutting a release is
+  a manual `git tag`, it was forgotten for v0.2.5.0 and again for v0.2.5.1, and nothing detected it.
+
+  Found while closing the "make the repo public" TODO, which turned out to be **already done**
+  (`visibility=PUBLIC`, both anonymous URLs answering 200). The repo was public; what it published
+  was stale.
+
+### Added
+- **`scripts/check-release-current.sh`** and a CI job that runs it on `main`. It compares main's
+  VERSION against the **published release** — not merely against the existence of a tag, so a release
+  build that failed is caught too — and fails only once the last release is older than three days.
+  Not on every cycle: main is legitimately ahead between a merge and its tag, and a repo that is
+  routinely red teaches everyone to ignore red. It never concludes from a non-answer either; a
+  rate-limited or unreachable API reports that it cannot tell, because the alternative is sending the
+  operator to tag a version that is already published.
+
+  The first cut measured the age of the VERSION bump and was wrong: every bump resets that clock, so
+  a project shipping several versions a day would never accumulate age while the install URL stayed
+  permanently behind. It measures the age of the published release instead.
+
+  The logic lives in a script rather than inline in the workflow because a `main`-only job cannot be
+  exercised by any pull request — its four branches would have shipped having run nowhere. Same reason
+  46f489f moved the agent launch command out of the spawn call. `test/release-current.test.ts` drives
+  all four through the real subprocess, and the red one asserts the exact `git tag` command it prints.
+- **The installer ships as a release asset.** The runbook curled `setup-agent-user.sh` from `main`
+  while the binary came from `releases/latest` — two sources for one install, guaranteed to disagree
+  the moment main moves. One URL now, from the same release as the daemon.
+
 ## [0.2.5.2] - 2026-08-13
 
 ### Fixed

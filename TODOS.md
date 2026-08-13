@@ -63,8 +63,13 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Distribution (OSS)
 
-- **Make the repo public** — **Priority: P2**
-  The release pipeline + binaries are ready; flipping visibility to public (`gh repo edit Corenthin-Buffard/AgentDeck --visibility public`) unblocks the README's anonymous `curl .../releases/latest/download/...` install URL. README + LICENSE (MIT) are public-ready, the codebase is fully rebranded to AgentDeck, and no secrets are tracked in the tree or history.
+- **Is `releases/latest` the right install channel for a project moving this fast?** — **Priority: P4**
+  The release-drift guard (v0.2.5.3) narrows the window; it does not close it. This project shipped
+  three versions in one day, so any release is stale within hours of being cut — the two-versions-behind
+  binary that prompted the guard is just the extreme of a permanent condition. Three answers exist and
+  none was chosen: make building from source the documented path, publish on every merge (rejected once
+  already — it publishes binaries from any hasty merge), or accept that a release is a periodic snapshot
+  and say so in the README instead of implying currency. Surfaced while closing the P2, 2026-08-13.
 
 ## Notifications
 
@@ -80,6 +85,8 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
   `DESIGN.md` ships at the repo root: tokens with their roles, the three color rules, the mono-as-identity decision, the two-row header invariants, interaction states, and the a11y floors. Written after the design review that found the approved brand lockup had been dropped during implementation — the failure mode DT5 existed to prevent.
 
 ## Completed
+
+- **v0.2.5.3** (2026-08-13) — **~~Make the repo public~~ — it already was, and verifying it found the real defect.** Measured: `visibility=PUBLIC`, and both anonymous URLs (`releases/latest/download/agentdeck-linux-x64`, the installer) answer 200. But the goal behind it was not met: `releases/latest` served **v0.2.4.1** while main was at 0.2.5.1 — the install URL handed out a binary two feature releases behind, paired with a runbook fetched from `main` describing features it did not have. Cutting a release is a manual step, forgotten twice, and nothing detected it. Now `scripts/check-release-current.sh` compares main's VERSION against the **published** release and turns main red once the last release is older than three days — not on every cycle, because a repo that is routinely red teaches everyone to ignore red. It never concludes from an unreachable API. The first cut measured the age of the VERSION bump and was wrong: every bump resets that clock, so a project shipping often would never accumulate age while the install URL stayed permanently behind. The installer now ships as a release asset, so script and binary come from one place. Four branches under test; the red one asserts the exact `git tag` command.
 
 - **v0.2.5.2** (2026-08-13) — **An authentication failure is no longer reported as `done`.** The supervisor decided from `subtype` alone, and a real auth failure emits `{"subtype":"success","is_error":true,"terminal_reason":"api_error"}` — so a task whose agent never ran was marked done, with an empty worktree and a ✅ notification (observed: `t_c4d6e593`, 7.5s). A turn is now failed when `subtype` is not success OR `is_error` is true, and the agent's own words reach `task.error`. Two regression tests replay the captured event shape through a real subprocess, including the exit-1 that arrives too late to help; both fail without the fix.
 

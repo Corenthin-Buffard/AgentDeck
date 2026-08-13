@@ -84,7 +84,8 @@ This runbook is deliberately short. `scripts/setup-agent-user.sh --check` enumer
 
 1. PROVISION — the mechanical half (DEDICATED)
 - Get the script (from a clone: `scripts/setup-agent-user.sh`; or download it):
-    curl -fsSL https://raw.githubusercontent.com/Corenthin-Buffard/AgentDeck/main/scripts/setup-agent-user.sh -o /tmp/setup-agent-user.sh && chmod +x /tmp/setup-agent-user.sh
+    curl -fsSL https://github.com/Corenthin-Buffard/AgentDeck/releases/latest/download/setup-agent-user.sh -o /tmp/setup-agent-user.sh && chmod +x /tmp/setup-agent-user.sh
+  Same release as the binary in step 3, on purpose: a script from one version and a daemon from another is an install nobody tested.
 - Run it: `sudo /tmp/setup-agent-user.sh --user agentdeck --home /var/lib/agentdeck`
   It creates the account, its directories, `/etc/systemd/system/agentdeck.service`, and reloads systemd. It is idempotent, and it deliberately does NOT enable or start anything — the daemon cannot work before credentials and a repo.
 - Do NOT create anything else in that home with `sudo` afterwards: root-owned directories under RUN_HOME read as healthy until an agent writes. `--check` catches it.

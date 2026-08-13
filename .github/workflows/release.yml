@@ -60,9 +60,16 @@ jobs:
             || { echo "artifact booted unhealthy:"; curl -s http://127.0.0.1:8899/api/health; kill $PID 2>/dev/null; exit 1; }
           kill $PID 2>/dev/null || true
           echo "OK: v$BIN_VERSION boots and reports healthy"
+      # The installer ships WITH the binaries. The runbook used to curl it from
+      # `main` while the binary came from releases/latest — two sources for one
+      # install, guaranteed to disagree the moment main moves.
+      - name: Stage the installer alongside the binaries
+        run: cp scripts/setup-agent-user.sh dist/
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/agentdeck-*
+          files: |
+            dist/agentdeck-*
+            dist/setup-agent-user.sh
           fail_on_unmatched_files: true
           generate_release_notes: true
