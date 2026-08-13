@@ -247,8 +247,9 @@ export function rootWillBlockAgents(): boolean {
  *  wherever they hit it first. */
 export const ROOT_BLOCKED_MESSAGE =
   "running as root: Claude Code refuses --dangerously-skip-permissions as uid 0, so agents cannot start and new tasks are refused. " +
-  "Run the daemon as an unprivileged user (systemd: User=), or set AGENTDECK_ALLOW_ROOT=true, " +
-  "or set AGENTDECK_SKIP_PERMISSIONS=false (agents run, gstack skills won't resolve).";
+  "The fix is to run the daemon as an unprivileged user — scripts/setup-agent-user.sh creates one and installs the systemd unit (see the README runbook). " +
+  "Last resorts, in that order: AGENTDECK_SKIP_PERMISSIONS=false (agents run, gstack skills won't resolve), " +
+  "or AGENTDECK_ALLOW_ROOT=true (agents run AS ROOT with permissions skipped — the blast radius becomes the whole box).";
 
 /** Resolve a project by id. Reads the live registry so daemon.ts boot-validation
  *  (which may drop invalid entries) is reflected. */

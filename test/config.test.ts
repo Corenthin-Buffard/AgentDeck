@@ -156,6 +156,17 @@ describe("rootWillBlockAgents", () => {
     expect(ROOT_BLOCKED_MESSAGE).toContain("AGENTDECK_SKIP_PERMISSIONS=false");
     expect(ROOT_BLOCKED_MESSAGE).toContain("unprivileged user");
   });
+
+  test("it offers the real fix before the workarounds", () => {
+    // Order is the point, not the presence: an operator reading a red banner acts
+    // on the first remedy they see, and for two releases that was ALLOW_ROOT —
+    // which keeps every agent running as root instead of removing the problem.
+    const fix = ROOT_BLOCKED_MESSAGE.indexOf("unprivileged user");
+    const skip = ROOT_BLOCKED_MESSAGE.indexOf("AGENTDECK_SKIP_PERMISSIONS=false");
+    const allowRoot = ROOT_BLOCKED_MESSAGE.indexOf("AGENTDECK_ALLOW_ROOT=true");
+    expect(fix).toBeLessThan(skip);
+    expect(skip).toBeLessThan(allowRoot);
+  });
 });
 
 // ── AGENTDECK_PIPELINE arms autonomous behaviour, so it is opt-IN ────────────

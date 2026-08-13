@@ -9,6 +9,110 @@ permissions:
   contents: read
 
 jobs:
+  # The root-install runbook delegates its mechanical half to this script. An
+  # install script the CI never RUNS is prose with a .sh extension, so this job
+  # executes it for real on a throwaway runner — twice, because the runbook tells
+  # operators to re-run it, and once more in --check mode to prove the check can
+  # still fail. A gate that always passes is the failure mode to fear here.
+  setup-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/setup-agent-user.sh
+      - name: Provision (twice — must be idempotent)
+        run: |
+          sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci
+          id adci
+          sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci
+          echo "OK: second run succeeded too"
+      - name: The generated unit is valid to systemd
+        run: |
+          # systemd-analyze verify EXITS 1 when ExecStart doesn't resolve, and the
+          # runner has no agentdeck binary. Stub it so this step tests the unit we
+          # generate rather than the runner's lack of an install — same reason the
+          # smoke test below stubs `claude` on PATH.
+          sudo install -m 755 /bin/true /usr/local/bin/agentdeck
+          systemd-analyze verify /etc/systemd/system/adci.service
+          grep -q '^User=adci' /etc/systemd/system/adci.service
+          grep -q '^RestartPreventExitStatus=78' /etc/systemd/system/adci.service
+          echo "OK: unit parses and carries the directives the runbook promises"
+      # A bare account has no claude, no credentials and no gstack: --check MUST
+      # report FAIL (exit 1). If this ever exits 0, the runbook's "green before you
+      # start the daemon" gate is inert and would certify a dead install.
+      - name: --check fails on an unfinished install
+        run: |
+          if sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci --check; then
+            echo "--check passed on an install with no claude and no credentials"; exit 1
+          fi
+          echo "OK: --check correctly refuses an unfinished install"
+      # The gate has three answers: ready (0), ready-but-degraded (2), broken (1),
+      # and the runbook branches on which one it gets. The step above proves it can
+      # say "broken". This proves 2 is REACHABLE and DISTINCT from 1 — otherwise the
+      # runbook would halt on a benign warning, or worse, walk past a real failure.
+      # Everything that blocks the daemon gets satisfied; gh stays unauthenticated
+      # and gstack-review-read stays absent, so at least one warning is guaranteed.
+      - name: --check separates "degraded" from "broken"
+        run: |
+          sudo git init -q /srv/adrepo
+          sudo mkdir -p /var/lib/adci/.claude/skills/gstack/bin
+          # The stub answers `auth status` the way a logged-in Claude Code does,
+          # because --check asks the CLI rather than reading the credentials file:
+          # a copied file whose refresh token has rotated looks perfect and still
+          # fails every task, which is how this install broke for real.
+          printf '#!/bin/sh\ncase "$*" in\n*"auth status"*) echo "{\\"loggedIn\\":true}" ;;\n*) echo stub-claude ;;\nesac\n' \
+            | sudo tee /var/lib/adci/.local/bin/claude >/dev/null
+          sudo chmod +x /var/lib/adci/.local/bin/claude
+          echo '1.0.0.0'        | sudo tee /var/lib/adci/.claude/skills/gstack/VERSION >/dev/null
+          sudo chown -R adci:adci /var/lib/adci /srv/adrepo
+          echo 'AGENTDECK_TARGET_REPO=/srv/adrepo' | sudo tee -a /var/lib/adci/.config/agentdeck/env >/dev/null
+          set +e
+          sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci --check
+          code=$?
+          set -e
+          [ "$code" = 2 ] || { echo "expected exit 2 (degraded), got $code"; exit 1; }
+          echo "OK: --check reports 2 — runs, but the flagged half of the workflow would not"
+      # The probe decides ok vs FAIL vs WARN, and those branches are the whole value
+      # of the gate. Local bare repos exercise them with no network, no SSH and no
+      # secret. Deliberately out of reach here: a real `Permission denied (publickey)`
+      # and a real timeout both need a live host, so they are covered by hand.
+      - name: The remote probe separates reachable from unreachable
+        run: |
+          chk() { sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci --check 2>&1 \
+                    | sed 's/\x1b\[[0-9;]*m//g' | grep -E '^ +(OK|WARN|FAIL) +remote' || true; }
+          # a) a local bare repo is a legitimate remote — must report reachable
+          sudo git init -q --bare /srv/adbare && sudo chown -R adci:adci /srv/adbare
+          sudo -u adci git -C /srv/adrepo remote add origin /srv/adbare
+          a=$(chk); echo "$a"
+          case "$a" in *"OK"*reachable*) ;; *) echo "reachable branch did not report ok"; exit 1 ;; esac
+          # b) a local path that isn't there must FAIL — and must NOT advise a deploy
+          #    key, because git says "could not read from remote" for both cases
+          sudo -u adci git -C /srv/adrepo remote set-url origin /srv/nope
+          b=$(chk); echo "$b"
+          case "$b" in *FAIL*unreachable*) ;; *) echo "missing the unreachable FAIL"; exit 1 ;; esac
+          case "$b" in *"deploy key"*) echo "offered deploy-key advice for a local path"; exit 1 ;; esac
+          # c) no origin at all is a valid local-only repo, not a failure
+          sudo -u adci git -C /srv/adrepo remote remove origin
+          c=$(chk); echo "$c"
+          case "$c" in *"OK"*"no origin"*) ;; *) echo "no-origin branch did not report ok"; exit 1 ;; esac
+          echo "OK: reachable, unreachable and no-origin are three distinct verdicts"
+      # The failure this check exists for: a home the service account does not own.
+      # Every other line stays green (the daemon only READS most of the home), so
+      # the install reads as healthy right up until an agent writes — which is how
+      # a root-owned .config survived unnoticed until `gh auth login` hit it.
+      - name: --check catches a home the agent does not own
+        run: |
+          sudo chown root:root /var/lib/adci/.config
+          set +e
+          sudo ./scripts/setup-agent-user.sh --user adci --home /var/lib/adci --check > /tmp/chk.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/chk.txt
+          grep -q "home ownership" /tmp/chk.txt || { echo "no home-ownership line in the report"; exit 1; }
+          [ "$code" = 1 ] || { echo "expected exit 1 (broken), got $code"; exit 1; }
+          sudo chown -R adci:adci /var/lib/adci/.config
+          echo "OK: a root-owned .config is reported broken, not healthy"
+
   test:
     runs-on: ubuntu-latest
     steps:

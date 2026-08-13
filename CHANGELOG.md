@@ -1,5 +1,90 @@
 # Changelog
 
+## [0.2.5.1] - 2026-08-12
+
+### Fixed
+- **The install runbook still produced the broken install it now detects.** v0.2.4.1 taught the
+  daemon to recognise that it was running as root and explain itself. The README, meanwhile, kept
+  installing as root and offering `AGENTDECK_ALLOW_ROOT` as one of two equal options — so anyone
+  following it reproduced exactly the situation that produced the bug report, and the fastest way out
+  of the red banner was the workaround rather than the fix. The README also contradicted itself:
+  it called `User=` in the systemd unit "the supported configuration" while the runbook wrote a
+  `systemd --user` unit, where `User=` is not a valid directive.
+
+  The runbook now branches on `uname -s` and then `id -u`. Installing as yourself is unchanged.
+  Installing as **root** creates a dedicated unprivileged service account and a system unit for it,
+  and the install is not declared successful until a witness task actually runs in the target repo.
+  `AGENTDECK_ALLOW_ROOT` is no longer offered there; it remains documented as a last resort for
+  machines where no service account can be created, and its behaviour is unchanged.
+
+### Changed
+- **The runbook shrank to what a script cannot decide.** It was followed on a real machine and took
+  nine round trips: wrong step order, `claude login` instead of `claude auth login`, a command
+  missing its PATH, copied credentials that rot, a sign-in URL printed twice, root-owned directories
+  under the service home, an unregistered deploy key, and a witness task marked `done` in 7.5 seconds
+  having produced nothing. Each was patched into the prose as it happened.
+
+  The diagnosis: three artifacts describe the same requirements and only one can lie. The script and
+  `--check` are executed, so they are true by construction; the runbook is a narrative nobody runs.
+  So the prose now keeps only the decisions — which account, which credentials, which repo, which key
+  — and **every failing `--check` line prints the command that fixes it**. Installing gstack, bun,
+  bunx, node and the binary left the text entirely: the tool asks for them and hands you the command.
+
+### Added
+- **`scripts/setup-agent-user.sh`** — the mechanical half of the root path: creates the account and
+  its directories, writes `/etc/systemd/system/agentdeck.service`, reloads systemd. Idempotent, and
+  deliberately does *not* enable or start the service, because credentials and repo access are human
+  decisions that must come first. It is the single source of truth for the unit's contents; the
+  README shows the invocation rather than a second copy that would drift.
+- **`--check`**, an audit of what the *agent* needs — `claude`, its own Claude Code credentials,
+  gstack, `git`, an authenticated `gh`, `bun`/`bunx`/`node` — resolved as the service user, on the
+  service PATH. It exits 0 (ready), 2 (the daemon will run but a flagged part of the workflow will
+  not, e.g. `/ship` without `gh`) or 1 (broken; don't start it). Checking with your own PATH is how
+  an install gets certified and then fails on first contact.
+- **A credentials check that asks Claude Code, instead of reading its credentials file.** `--check`
+  now runs `claude auth status` as the service user and reads `loggedIn`. Copying
+  `~/.claude/.credentials.json` to the service account is the obvious way to give it a session, and it
+  rots: the OAuth refresh token rotates, so the copy works until your own session refreshes and then
+  every agent fails at authentication. Measured — the copy was dead within hours, `--check` reported
+  the file as present the whole time, and the daemon marked the failed task `done`. A file check
+  cannot see that; the CLI's own verdict can. The runbook now leads with `claude auth login` under the
+  service account and marks copying a stopgap.
+- **A home-ownership check.** A service account that does not own its own `$HOME` is the quiet
+  failure: the daemon only *reads* most of it, so every other line of `--check` stays green and the
+  dashboard looks healthy, until an agent *writes*. Found the hard way on a hand-built install where
+  `.config` was left root-owned — `gh auth login` died on `mkdir: permission denied` while nothing
+  else complained. The check scans the whole top level of the home rather than the three directories
+  the script happens to create, because any later `sudo mkdir` recreates the state.
+- **A remote-reachability probe.** `--check` verified the agent could write the repo *locally* and
+  never that it could reach it, so an install passed every line and then died on its first task with
+  `Permission denied (publickey)`. It now runs `git ls-remote` as the service user with
+  `BatchMode=yes` — not decoration: `--check` runs from a terminal, the daemon runs under systemd with
+  none, and SSH's default is to ASK before trusting an unknown host, so without it the probe goes green
+  where the daemon's push dies on `Host key verification failed`. Distinguishes an unregistered deploy
+  key (and prints the `gh repo deploy-key add` line, repo slug derived from the remote URL) from an
+  unseeded host key, a local path that isn't there, a timeout, and a repo with no remote at all.
+- **`--check` runs unprivileged when you are the service account.** The root guard covered both modes,
+  so a SELF-mode install — you installing for yourself — could not open the gate the runbook tells it
+  to open. The guard moved to provisioning, where root is actually needed.
+- **A warning when the agent's `gh` token is wider than its deploy key.** The device flow mints `repo`
+  scope: write access to every repo the account owns, which quietly undoes the reason the deploy key
+  was scoped to one. A warning, not a failure — a broad token works, it is only broader than intended.
+- **A "when it breaks, start from the message" index** in the README: eight symptoms, each pointing at
+  the step that explains it. Every row cost a round trip during the real install, because each message
+  points somewhere other than its cause.
+- **A CI job that runs the script for real**, twice, and asserts the generated unit parses
+  (`systemd-analyze verify`) — plus a case asserting `--check` still *fails* on an unfinished
+  install, so the gate can't silently become inert.
+- **A migration section** for existing root installs, which opens with a required drain: Claude Code
+  stores transcripts under `$HOME`, so changing the daemon's `HOME` makes every stored `sessionId`
+  unresolvable and `claude --resume` loses those tasks silently.
+
+### Changed
+- `ROOT_BLOCKED_MESSAGE` now leads with the real fix and lists the workarounds after it, mildest
+  first — an operator acting on a red banner acts on the first remedy they read, and for two
+  releases that was the one keeping every agent at uid 0. A test asserts the order, not just the
+  presence of each string.
+
 ## [0.2.5.0] - 2026-08-12
 
 ### Added

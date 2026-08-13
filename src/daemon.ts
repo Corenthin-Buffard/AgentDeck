@@ -7,8 +7,11 @@ import { startAutoCleanSweep } from "./cleanup.ts";
 import { hookSettings } from "./hooks-config.ts";
 import { notice } from "./notices.ts";
 
-// AgentDeck daemon boot. Runs as a systemd --user service on the VPS so agents
-// survive SSH/browser disconnects (they live here, not on your laptop).
+// AgentDeck daemon boot. Runs as a systemd service on the VPS — as a SYSTEM unit
+// under a dedicated unprivileged user when you install as root (the supported
+// shape; see scripts/setup-agent-user.sh), or as a `systemd --user` unit when you
+// install as yourself. Either way it lives on the server, so agents survive
+// SSH/browser disconnects — they run here, not on your laptop.
 //
 // NOTE: this is NOT the process entry point — src/main.ts is, because it must
 // handle --version/--help BEFORE config.ts is imported (config.ts does real I/O
