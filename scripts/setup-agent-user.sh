@@ -22,6 +22,7 @@ set -euo pipefail
 AD_USER="agentdeck"
 AD_HOME=""
 AD_BIN="/usr/local/bin/agentdeck"
+AD_BIN_SET=0
 MODE="provision"
 
 usage() {
@@ -50,7 +51,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --user)  AD_USER="${2:?--user needs a value}"; shift 2 ;;
     --home)  AD_HOME="${2:?--home needs a value}"; shift 2 ;;
-    --bin)   AD_BIN="${2:?--bin needs a value}";  shift 2 ;;
+    --bin)   AD_BIN="${2:?--bin needs a value}"; AD_BIN_SET=1; shift 2 ;;
     --check) MODE="check"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 64 ;;
@@ -72,17 +73,43 @@ fi
 IS_SELF=0
 [ "$(id -un)" = "$AD_USER" ] && IS_SELF=1
 
-if [ "$IS_SELF" -eq 1 ]; then
-  UNIT="$AD_HOME/.config/systemd/user/agentdeck.service"
-else
-  UNIT="/etc/systemd/system/${AD_USER}.service"
+# Which SHAPE the install has is a different question from who is running this.
+# Inspecting a dedicated install AS the service account is legitimate (and is how
+# the unprivileged path gets tested), so infer the shape from what exists on disk
+# and only fall back to IS_SELF for an install that does not exist yet.
+UNIT_SYSTEM="/etc/systemd/system/${AD_USER}.service"
+UNIT_USER="$AD_HOME/.config/systemd/user/agentdeck.service"
+if   [ -f "$UNIT_SYSTEM" ]; then UNIT="$UNIT_SYSTEM"
+elif [ -f "$UNIT_USER" ];   then UNIT="$UNIT_USER"
+elif [ "$IS_SELF" -eq 1 ];  then UNIT="$UNIT_USER"
+else                             UNIT="$UNIT_SYSTEM"
 fi
 ENV_FILE="$AD_HOME/.config/agentdeck/env"
 
 # The PATH the service runs with. Every check below uses this exact string, so a
 # tool that resolves here is a tool the daemon can actually spawn — checking with
 # your own interactive PATH is how you certify an install that then fails.
-SERVICE_PATH="/usr/local/bin:/usr/bin:/bin:$AD_HOME/.local/bin"
+#
+# The two modes run with different PATHs, so the check has to follow. A SELF unit
+# is written with your interactive PATH plus ~/.local/bin and ~/.bun/bin (that is
+# what the runbook tells you to paste); probing the DEDICATED shape there reports
+# a bun installed at its own default location as missing.
+if [ "$IS_SELF" -eq 1 ]; then
+  SERVICE_PATH="$PATH:$AD_HOME/.local/bin:$AD_HOME/.bun/bin"
+else
+  SERVICE_PATH="/usr/local/bin:/usr/bin:/bin:$AD_HOME/.local/bin"
+fi
+
+# Same story for the binary, and the same trap: a SELF install has no root so it
+# lands in ~/.local/bin, but a DEDICATED install inspected BY the service account
+# still has it in /usr/local/bin. Take whichever is actually there; only when
+# neither exists does the mode decide what to recommend.
+if [ "$AD_BIN_SET" -eq 0 ]; then
+  if   [ -x "/usr/local/bin/agentdeck" ];        then AD_BIN="/usr/local/bin/agentdeck"
+  elif [ -x "$AD_HOME/.local/bin/agentdeck" ];   then AD_BIN="$AD_HOME/.local/bin/agentdeck"
+  elif [ "$IS_SELF" -eq 1 ];                     then AD_BIN="$AD_HOME/.local/bin/agentdeck"
+  fi
+fi
 
 # ── preconditions ──────────────────────────────────────────────────────────────
 # System accounts + a system-wide unit are Linux/systemd concepts. On macOS there
