@@ -110,6 +110,11 @@ Install AgentDeck (a self-hosted orchestrator for parallel Claude Code agents) a
         parsed as a PROMPT, so you get an authentication error that looks like a broken session.
           su -s /bin/bash agentdeck -c 'HOME=/var/lib/agentdeck PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/agentdeck/.local/bin claude auth login'
         Verify with `claude auth status`, which reports `"loggedIn": true` — this is what --check reads.
+        The CLI prints its sign-in URL wrapped in a terminal hyperlink escape (OSC 8), so the URL
+        appears TWICE back to back and copying it out of a log gives you a truncated one. The
+        truncation drops `scope=`, and the browser then says "Invalid OAuth request: missing scope
+        parameter" — which looks like a broken account, not a bad copy-paste. Take the first copy
+        only, or extract it: `tr '\007' '\n' < out | sed 's/\x1b]8;;//' | grep -m1 -o 'https://[^ ]*'`
     (b) copy my `~/.claude/.credentials.json` to $RUN_HOME/.claude/.credentials.json (chown to RUN_USER, mode 0600).
   Immediate, and it ROTS: the OAuth refresh token rotates, so the copy keeps working only until MY
   session refreshes, after which every agent fails at authentication. Measured here — the copy was
