@@ -165,11 +165,19 @@
   .aside{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:8px;padding:13px 16px;border-left:1px solid var(--line-soft);min-width:150px}
   .ago{font-family:var(--mono);font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
   .row.waiting .ago{color:var(--wait)}.row.error .ago{color:var(--err)}
-  .btn{font-family:var(--sans);font-size:13px;font-weight:600;cursor:pointer;padding:7px 14px;border-radius:6px;border:1px solid transparent;white-space:nowrap}
+  /* inline-flex + no underline so an <a class="btn"> matches a <button> exactly.
+     The preview link is the first anchor on this page; see DESIGN.md. */
+  .btn{font-family:var(--sans);font-size:13px;font-weight:600;cursor:pointer;padding:7px 14px;border-radius:6px;border:1px solid transparent;white-space:nowrap;display:inline-flex;align-items:center;text-decoration:none}
   .btn.primary{background:var(--wait);color:#14100a;border-color:var(--wait)}
   .btn.danger{background:transparent;color:var(--err);border-color:var(--err)}
   .btn.ghost{background:transparent;color:var(--dim);border-color:var(--line)}
+  /* Preview state is never --err or --wait: those are reserved for AGENT state
+     (DESIGN.md rule 1), and a dev server that won't boot is not the task failing. */
+  .btn[disabled]{opacity:.5;cursor:default}
   .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  /* Two controls per row now, so they need their own row box — .aside becomes a
+     space-between flex row under 620px and would otherwise fling them apart. */
+  .acts{display:flex;gap:8px;align-items:center}
   .empty{margin-top:26px;padding:22px;border:1px dashed var(--line);border-radius:8px;color:var(--dim);font-family:var(--mono);font-size:13px;text-align:center}
   /* drawer */
   .scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .15s}
@@ -214,6 +222,7 @@
     .opt{min-height:44px}
     .projsel{flex:1 1 auto;min-width:0}
     .notice .x{min-width:44px;min-height:44px}
+    .acts .btn{min-height:44px}
     .projsel select{min-height:44px;flex:1 1 auto;max-width:none}}
 </style>
 </head>
@@ -280,6 +289,11 @@ const BRANCH_ICON=`<svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="
   +`<path d="M3.5 10V4M3.5 7h2.5a2 2 0 0 0 2-2V4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>`
   +`<circle cx="3.5" cy="2.6" r="1.4" fill="currentColor"/><circle cx="8" cy="2.6" r="1.4" fill="currentColor"/></svg>`;
 const AD_TOKEN=(document.querySelector('meta[name=ad-token]')||{}).content||"";
+const AD_PREVIEW=((document.querySelector('meta[name=ad-preview]')||{}).content||"")==="true";
+// The dev server binds 127.0.0.1:<port> ON THE DAEMON'S BOX, so the link only
+// resolves once that port is forwarded. location.hostname (not location.host)
+// because the pool port is not the dashboard's port.
+function previewUrl(port){return `${location.protocol}//${location.hostname}:${port}/`;}
 // Whether the New-task pipeline box starts ticked (AGENTDECK_PIPELINE). Served in
 // the HTML rather than fetched, so the drawer renders correctly on first open.
 const AD_PIPELINE_DEFAULT=((document.querySelector('meta[name=ad-pipeline-default]')||{}).content||"")==="true";
@@ -420,11 +434,36 @@ function phaseBar(t){
     return `<div class="seg ${cls}"><div class="bar"></div><div class="pl">${p}</div>${i===0?reviewMarks(t):""}</div>`;
   }).join("")+`</div>`+(st.cls==="missed"?`<div class="pipewarn">⚠ pipeline did not run</div>`:"");
 }
-function actions(t){
+// Preview is offered only when the worktree is QUIESCENT. A `running` agent is
+// actively rewriting the files a dev server watches, so a preview started there
+// shows rebuild storms and half-finished builds — which read as bad agent work
+// rather than as work in progress, the worst possible outcome for a feature whose
+// job is judging that work. `waiting` IS included: the agent is idle, blocked on
+// your answer, and the running app is exactly the evidence you need to answer.
+const PREVIEWABLE={waiting:1,done:1,stopped:1,error:1};
+function previewBtn(t){
+  if(!AD_PREVIEW)return "";                       // daemon can't serve previews at all
+  const p=t.preview;
+  if(!PREVIEWABLE[t.status]&&!p)
+    return `<button class="btn ghost" disabled title="The agent is still editing this worktree — a preview would rebuild on every change and show half-finished work. Available once it stops.">Preview</button>`;
+  if(!p)return `<button class="btn ghost" onclick="openPreview('${t.id}')">Preview</button>`;
+  if(p.status==="installing")return `<button class="btn ghost" disabled title="Installing dependencies — a cold install takes minutes.">Installing…</button>`;
+  if(p.status==="starting")return `<button class="btn ghost" disabled>Preview…</button>`;
+  if(p.status==="stopping")return `<button class="btn ghost" disabled>Stopping…</button>`;
+  if(p.status==="failed")return `<button class="btn ghost" onclick="openPreview('${t.id}')">Preview failed</button>`;
+  // A real <a>, so middle-click and ⌘-click work. rel="noopener" is mandatory, not
+  // hygiene: the previewed app is unreviewed agent-written code on another origin,
+  // and while it cannot READ this page it could navigate it via window.opener.
+  return `<a class="btn ghost" href="${previewUrl(p.port)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" onclick="event.stopPropagation()">Preview ▸</a>`;
+}
+function primaryAction(t){
   if(t.status==="waiting")return `<button class="btn primary" onclick="reply('${t.id}')">Reply</button>`;
   if(t.status==="error")return `<button class="btn danger" onclick="openTask('${t.id}')">View logs</button>`;
   if(t.status==="done")return `<button class="btn ghost" onclick="del('${t.id}')">Clean up</button>`;
   return `<button class="btn ghost" onclick="openTask('${t.id}')">Open</button>`;
+}
+function actions(t){
+  return `<div class="acts">${previewBtn(t)}${primaryAction(t)}</div>`;
 }
 function rowHtml(t){
   return `<article class="row ${t.status}">
@@ -477,6 +516,9 @@ function render(){
     return;
   }
   board.innerHTML=section("Needs you",wait)+section("Cruising",run)+section("Done",done);
+  // An open preview drawer follows the same payload the board just re-rendered
+  // from, so installing → starting → ready animates without polling.
+  renderPreviewDrawer();
 }
 // Populate the header switcher from the registry; "all" + one option per project.
 function renderSwitcher(){
@@ -511,7 +553,7 @@ function projectField(id,selected){
 // ── drawer ──
 const drawer=document.getElementById("drawer"),scrim=document.getElementById("scrim");
 function showDrawer(html){document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
-function closeDrawer(){drawer.classList.remove("on");scrim.classList.remove("on");}
+function closeDrawer(){drawer.classList.remove("on");scrim.classList.remove("on");pvDrawer=null;}
 function openNew(){
   if(!projects.length){announce("No project configured.");return;}
   showDrawer(`<h2>New task</h2>
@@ -586,6 +628,91 @@ function doUpload(){
   xhr.onerror=()=>{btn.disabled=false;prog.hidden=true;err.textContent="Network error.";announce("Upload failed.");};
   xhr.send(fd);
 }
+// ── preview drawer ─────────────────────────────────────────────────────────
+// `command` and `resolution` are fetched once per open (they don't change while
+// the drawer is up), while the live status rides the normal task payload. So the
+// drawer re-renders from `tasks` on every board update with no extra round trip —
+// which is what makes installing → starting → ready animate by itself.
+let pvDrawer=null; // {id, meta} while a preview drawer is open
+async function openPreview(id){
+  const meta=await fetch(`/api/tasks/${id}/preview`).then(r=>r.json()).catch(()=>({enabled:AD_PREVIEW,resolution:null,command:null}));
+  pvDrawer={id,meta};
+  renderPreviewDrawer();
+}
+function renderPreviewDrawer(){
+  if(!pvDrawer)return;
+  const t=tasks.find(x=>x.id===pvDrawer.id);
+  if(!t){closeDrawer();return;}
+  showDrawer(previewSection(t,pvDrawer.meta));
+}
+function previewSection(t,meta){
+  const p=t.preview,id=t.id;
+  const head=`<h2>Preview</h2>
+    <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span><span>${esc(t.title)}</span></div>`;
+
+  if(!meta.enabled)
+    return head+`<div class="q">Previews are disabled on this daemon. Either AGENTDECK_PREVIEW=false, the daemon is bound off-loopback (a preview link would not be reachable through a proxy), or the port pool collides with the dashboard port. Check the boot notices.</div>`;
+
+  // No command configured: the reason IS the fix, so show it verbatim and let the
+  // operator copy it rather than retype JSON from a screenshot.
+  if(meta.resolution&&!meta.resolution.ok&&!p)
+    return head+`<label class="lbl">Not configured</label>
+      <div class="q">${esc(meta.resolution.reason)}</div>
+      <div class="acts"><button class="btn ghost" onclick="copyText(${JSON.stringify(meta.resolution.reason)},'Snippet')">Copy</button></div>`;
+
+  let body="";
+  if(p&&p.status==="ready"){
+    const url=previewUrl(p.port);
+    body+=`<label class="lbl">Running</label>
+      <div class="acts"><a class="btn ghost" href="${url}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">Open ${esc(url)} ▸</a></div>
+      <label class="lbl">Reaching it</label>
+      <div class="q">The dev server listens on 127.0.0.1:${esc(String(p.port))} on the daemon's machine, so the link only resolves once that port is forwarded:
+
+  ssh -O forward -L ${esc(String(p.port))}:127.0.0.1:${esc(String(p.port))} you@your-vps
+
+-O forward adds the forward to the SSH session you already have open, instead of starting a second login. If your local ${esc(String(p.port))} is already in use, the link will silently open whatever is running there instead — check before you trust what you see.</div>
+      <div class="acts"><button class="btn ghost" onclick="copyText('ssh -O forward -L ${esc(String(p.port))}:127.0.0.1:${esc(String(p.port))} you@your-vps','Command')">Copy ssh line</button></div>`;
+  }else if(p&&p.status==="installing"){
+    body+=`<label class="lbl">Installing</label><div class="q">This worktree has no node_modules yet, so the install command is running first. A cold install takes minutes.</div>`;
+  }else if(p&&p.status==="starting"){
+    body+=`<label class="lbl">Starting</label><div class="q">Waiting for the dev server to listen on port ${esc(String(p.port))}…</div>`;
+  }else if(p&&p.status==="stopping"){
+    body+=`<label class="lbl">Stopping</label><div class="q">Shutting the dev server down…</div>`;
+  }
+  if(p&&p.status==="failed")
+    body+=`<label class="lbl">Failed</label><div class="q">${esc(p.error||"the preview stopped")}</div>`;
+  if(meta.command)
+    body+=`<label class="lbl">Command</label><div class="q">${esc(meta.command)}</div>`;
+
+  const busy=p&&(p.status==="installing"||p.status==="starting"||p.status==="stopping");
+  const controls=`<div class="acts">`
+    +(p?`<button class="btn ghost" ${busy&&p.status==="stopping"?"disabled":""} onclick="stopPreview('${id}')">Stop</button>`
+       :`<button class="btn ghost" onclick="startPreview('${id}')">Start</button>`)
+    +(p&&p.status==="failed"?`<button class="btn ghost" onclick="restartPreview('${id}')">Retry</button>`:"")
+    +`</div>`;
+  return head+body+controls;
+}
+async function startPreview(id){
+  announce("Starting the preview.");
+  const r=await fetch(`/api/tasks/${id}/preview`,{method:"POST",headers:authHeaders()});
+  if(!r.ok){
+    const b=await r.json().catch(()=>({error:"request failed"}));
+    // Show the daemon's message verbatim — it names the fix (the projects.json
+    // snippet, which previews to stop, or the install command to run).
+    if(pvDrawer&&pvDrawer.id===id)showDrawer(`<h2>Preview</h2><label class="lbl">Could not start</label><div class="q">${esc(b.error||"unknown error")}</div>`);
+    return;
+  }
+  announce("Preview ready.");
+}
+async function stopPreview(id){
+  await fetch(`/api/tasks/${id}/preview`,{method:"DELETE",headers:authHeaders()});
+}
+async function restartPreview(id){await stopPreview(id);await startPreview(id);}
+function copyText(text,what){
+  if(!navigator.clipboard){announce("Clipboard unavailable.");return;}
+  navigator.clipboard.writeText(text).then(()=>announce((what||"Text")+" copied."),()=>announce("Could not copy."));
+}
+
 // ── toast (upload result: a path you copy, not an alert to hand-retype) ──
 let lastToastPath="",toastTimer=null;
 function showToast(path){
@@ -671,7 +798,8 @@ async function openTask(id){
     <label class="lbl">Diff</label><div class="q">${esc(diffShown||"(no changes)")}</div>
     <label class="lbl">Recent events</label>
     <div class="q">${ev.events.slice(-40).map(evLine).join("\n")||"(none)"}</div>
-    <div style="display:flex;gap:8px">
+    <div class="acts">
+      ${AD_PREVIEW?`<button class="btn ghost" data-id="${esc(id)}" onclick="openPreview(this.dataset.id)">Preview</button>`:""}
       <button class="btn ghost" data-id="${esc(id)}" onclick="stop(this.dataset.id)">Pause</button>
       <button class="btn danger" data-id="${esc(id)}" onclick="del(this.dataset.id)">Delete</button></div>`);
 }
