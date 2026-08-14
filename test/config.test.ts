@@ -2,7 +2,7 @@ import { afterAll, expect, test, describe } from "bun:test";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
-import { config, isOptIn, loadProjects, ROOT_BLOCKED_MESSAGE, rootBlocksAgents, rootWillBlockAgents } from "../src/config.ts";
+import { cmdField, config, isOptIn, loadProjects, parsePool, ROOT_BLOCKED_MESSAGE, rootBlocksAgents, rootWillBlockAgents } from "../src/config.ts";
 import { resetNotices } from "../src/notices.ts";
 
 // loadProjects MUST NOT throw — config.ts is imported everywhere, so a throw is a
@@ -174,6 +174,127 @@ describe("rootWillBlockAgents", () => {
 // AGENTDECK_SKIP_PERMISSIONS — a flag that defaults ON, where that shape is
 // right. Here it inverted the guard: "0", "off", "no", "FALSE" and an empty
 // value (a bare `Environment=AGENTDECK_PIPELINE=` line) all resolved to TRUE,
+// loadProjects builds entries field-by-field and drops unknown keys, so a new
+// optional field has to be carried through explicitly or it vanishes silently —
+// the button would just never appear, with nothing to grep for.
+describe("loadProjects carries the preview commands through", () => {
+  function withDir(fn: (dir: string) => void) {
+    const dir = mkdtempSync(join(tmpdir(), "agentdeck-cfg-pv-"));
+    try { fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  test("install and preview survive, in both shapes", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, "projects.json"), JSON.stringify([
+        { id: "a", path: "/a", install: "pnpm install", preview: "pnpm dev --port {port}" },
+        { id: "b", path: "/b", preview: ["pnpm", "dev", "--define", "K=v w"] },
+      ]));
+      const [a, b] = loadProjects(dir, "/fallback");
+      expect(a.install).toBe("pnpm install");
+      expect(a.preview).toBe("pnpm dev --port {port}");
+      expect(b.preview).toEqual(["pnpm", "dev", "--define", "K=v w"]);
+      expect(b.install).toBeUndefined();
+    });
+  });
+
+  test("a project without them is still valid — previews are simply unavailable", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, "projects.json"), JSON.stringify([{ id: "a", path: "/a" }]));
+      const [a] = loadProjects(dir, "/fallback");
+      expect(a.id).toBe("a");
+      expect(a.preview).toBeUndefined();
+    });
+  });
+
+  // A bad command must not take the whole project down with it: the project keeps
+  // working for agents, and only the preview button is unavailable.
+  test("an invalid command is dropped but the project survives", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, "projects.json"), JSON.stringify([{ id: "a", path: "/a", preview: 42 }]));
+      const [a] = loadProjects(dir, "/fallback");
+      expect(a.id).toBe("a");
+      expect(a.preview).toBeUndefined();
+    });
+  });
+});
+
+// The preview port pool. parsePool MUST NOT throw for the same reason
+// loadProjects must not: config.ts is imported everywhere, so a bad env value has
+// to degrade to the default rather than crash-loop the daemon.
+describe("parsePool", () => {
+  const FALLBACK = [8788, 8789, 8790];
+
+  test("a range expands inclusively", () => {
+    expect(parsePool("8788-8790", FALLBACK)).toEqual([8788, 8789, 8790]);
+    expect(parsePool("9000-9000", FALLBACK)).toEqual([9000]);
+  });
+
+  test("a comma list is taken verbatim, deduped", () => {
+    expect(parsePool("8788,9100", FALLBACK)).toEqual([8788, 9100]);
+    expect(parsePool("8788, 8788 ,9100", FALLBACK)).toEqual([8788, 9100]);
+  });
+
+  test("unset or blank → the default pool", () => {
+    expect(parsePool(undefined, FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("   ", FALLBACK)).toEqual(FALLBACK);
+  });
+
+  // Above 32767 collides with the kernel's ephemeral range (32768-60999), which
+  // would produce a rare, unreproducible "the preview randomly won't start".
+  test("ports inside the ephemeral range are refused", () => {
+    expect(parsePool("40000-40002", FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("8788,50000", FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("32768", FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("32767", FALLBACK)).toEqual([32767]); // the boundary is inclusive
+  });
+
+  test("privileged ports are refused", () => {
+    expect(parsePool("80-82", FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("1024", FALLBACK)).toEqual([1024]); // the boundary is inclusive
+  });
+
+  // `8788-9788` is a plausible typo and would claim 1001 ports, each of which
+  // costs an ssh -L line and up to ~600MB of dev server.
+  test("an implausibly large pool is refused", () => {
+    expect(parsePool("8788-9788", FALLBACK)).toEqual(FALLBACK);
+  });
+
+  test("reversed bounds and junk are refused, never thrown", () => {
+    expect(parsePool("8790-8788", FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("not-a-port", FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("8788-", FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("-", FALLBACK)).toEqual(FALLBACK);
+    expect(parsePool("8788;8789", FALLBACK)).toEqual(FALLBACK);
+  });
+});
+
+// The array form of `install`/`preview` exists so an argument can contain a space.
+// The string form splits on whitespace (the AGENTDECK_CLAUDE_ARGS convention),
+// which would silently turn `--define "API=https://x/a b"` into four arguments.
+describe("cmdField", () => {
+  test("a non-empty string is kept", () => {
+    expect(cmdField("p", "preview", "pnpm dev --port {port}")).toEqual({ preview: "pnpm dev --port {port}" });
+  });
+
+  test("an array of non-empty strings is kept verbatim", () => {
+    const argv = ["pnpm", "dev", "--define", "API=https://x.test/a b"];
+    expect(cmdField("p", "install", argv)).toEqual({ install: argv });
+  });
+
+  test("absent contributes nothing", () => {
+    expect(cmdField("p", "preview", undefined)).toEqual({});
+    expect(cmdField("p", "preview", null)).toEqual({});
+  });
+
+  // Dropped rather than kept: a half-valid command fails at spawn time, in a
+  // worktree, minutes later — far from the typo that caused it.
+  test("empty, wrong-typed and mixed values are dropped, never thrown", () => {
+    for (const bad of ["", "   ", [], [""], ["ok", ""], ["ok", 3], 42, true, {}, [[]]]) {
+      expect(cmdField("p", "preview", bad)).toEqual({});
+    }
+  });
+});
+
 // arming a pipeline whose last steps are `git push` and opening a PR.
 describe("the pipeline opt-in", () => {
   test("only the exact string 'true' arms it", () => {

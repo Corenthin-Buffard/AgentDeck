@@ -33,6 +33,36 @@ export interface Project {
   id: string;              // stable routing key (DB column, dashboard filter)
   path: string;            // absolute path to the git repo
   label: string;           // human name shown in the dashboard (defaults to basename)
+  // ── Preview (operator-authored, deliberately NOT auto-detected) ────────────
+  // The daemon runs these in a task's worktree. They are read from projects.json
+  // rather than inferred from the repo's package.json for two reasons: a fresh
+  // `git worktree add` has no node_modules (so "just run scripts.dev" fails on the
+  // first click, intermittently, depending on what the agent happened to do), and
+  // running a script out of an AGENT-AUTHORED package.json as the daemon uid with
+  // the daemon's environment is arbitrary code execution behind a button.
+  //
+  // string  → split on whitespace into argv (the AGENTDECK_CLAUDE_ARGS convention)
+  // array   → used verbatim as argv, so an argument may contain spaces
+  // Leading NAME=VALUE tokens in either form become child env.
+  install?: string | string[]; // run only when <worktree>/node_modules is absent
+  preview?: string | string[]; // the dev server; {port} is substituted
+}
+
+/** Where a preview is in its lifecycle. `stopping` matters to more than the UI:
+ *  the port is STILL BOUND during the SIGTERM grace window, so port allocation
+ *  must keep treating it as taken. */
+export type PreviewStatus = "installing" | "starting" | "ready" | "failed" | "stopping";
+
+/** The client-facing view of a preview. Folded onto the task payload by
+ *  withPreviews(), derived and never persisted — same shape of thing as `brief`.
+ *  The supervisor's own entry additionally holds the child handle and pgid, which
+ *  never leave preview.ts. */
+export interface PreviewState {
+  taskId: string;
+  status: PreviewStatus;
+  port: number;
+  startedAt: number;
+  error: string | null;   // one-line, scrubbed excerpt of the child's output
 }
 
 export interface Task {
@@ -127,6 +157,28 @@ export interface AgentDeckConfig {
                                  //   sent as x-agentdeck-token on write requests (anti-CSRF)
   agentSettingsPath: string;     // the generated `claude --settings` file
   maxConcurrentAgents: number;
+  /**
+   * Preview dev servers: the daemon runs a project's `preview` command in a task's
+   * worktree so the operator can look at what the agent built.
+   *
+   * `ports` sets BOTH reachability and concurrency — one knob, not two. Each port
+   * must be forwarded (`ssh -L 8788:127.0.0.1:8788`) to be reachable, so the pool
+   * size is the number of tunnel lines the operator agreed to, and there is no
+   * separate "max previews" to drift out of sync with it.
+   *
+   * There is deliberately NO bind-address knob. Dev servers always bind 127.0.0.1;
+   * see preview.ts. The daemon's own `host` must not leak here — an operator behind
+   * a reverse proxy sets AGENTDECK_HOST=0.0.0.0, and inheriting that would publish
+   * unreviewed agent-written code straight to the internet.
+   */
+  preview: {
+    enabled: boolean;
+    ports: number[];          // the pool, e.g. [8788, 8789, 8790]
+    readyTimeoutMs: number;   // how long to wait for the dev server to listen
+    installTimeoutMs: number; // a cold `npm install` is minutes, not seconds
+    ttlMs: number;            // hard lifetime cap; 0 disables
+    memMax: string;           // passed to `systemd-run -p MemoryMax=`
+  };
   notify: {
     telegram?: { botToken: string; chatId: string };
     slack?: { webhookUrl: string };
