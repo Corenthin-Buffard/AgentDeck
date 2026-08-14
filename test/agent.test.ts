@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { agentEnv, checkRootBypassStillWorks, createStderrTail, exitReason, scrubSecrets, shouldRelay, spawnOpts } from "../src/agent.ts";
+import { checkRootBypassStillWorks } from "../src/agent.ts";
+// These five moved to src/proc.ts so the preview supervisor can use them without
+// importing the agent module. The assertions below are unchanged by that move —
+// which is what proves it was a pure one.
+import { agentEnv, createStderrTail, exitReason, scrubSecrets, shouldRelay, spawnOpts } from "../src/proc.ts";
 import { config } from "../src/config.ts";
 import { notices, resetNotices } from "../src/notices.ts";
 
