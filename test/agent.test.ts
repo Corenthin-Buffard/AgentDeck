@@ -3,7 +3,7 @@ import { checkRootBypassStillWorks } from "../src/agent.ts";
 // These five moved to src/proc.ts so the preview supervisor can use them without
 // importing the agent module. The assertions below are unchanged by that move —
 // which is what proves it was a pure one.
-import { agentEnv, createStderrTail, exitReason, scrubSecrets, shouldRelay, spawnOpts } from "../src/proc.ts";
+import { agentEnv, createStderrTail, exitReason, isAlive, killGroup, scrubSecrets, shouldRelay, spawnOpts } from "../src/proc.ts";
 import { config } from "../src/config.ts";
 import { notices, resetNotices } from "../src/notices.ts";
 
@@ -40,6 +40,33 @@ describe("agentEnv — the root bypass matrix", () => {
     expect(base.IS_SANDBOX).toBeUndefined();
     expect(out.PATH).toBe("/usr/bin:/bin");
     expect(out.HOME).toBe("/root");
+  });
+});
+
+// killGroup negates its argument, so a bad pid is not a no-op — it is a weapon.
+// `kill(-0, …)` signals the CALLER'S OWN process group and `kill(-1, …)` signals
+// every process this uid can reach, so a 0 or a -1 arriving from a corrupted
+// pidfile would turn cleanup into a self-inflicted outage.
+//
+// These assert the guard by its return value rather than by observing a signal:
+// with the guard removed the call would take out this test runner, so there is no
+// safe way to mutation-test it from inside the suite. That asymmetry is the point.
+describe("killGroup refuses anything that is not a real pid", () => {
+  test("0, negative, 1 and non-integers are rejected without signalling", () => {
+    for (const bad of [0, -0, -1, -999, 1, 1.5, NaN, Infinity]) {
+      expect(killGroup(bad, "SIGTERM")).toBe(false);
+    }
+  });
+
+  test("a pid that is real but already gone reports false rather than throwing", () => {
+    expect(killGroup(999_999, "SIGTERM")).toBe(false); // ESRCH
+  });
+});
+
+describe("isAlive", () => {
+  test("this process is alive; a non-pid never is", () => {
+    expect(isAlive(process.pid)).toBe(true);
+    for (const bad of [0, -1, 1.5, NaN]) expect(isAlive(bad)).toBe(false);
   });
 });
 

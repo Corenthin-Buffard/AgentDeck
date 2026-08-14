@@ -11,7 +11,7 @@
 // and inheriting it would publish unreviewed, agent-written code straight to the
 // internet on every pool port. The operator reaches previews through the same SSH
 // tunnel that carries the dashboard. The deterministic guard is a firewall rule
-// (`ufw deny in on <pool>`, see the README) — a post-hoc /proc inspection would fail
+// (`ufw deny <pool>/tcp`, see the README) — a post-hoc /proc inspection would fail
 // open on any host without /proc and would still leave an exposure window.
 //
 // ── Why the commands are operator-authored ───────────────────────────────────────
@@ -28,7 +28,7 @@ import { join } from "node:path";
 import { config } from "./config.ts";
 import { emitUpdate } from "./bus.ts";
 import { notice } from "./notices.ts";
-import { createStderrTail, isAlive, killGroup, scrubSecrets, shouldRelay, spawnOpts } from "./proc.ts";
+import { createStderrTail, isAlive, killGroup, scrubSecrets, shouldRelay, spawnOpts, type StderrTail } from "./proc.ts";
 import type { PreviewState, PreviewStatus, Project, Task } from "./types.ts";
 
 /** Dev servers bind here. Not configurable — see the header. */
@@ -159,6 +159,21 @@ export function resolvePreview(project: Project | undefined): Resolution {
   return { ok: true, preview: project.preview, install: project.install };
 }
 
+/**
+ * The configured command, safe to serve on an UNGATED read.
+ *
+ * Exists because the Resolution itself is not safe to serialise: it carries
+ * projects.json's `preview`/`install` verbatim, and both accept leading NAME=VALUE
+ * tokens — so returning it published every env VALUE an operator had set there.
+ * This runs the same parse the spawn path does and hands the result to
+ * redactCommand, which shows names and never values.
+ */
+export function redactedResolution(res: Resolution): { preview: string; install?: string } {
+  if (!res.ok) return { preview: "" };
+  const fmt = (v: string | string[]) => { const { env, argv } = parsePreviewCommand(v); return redactCommand(argv, env); };
+  return { preview: fmt(res.preview), ...(res.install ? { install: fmt(res.install) } : {}) };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Registry
 // ─────────────────────────────────────────────────────────────────────────────
@@ -172,9 +187,13 @@ interface Entry {
   command: string;                 // redacted, display only
   child: ChildProcess | null;
   pgid: number | null;
-  out: ReturnType<typeof createStderrTail>;
+  out: StderrTail;
   starting: Promise<PreviewState> | null; // in-flight start, for idempotence
   stopping: Promise<void> | null;
+  // Set by stopPreview. The start closure re-checks it at every await boundary,
+  // because a stop that arrives DURING install has no child to signal yet and must
+  // not let the closure go on to spawn a dev server nothing is tracking.
+  aborted: boolean;
 }
 
 const previews = new Map<string, Entry>();
@@ -192,6 +211,13 @@ export function getPreview(taskId: string): PreviewState | undefined {
  *  removes a worktree out from under a dev server the operator is looking at. */
 export function isPreviewing(taskId: string): boolean {
   return previews.has(taskId);
+}
+
+/** The bounded tail of everything the child has written. Exported so a test can
+ *  assert the supervisor really CONSUMED stdout, rather than inferring it from the
+ *  preview happening to reach ready. */
+export function previewTail(taskId: string): string {
+  return previews.get(taskId)?.out.tail() ?? "";
 }
 
 /** The redacted command for the drawer. Separate from the PreviewState because it
@@ -292,7 +318,7 @@ function withMemoryCap(argv: string[]): string[] {
  * `detached` makes the child a process-group leader (pid === pgid), which is what
  * lets killGroup reap the whole `npm run dev` → real-server tree.
  */
-function spawnDetached(argv: string[], env: Record<string, string>, cwd: string, out: ReturnType<typeof createStderrTail>) {
+function spawnDetached(argv: string[], env: Record<string, string>, cwd: string, out: StderrTail) {
   const base = spawnOpts(cwd, process.getuid?.());
   const full = withMemoryCap(argv);
   const child = spawn(full[0], full.slice(1), {
@@ -316,16 +342,28 @@ function spawnDetached(argv: string[], env: Record<string, string>, cwd: string,
   return child;
 }
 
-/** Run a command to completion (the install step). Resolves with the exit code, or
- *  null if it had to be killed for exceeding the timeout. */
+/**
+ * Run a command to completion (the install step).
+ *
+ * `onSpawn` hands the child to the caller so a concurrent stop can signal it. An
+ * install is the LONGEST phase of a preview (minutes, not seconds), so it is by far
+ * the likeliest moment for someone to hit Stop — leaving it unkillable meant Stop
+ * appeared to work while npm kept running to completion.
+ *
+ * Resolves the exit code, or one of two sentinels: `null` for the timeout, `-1` for
+ * "never ran or died by signal". The caller distinguishes them so the message can
+ * say what actually happened rather than reporting `exit -1`, which no process ever
+ * returns.
+ */
 function runToCompletion(
   argv: string[], env: Record<string, string>, cwd: string,
-  out: ReturnType<typeof createStderrTail>, timeoutMs: number,
+  out: StderrTail, timeoutMs: number, onSpawn?: (c: ChildProcess) => void,
 ): Promise<number | null> {
   return new Promise((resolve) => {
     let child: ChildProcess;
     try {
       child = spawnDetached(argv, env, cwd, out);
+      onSpawn?.(child);
     } catch (e: any) {
       out.push(`spawn failed: ${e?.message ?? e}`);
       resolve(-1);
@@ -372,8 +410,14 @@ function writePidfile() {
   }
   try {
     if (!records.length) { try { unlinkSync(pidfilePath()); } catch { /* already gone */ } return; }
-    // O_CREAT|O_TRUNC with an explicit mode: the file names live pids on this box.
-    const fd = openSync(pidfilePath(), constants.O_CREAT | constants.O_TRUNC | constants.O_WRONLY, 0o600);
+    // O_NOFOLLOW: never write THROUGH a symlink, the same hardening the dashboard
+    // token already has (config.ts). Both the agent and the previewed dev server
+    // run as this uid, so either can pre-place a link here; without the flag the
+    // daemon would happily TRUNCATE whatever it points at — agent-settings.json, a
+    // systemd unit, an authorized_keys — on the next preview start.
+    // The explicit 0600 only applies on creation, which is why O_NOFOLLOW rather
+    // than the mode is what actually protects this path.
+    const fd = openSync(pidfilePath(), constants.O_CREAT | constants.O_TRUNC | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
     try { writeSync(fd, JSON.stringify(records)); } finally { closeSync(fd); }
   } catch (e: any) {
     notice("warn", "preview-pidfile", `could not write ${pidfilePath()}: ${e?.message ?? e} — a hard daemon crash may leave dev servers holding preview ports`);
@@ -404,16 +448,26 @@ export async function reapOrphans(): Promise<number> {
   }
   let killed = 0;
   for (const r of records) {
-    if (!r || typeof r.pid !== "number" || typeof r.port !== "number") continue;
+    // The file lives in the data dir, which the agent and the previewed dev server
+    // can both write (same uid). Validate it as untrusted input, not as our own
+    // state: a forged or corrupted pid must never reach a signal.
+    if (!r || !Number.isInteger(r.pid) || r.pid <= 1 || !Number.isInteger(r.port)) continue;
     if (isAlive(r.pid)) {
       const now = readStarttime(r.pid);
-      if (now === null) {
+      // FAIL CLOSED. Anything short of a positive identity match means we do not
+      // signal. The earlier form (`r.starttime !== null && now !== r.starttime`)
+      // skipped the comparison entirely when the RECORDED starttime was null —
+      // which writePidfile legitimately writes for a child that has already exited
+      // — so after a crash a recycled pid matched nothing, fell through, and got
+      // its whole group SIGTERMed. That is the exact outcome this check exists to
+      // prevent, and it is worse than the port leak it was meant to fix.
+      if (now === null || r.starttime === null) {
         notice("warn", "preview-orphan",
-          `a process from a previous run may still hold preview port ${r.port} (pid ${r.pid}), but its identity cannot be confirmed on this platform, so it was left alone. `
+          `a process from a previous run may still hold preview port ${r.port} (pid ${r.pid}), but its identity cannot be confirmed, so it was left alone. `
           + `Check with: ss -ltnp 'sport = :${r.port}'`);
         continue;
       }
-      if (r.starttime !== null && now !== r.starttime) continue; // pid recycled — not ours
+      if (now !== r.starttime) continue; // pid recycled — definitively not ours, and not worth a notice
       // Count only what we actually signalled. killGroup returns false when the
       // group is already gone, and reporting a reap that did not happen would make
       // the boot log claim it recovered ports it did not.
@@ -440,20 +494,33 @@ export async function reapOrphans(): Promise<number> {
 const reservedPorts = (): Set<number> => new Set([...previews.values()].map((e) => e.port));
 
 /**
- * Start (or return) the preview for a task.
+ * Begin a preview and return as soon as the entry EXISTS — do not wait for it to
+ * be ready.
  *
- * IDEMPOTENT. Two rapid clicks, or a click on an already-running preview, return
- * the same entry rather than racing two spawns for one port. Throws with an
- * operator-readable message when it cannot start; callers surface `e.message`.
+ * This split exists because the HTTP route cannot await the whole thing. Bun.serve
+ * kills any handler that takes longer than its `idleTimeout` (10s by default, and
+ * capped at 255s), while a cold `npm install` is minutes and even a warm dev server
+ * boot routinely passes 10s. Awaiting inside the handler meant the connection was
+ * closed under the client, the dashboard's `await fetch` rejected with a socket
+ * error, and the operator got no feedback at all — while the install carried on
+ * invisibly. Measured on bun 1.3.14.
+ *
+ * Everything that can fail FAST fails here, synchronously, before any await: the
+ * feature being disabled, no configured command, an exhausted pool. Those still
+ * throw, so the route can answer 409 with a message that names the fix. Everything
+ * slow — install, spawn, readiness — runs in the background and reports through the
+ * entry's status, which already rides the WebSocket to the board.
+ *
+ * IDEMPOTENT. Two rapid clicks return the same entry rather than racing two spawns
+ * for one port.
  */
-export async function startPreview(task: Task, project: Project | undefined): Promise<PreviewState> {
+export function beginPreview(task: Task, project: Project | undefined): PreviewState {
   if (!config.preview.enabled) throw new Error("previews are disabled on this daemon (AGENTDECK_PREVIEW=false)");
 
   const existing = previews.get(task.id);
   if (existing) {
     if (existing.stopping) throw new Error("this preview is still shutting down — try again in a moment");
-    if (existing.starting) return existing.starting;   // in flight: same promise, one child
-    return view(existing);                              // ready or failed: nothing to do
+    return view(existing);   // in flight, ready, or failed — one entry, one child
   }
 
   const res = resolvePreview(project);
@@ -477,7 +544,7 @@ export async function startPreview(task: Task, project: Project | undefined): Pr
   const entry: Entry = {
     taskId: task.id, port, status: "starting", startedAt: Date.now(), error: null,
     command: redactCommand(argv, env), child: null, pgid: null,
-    out: createStderrTail(), starting: null, stopping: null,
+    out: createStderrTail(), starting: null, stopping: null, aborted: false,
   };
   previews.set(task.id, entry);
 
@@ -496,11 +563,24 @@ export async function startPreview(task: Task, project: Project | undefined): Pr
       setStatus(entry, "installing");
       const { env: iEnv, argv: iArgv } = parsePreviewCommand(res.install);
       if (!iArgv.length) throw new Error(`the install command for '${project!.id}' has no program to run`);
-      const code = await runToCompletion(iArgv, iEnv, task.worktree, entry.out, config.preview.installTimeoutMs);
+      const code = await runToCompletion(
+        iArgv, iEnv, task.worktree, entry.out, config.preview.installTimeoutMs,
+        // Registering the install child is what makes Stop work during the longest
+        // phase of a preview. Without it, stopPreview found pgid === null, resolved
+        // immediately, deleted the entry — and this closure carried on installing
+        // and then spawned a dev server that nothing tracked, holding a pool port
+        // until the box rebooted.
+        (c) => { entry.child = c; entry.pgid = c.pid ?? null; writePidfile(); },
+      );
+      entry.child = null; entry.pgid = null;
+      if (entry.aborted) throw new AbortedError();
       if (code === null) throw new Error(`install timed out after ${Math.round(config.preview.installTimeoutMs / 1000)}s — ${entry.out.excerpt() || "no output"}`);
+      if (code === -1) throw new Error(`the install command could not run — ${entry.out.excerpt() || "no output"}`);
       if (code !== 0) throw new Error(`install failed (exit ${code}) — ${entry.out.excerpt() || "no output"}`);
       setStatus(entry, "starting");
     }
+    // Re-check after every await: a stop may have landed while the install ran.
+    if (entry.aborted) throw new AbortedError();
 
     // ── the dev server ────────────────────────────────────────────────────────
     let child: ChildProcess;
@@ -516,6 +596,10 @@ export async function startPreview(task: Task, project: Project | undefined): Pr
     let dead = false;
     child.once("close", () => {
       dead = true;
+      // Drop the handle the instant the OS reaps it. A pid is not an identity: once
+      // waitpid has run, the kernel may hand that number to anything, so a stale
+      // pgid left here means a later stop/TTL/shutdown SIGTERMs a stranger's group.
+      if (entry.child === child) { entry.child = null; entry.pgid = null; writePidfile(); }
       // Only meaningful once ready: before that, the readiness loop reports it with
       // the captured output, which is a far better message than "it closed".
       const e = previews.get(task.id);
@@ -526,6 +610,7 @@ export async function startPreview(task: Task, project: Project | undefined): Pr
     const deadline = Date.now() + config.preview.readyTimeoutMs;
     while (Date.now() < deadline) {
       if (dead) throw new Error(`the preview exited before it listened — ${entry.out.excerpt() || "no output"}`);
+      if (entry.aborted) throw new AbortedError();
       if (await canConnect(port)) {
         setStatus(entry, "ready", null);
         return view(entry);
@@ -538,23 +623,42 @@ export async function startPreview(task: Task, project: Project | undefined): Pr
     );
   })();
 
-  entry.starting = run;
-  try {
-    return await run;
-  } catch (e: any) {
-    // Keep the entry in `failed` so the drawer can explain what happened; the port
-    // stays reserved until the operator dismisses it with Stop. Any child we did
-    // manage to spawn is reaped first, or it would hold the port with nothing
-    // tracking it.
+  entry.starting = run.catch((e: any) => {
+    // An abort is the stop path doing its job, not a failure to report: stopPreview
+    // owns the entry from here and will delete it.
+    if (e instanceof AbortedError || entry.aborted) throw e;
+    // Otherwise keep the entry in `failed` so the drawer can explain what happened.
+    // The port stays reserved until the operator dismisses it with Stop. Anything we
+    // did manage to spawn is reaped first, or it would hold the port untracked.
     if (entry.pgid) killGroup(entry.pgid, "SIGKILL");
     entry.child = null;
     entry.pgid = null;
     writePidfile();
     setStatus(entry, "failed", String(e?.message ?? e));
     throw e;
-  } finally {
-    entry.starting = null;
-  }
+  }).finally(() => { entry.starting = null; }) as Promise<PreviewState>;
+  // Nothing awaits `run` here. Failures surface as the entry's `failed` status,
+  // which emitUpdate has already pushed to every open dashboard.
+  entry.starting.catch(() => { /* observed via status; keeps this off unhandledRejection */ });
+  return view(entry);
+}
+
+/** Thrown by the start closure when a stop landed mid-flight. Not an error the
+ *  operator should ever see — it means the stop path is in charge now. */
+class AbortedError extends Error {
+  constructor() { super("preview stopped before it finished starting"); }
+}
+
+/**
+ * Start a preview and WAIT for it to be ready (or fail).
+ *
+ * The awaitable form, for tests and any caller that genuinely wants completion.
+ * The HTTP route deliberately does NOT use this — see beginPreview.
+ */
+export async function startPreview(task: Task, project: Project | undefined): Promise<PreviewState> {
+  const state = beginPreview(task, project);
+  const entry = previews.get(task.id);
+  return entry?.starting ? await entry.starting : state;
 }
 
 /**
@@ -568,12 +672,40 @@ export function stopPreview(taskId: string, why?: string): Promise<void> {
   if (!e) return Promise.resolve();
   if (e.stopping) return e.stopping;
 
-  const pgid = e.pgid;
-  const child = e.child;
+  // Set BEFORE anything else. The start closure re-checks this at every await
+  // boundary, so from this instant it will unwind rather than go on to spawn.
+  e.aborted = true;
   setStatus(e, "stopping");
 
-  const done = new Promise<void>((resolve) => {
-    if (!pgid || !child) return resolve();       // never spawned, or already reaped
+  const done = (async () => {
+    // Signal whatever child exists RIGHT NOW, not whatever existed when stop was
+    // called. During an install that is the package manager; after it, the dev
+    // server. The previous version captured child/pgid up front, so a stop during
+    // install found null and resolved instantly while the install ran on.
+    await killCurrentChild(e);
+    // Let an in-flight start finish unwinding before the entry is dropped, so the
+    // port stays reserved until nothing is left that could still bind it.
+    if (e.starting) await e.starting.catch(() => { /* abort or failure, both fine */ });
+    // The closure may have spawned in the window between the kill and the abort
+    // check. Cheap to repeat, and the alternative is an untracked dev server.
+    await killCurrentChild(e);
+    previews.delete(taskId);
+    writePidfile();
+    emitUpdate(taskId);
+    if (why) console.log(`[preview] stopped ${taskId} (${why})`);
+  })();
+
+  e.stopping = done;
+  return done;
+}
+
+/** SIGTERM the entry's current process group, escalate to SIGKILL after the grace
+ *  window, and resolve once it is actually gone. No-op when there is no child. */
+function killCurrentChild(e: Entry): Promise<void> {
+  const pgid = e.pgid;
+  const child = e.child;
+  if (!pgid || !child) return Promise.resolve();
+  return new Promise<void>((resolve) => {
     let settled = false;
     const finish = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
     const timer = setTimeout(() => { killGroup(pgid, "SIGKILL"); finish(); }, SIGKILL_AFTER_MS);
@@ -581,15 +713,7 @@ export function stopPreview(taskId: string, why?: string): Promise<void> {
     child.once("close", finish);
     child.once("error", finish);
     if (!killGroup(pgid, "SIGTERM")) finish();    // already gone
-  }).then(() => {
-    previews.delete(taskId);
-    writePidfile();
-    emitUpdate(taskId);
-    if (why) console.log(`[preview] stopped ${taskId} (${why})`);
   });
-
-  e.stopping = done;
-  return done;
 }
 
 /** Stop every preview. Bounded by the caller — see the shutdown handler. */

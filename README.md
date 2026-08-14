@@ -35,9 +35,9 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
                  git worktree                         git worktree
                       ▲                                    ▲
                       │ same worktree, on demand           │
-              ┌───────┴────────┐                   ┌───────┴────────┐
+              ┌────────┴────────┐                  ┌────────┴────────┐
               │ dev server :8788│  (pool)          │ dev server :8789│
-              └────────────────┘                   └────────────────┘
+              └─────────────────┘                  └─────────────────┘
                  Browser ──────── ssh -L 8788 ─────────▶ (loopback only)
 ```
 
@@ -373,7 +373,7 @@ Things worth knowing before you rely on it:
   simultaneous previews. Three dev servers is 0.6–1.8GB; on a 4GB box also running
   four agents, consider `8788-8789`.
 - **Lock the pool down at the firewall.** Dev servers always bind `127.0.0.1`, but
-  a belt-and-braces `ufw deny in on 8788:8790` costs nothing and covers any
+  a belt-and-braces `ufw deny 8788:8790/tcp` costs nothing and covers any
   framework that ignores the bind flag you gave it.
 - **Preview is offered only when the agent is idle** — waiting, done, stopped or
   errored. On a running task the button is disabled: a file-watcher pointed at a

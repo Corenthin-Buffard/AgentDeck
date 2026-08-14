@@ -7,7 +7,7 @@ import { config } from "../src/config.ts";
 import { resetNotices, notices } from "../src/notices.ts";
 import {
   _resetPreviewsForTest, expandPlaceholders, getPreview, installPreviewShutdown, isPreviewing, parsePreviewCommand,
-  parseStarttime, pickPort, previewCommand, reapOrphans, redactCommand, resolvePreview,
+  parseStarttime, pickPort, previewCommand, previewTail, reapOrphans, redactCommand, resolvePreview,
   startPreview, stopPreview, sweepOncePreviews,
 } from "../src/preview.ts";
 import type { Project, Task } from "../src/types.ts";
@@ -196,6 +196,7 @@ describe("the supervisor", () => {
   let savedPorts: number[];
   let savedReady: number;
   let savedTtl: number;
+  let savedInstall: number;
 
   const project = (over: Partial<Project> = {}): Project => ({ id: "p", path: wt, label: "p", ...over });
   const task = (id = "t_pv"): Task => ({
@@ -216,6 +217,7 @@ describe("the supervisor", () => {
     savedPorts = config.preview.ports;
     savedReady = config.preview.readyTimeoutMs;
     savedTtl = config.preview.ttlMs;
+    savedInstall = config.preview.installTimeoutMs;
     // Ports well clear of the documented default so a developer running the daemon
     // while the suite runs doesn't collide with their own previews.
     config.preview.ports = [18788, 18789];
@@ -229,6 +231,7 @@ describe("the supervisor", () => {
     config.preview.ports = savedPorts;
     config.preview.readyTimeoutMs = savedReady;
     config.preview.ttlMs = savedTtl;
+    config.preview.installTimeoutMs = savedInstall;
     rmSync(wt, { recursive: true, force: true });
   });
 
@@ -261,12 +264,18 @@ describe("the supervisor", () => {
     expect(getPreview("t_pv")?.status).toBe("failed");
   });
 
-  // THE DEADLOCK TEST. spawnOpts pipes stdout; a dev server writes its banner and
-  // every rebuild there. An undrained pipe blocks the child at 64KiB and the
-  // symptom is not an error — the preview simply never becomes ready.
-  test("a child that floods stdout still reaches ready", async () => {
-    const st = await startPreview(task(), project({ preview: fixtureCmd("--flood", "400000", "--port", "{port}") }));
+  // THE DRAIN TEST. The first version asserted only that a flooding child reached
+  // ready — which mutation testing showed stays true with the stdout handler
+  // deleted, because Bun's child_process shim does not block the child on a full
+  // pipe the way the C-level 64KiB buffer would. So assert the thing that is
+  // actually ours: that the supervisor CONSUMED the stream. The marker is written
+  // after the flood, so it can only be in the tail if everything before it was read.
+  test("the supervisor consumes the child's stdout, not just its stderr", async () => {
+    const st = await startPreview(task(), project({
+      preview: fixtureCmd("--flood", "400000", "--marker", "drained-ok", "--port", "{port}"),
+    }));
     expect(st.status).toBe("ready");
+    expect(previewTail("t_pv")).toContain("drained-ok");
   });
 
   // THE GRANDCHILD TEST. `npm run dev` is a wrapper that forks the real server and
@@ -353,7 +362,6 @@ describe("the supervisor", () => {
       config.preview.installTimeoutMs = 800;
       const p = project({ install: ["sh", "-c", "sleep 60"], preview: fixtureCmd("--port", "{port}") });
       await expect(startPreview(task(), p)).rejects.toThrow(/install timed out/);
-      config.preview.installTimeoutMs = 600_000;
     });
   });
 
@@ -380,13 +388,19 @@ describe("the supervisor", () => {
       expect(getPreview("t_pv")?.status).toBe("ready");
     });
 
-    // A dev server that dies on its own must show on the board rather than sitting
-    // at `ready` while the operator's tab fails to connect.
-    test("a dev server that died is marked failed by the health check", async () => {
-      const cmd = ["sh", "-c", `bun ${FIXTURE} --port {port} & wait`];
-      const st = await startPreview(task(), project({ preview: cmd }));
-      spawnSync("pkill", ["-f", `${FIXTURE} --port ${st.port}`]);
-      await new Promise((r) => setTimeout(r, 300));
+    // A dev server that stops serving must show on the board rather than sitting at
+    // `ready` while the operator's tab fails to connect.
+    //
+    // It has to stop LISTENING while staying ALIVE. The first version killed the
+    // process, which fires the child's close handler — so the entry was already
+    // `failed` before the sweep ran, and mutation testing showed the whole health
+    // block could be deleted with the test still green.
+    test("a server that stops listening but stays alive is caught by the sweep", async () => {
+      config.preview.ttlMs = 60_000; // not the TTL's doing
+      await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}", "--close-after", "900") }));
+      expect(getPreview("t_pv")?.status).toBe("ready");
+      await new Promise((r) => setTimeout(r, 1_200));   // the listener closes, the process lives
+      expect(getPreview("t_pv")?.status).toBe("ready"); // the close handler cannot have fired
       await sweepOncePreviews();
       expect(getPreview("t_pv")?.status).toBe("failed");
     });
@@ -472,12 +486,51 @@ describe("the supervisor", () => {
 
     // THE PID-REUSE SAFETY TEST. A recorded pid is not an identity; killing a
     // recycled one is strictly worse than the port leak being fixed.
-    test("a starttime mismatch means the pid was recycled — nothing is killed", async () => {
-      const victim = spawnSync("sh", ["-c", "echo $$"], { encoding: "utf8" });
-      expect(victim.status).toBe(0);
-      // Our own pid, with a deliberately wrong starttime.
-      write([{ taskId: "t_gone", pid: process.pid, port: 18999, startedAt: Date.now(), starttime: 1 }]);
-      expect(await reapOrphans()).toBe(0); // and this process is, evidently, still alive
+    //
+    // The victim must be a real detached GROUP LEADER, like the supervisor's own
+    // children. The first version recorded `process.pid`, and the test runner is not
+    // a group leader — so `kill(-pid)` ESRCH'd and the test passed with the guard
+    // deleted. Asserting the victim is still ALIVE afterwards is what distinguishes
+    // "correctly skipped" from "the signal went nowhere".
+    test("a starttime mismatch leaves the live process alone", async () => {
+      const victim = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+      victim.unref();
+      const pid = victim.pid!;
+      try {
+        write([{ taskId: "t_gone", pid, port: 18999, startedAt: Date.now(), starttime: 1 }]); // wrong on purpose
+        expect(await reapOrphans()).toBe(0);
+        await new Promise((r) => setTimeout(r, 200));
+        expect(spawnSync("kill", ["-0", String(pid)]).status).toBe(0); // untouched
+      } finally {
+        try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    });
+
+    // The same fail-closed rule for the other unverifiable case: a record whose
+    // starttime we never captured. The earlier guard skipped the comparison
+    // entirely when the RECORDED value was null and went on to signal.
+    test("a record with no recorded starttime is never signalled", async () => {
+      const victim = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+      victim.unref();
+      const pid = victim.pid!;
+      try {
+        write([{ taskId: "t_gone", pid, port: 18999, startedAt: Date.now(), starttime: null }]);
+        expect(await reapOrphans()).toBe(0);
+        await new Promise((r) => setTimeout(r, 200));
+        expect(spawnSync("kill", ["-0", String(pid)]).status).toBe(0); // untouched
+        expect(notices().some((n) => n.code === "preview-orphan")).toBe(true); // and reported
+      } finally {
+        try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    });
+
+    // A forged or corrupted pidfile must never reach a signal. kill(-0) would hit
+    // the daemon's OWN group; kill(-1) everything the uid can reach.
+    test("a pid that is not a real pid is refused outright", async () => {
+      for (const pid of [0, -1, 1, 1.5, "123" as unknown as number]) {
+        write([{ taskId: "t_gone", pid, port: 18999, startedAt: Date.now(), starttime: 1 }]);
+        expect(await reapOrphans()).toBe(0);
+      }
     });
 
     test("a matching starttime is reaped", async () => {

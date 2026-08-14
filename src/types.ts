@@ -140,7 +140,7 @@ export interface AgentDeckConfig {
   // Under uid 0, spawn agents with IS_SANDBOX=1 to lift Claude Code's refusal to
   // run --dangerously-skip-permissions as root. OFF by default: root is a mistake
   // (an unset systemd `User=`) far more often than a decision, and the flag it
-  // relaxes is an undocumented Claude Code internal. See agentEnv() in agent.ts.
+  // relaxes is an undocumented Claude Code internal. See agentEnv() in proc.ts.
   allowRoot: boolean;
   permissionMode: string;  // used only when dangerouslySkipPermissions=false
   // Default for a new task's `pipeline` flag (AGENTDECK_PIPELINE). Ships OFF:

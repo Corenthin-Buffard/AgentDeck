@@ -19,7 +19,7 @@ import { parseDecisionBrief } from "./detect.ts";
 import { stepSummary } from "./pipeline.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
-import { getPreview, previewCommand, resolvePreview, startPreview, stopPreview } from "./preview.ts";
+import { beginPreview, getPreview, previewCommand, redactedResolution, resolvePreview, stopPreview } from "./preview.ts";
 
 const MAX_UPLOAD = 25 * 1024 * 1024; // 25MB app cap; maxRequestBodySize is the first curtain
 // The only `dest` the upload accepts beyond the per-project uploads dir: the
@@ -430,7 +430,14 @@ export function startServer() {
           const t = store.getTask(id)!;
           if (req.method === "POST") {
             try {
-              return json({ preview: await startPreview(t, projectById(t.project)) });
+              // 202, and deliberately NOT awaited. Bun.serve closes any handler that
+              // runs past its idleTimeout (10s by default, 255s ceiling), while a
+              // cold `npm install` is minutes — awaiting here killed the connection
+              // under the client and the dashboard saw a socket error instead of a
+              // preview. beginPreview does the fast, throwable checks synchronously
+              // and reports the slow half through the entry's status, which already
+              // rides the WebSocket to the board.
+              return json({ preview: beginPreview(t, projectById(t.project)) }, 202);
             } catch (e: any) {
               // 409, not 500: every one of these is a state or configuration
               // problem the operator can act on, and the message IS the fix.
@@ -439,13 +446,20 @@ export function startServer() {
           }
           if (req.method === "DELETE") { await stopPreview(id, "stopped from the dashboard"); return json({ ok: true }); }
           if (req.method === "GET") {
+            // This read is UNGATED, so nothing here may carry a secret. The raw
+            // Resolution must never be serialised: it returns projects.json's
+            // `preview`/`install` verbatim, and those accept leading NAME=VALUE
+            // tokens — so a DATABASE_URL or npm_config__auth an operator put there
+            // would be served to anything that reaches the port, bypassing
+            // redactCommand entirely. Send only the shape the drawer reads.
+            const res = resolvePreview(projectById(t.project));
             return json({
               enabled: config.preview.enabled,
               preview: getPreview(id) ?? null,
               command: previewCommand(id),
               // The reason a preview CAN'T start is the most useful thing the
               // drawer can show, so resolve it even when nothing is running.
-              resolution: resolvePreview(projectById(t.project)),
+              resolution: res.ok ? { ok: true, configured: redactedResolution(res) } : { ok: false, reason: res.reason },
             });
           }
         }

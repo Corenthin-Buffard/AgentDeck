@@ -14,14 +14,6 @@ const port = Number(process.env.AGENTDECK_PORT ?? 8787);
 const targetRepo = process.env.AGENTDECK_TARGET_REPO ?? process.cwd();
 
 /**
- * The project registry. Read from `<dataDir>/projects.json` (an array of
- * `{ id, path, label? }`); on any problem — missing, unreadable, malformed,
- * empty after validation — fall back to a single `default` project synthesized
- * from `targetRepo`. config.ts is imported everywhere, so this MUST NOT throw:
- * a crash here is a systemd crash-loop. Exported so it's testable without the
- * singleton. Duplicate ids are dropped (first wins) so routing is unambiguous.
- */
-/**
  * Validate one optional command field on a projects.json entry.
  *
  * Accepts a non-empty string, or an array of non-empty strings. The array form
@@ -53,6 +45,14 @@ export function cmdField(
   return {};
 }
 
+/**
+ * The project registry. Read from `<dataDir>/projects.json` (an array of
+ * `{ id, path, label? }`); on any problem — missing, unreadable, malformed,
+ * empty after validation — fall back to a single `default` project synthesized
+ * from `targetRepo`. config.ts is imported everywhere, so this MUST NOT throw:
+ * a crash here is a systemd crash-loop. Exported so it's testable without the
+ * singleton. Duplicate ids are dropped (first wins) so routing is unambiguous.
+ */
 export function loadProjects(dir: string, fallbackRepo: string): Project[] {
   const fallback = (): Project[] => [{ id: "default", path: fallbackRepo, label: basename(fallbackRepo) || "default" }];
   const file = join(dir, "projects.json");
@@ -184,6 +184,28 @@ const PORT_MAX = 32767;
 const POOL_MAX = 16;
 
 /**
+ * A non-negative millisecond knob, with the same fail-soft contract as parsePool.
+ *
+ * `Number("4h")` is NaN, and NaN silently defeats every comparison it touches: a
+ * NaN ttlMs makes `ttl > 0` false, so the hard lifetime cap disappears without a
+ * word; a NaN readyTimeoutMs makes the readiness deadline expire on the first tick
+ * and every preview fails with "did not listen within NaNs". Both are far worse
+ * than falling back with a warning.
+ *
+ * `allowZero` exists because 0 is a meaningful value for the TTL (disable the cap)
+ * but a broken one for a timeout.
+ */
+export function posNum(raw: string | undefined, fallback: number, name: string, allowZero = false): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || (!allowZero && n === 0)) {
+    notice("warn", "preview-config", `${name}='${raw}' is not a ${allowZero ? "non-negative" : "positive"} number of milliseconds — using ${fallback}`);
+    return fallback;
+  }
+  return n;
+}
+
+/**
  * Parse the preview port pool: `"8788-8790"` or `"8788,8790"`.
  *
  * PURE + exported so every rejection is testable. MUST NOT throw — config.ts is
@@ -303,12 +325,12 @@ export const config: AgentDeckConfig = {
     // `ssh -L` line, so the pool IS the concurrency limit. Three is two more than
     // most sessions need and still only ~1.8GB worst case alongside four agents.
     ports: parsePool(process.env.AGENTDECK_PREVIEW_PORTS, [8788, 8789, 8790]),
-    readyTimeoutMs: Number(process.env.AGENTDECK_PREVIEW_READY_TIMEOUT_MS ?? 60_000),
-    installTimeoutMs: Number(process.env.AGENTDECK_PREVIEW_INSTALL_TIMEOUT_MS ?? 600_000),
+    readyTimeoutMs: posNum(process.env.AGENTDECK_PREVIEW_READY_TIMEOUT_MS, 60_000, "AGENTDECK_PREVIEW_READY_TIMEOUT_MS"),
+    installTimeoutMs: posNum(process.env.AGENTDECK_PREVIEW_INSTALL_TIMEOUT_MS, 600_000, "AGENTDECK_PREVIEW_INSTALL_TIMEOUT_MS"),
     // A hard lifetime cap, NOT an idle timer. The daemon is not in the request path
     // (dev servers are reached directly over the tunnel), so it cannot observe use;
     // any "idle" signal would be a guess. A ceiling is honest and deterministic.
-    ttlMs: Number(process.env.AGENTDECK_PREVIEW_TTL_MS ?? 4 * 60 * 60_000),
+    ttlMs: posNum(process.env.AGENTDECK_PREVIEW_TTL_MS, 4 * 60 * 60_000, "AGENTDECK_PREVIEW_TTL_MS", true),
     memMax: process.env.AGENTDECK_PREVIEW_MEM_MAX ?? "1G",
   },
 

@@ -236,7 +236,7 @@ Next, from the README runbook — none of it is mechanical, so none of it is her
   6. systemctl enable --now $AD_USER
 
 Optional, if you will use the Preview button (see the README):
-  - deny the dev-server pool at the firewall, e.g.  ufw deny in on 8788:8790
+  - deny the dev-server pool at the firewall, e.g.  ufw deny 8788:8790/tcp
     Dev servers already bind 127.0.0.1 only; this is the belt-and-braces layer that
     also covers a framework which ignores the bind flag you gave it. NOT done for
     you: enabling a firewall you were not already running is how people lock
@@ -255,7 +255,7 @@ check_preview_firewall() {
   if ufw status 2>/dev/null | grep -q "${ports%%-*}"; then
     ok "preview-firewall" "ufw has a rule covering $ports"
   else
-    warn "preview-firewall" "ufw is active but has no rule for the preview pool ($ports) — add: ufw deny in on ${ports}"
+    warn "preview-firewall" "ufw is active but has no rule for the preview pool ($ports) — add: ufw deny ${ports}/tcp"
   fi
 }
 

@@ -80,6 +80,11 @@ export function spawnOpts(cwd: string, uid: number | undefined): SpawnOptions {
  * "nothing to kill" as success rather than an error.
  */
 export function killGroup(pid: number, signal: NodeJS.Signals = "SIGTERM"): boolean {
+  // Refuse anything that is not a real pid BEFORE negating it. `kill(-0, …)`
+  // signals the caller's OWN process group and `kill(-1, …)` signals every process
+  // this uid can reach — so a 0, a negative, or a NaN arriving from a corrupted
+  // pidfile would turn a cleanup routine into a self-inflicted outage.
+  if (!Number.isInteger(pid) || pid <= 1) return false;
   try {
     process.kill(-pid, signal);
     return true;
@@ -93,6 +98,7 @@ export function killGroup(pid: number, signal: NodeJS.Signals = "SIGTERM"): bool
  *  without delivering anything. EPERM means it exists but isn't ours — still
  *  alive, so the answer is true. */
 export function isAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -139,6 +145,8 @@ export function shouldRelay(queuedBytes: number, max = STDERR_RELAY_MAX_QUEUE): 
  * line 2. Any first-line rule would have shown the operator the stdin warning. The
  * whole (bounded) tail has no such failure mode and is less code.
  */
+export type StderrTail = ReturnType<typeof createStderrTail>;
+
 export function createStderrTail(max = STDERR_TAIL_MAX) {
   let tail = "";
   return {

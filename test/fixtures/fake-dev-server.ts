@@ -17,6 +17,12 @@
 //   --exit <code>     exit immediately with this code
 //   --flood <bytes>   write this many bytes to stdout before listening
 //   --stderr <text>   write this to stderr before doing anything else
+//   --marker <text>   write this to stdout AFTER the flood, so a test can prove
+//                     the supervisor actually CONSUMED stdout rather than infer it
+//   --close-after <ms> stop listening but stay alive — the only shape the sweep's
+//                     health probe is responsible for (a dead process is caught by
+//                     the close handler long before any sweep runs)
+//   --ignore-sigterm  refuse SIGTERM, so the SIGKILL escalation has something to do
 
 const args = process.argv.slice(2);
 const flag = (name: string): string | undefined => {
@@ -38,8 +44,18 @@ if (flood > 0) {
   for (let written = 0; written < flood; written += chunk.length) process.stdout.write(chunk);
 }
 
+const marker = flag("--marker");
+if (marker) process.stdout.write(marker + "\n");
+
+if (args.includes("--ignore-sigterm")) process.on("SIGTERM", () => { /* deliberately unkillable by SIGTERM */ });
+
 const delay = Number(flag("--delay") ?? 0);
 const port = flag("--port");
+const closeAfter = Number(flag("--close-after") ?? 0);
+// Registered UP FRONT, not inside the timeout: once the listener is stopped there
+// is nothing else holding the loop open, and the process would exit — which is the
+// close-handler shape, not the stopped-listening shape this flag exists to produce.
+if (closeAfter > 0) setInterval(() => { /* stay alive with no listener */ }, 1 << 30);
 
 async function listen() {
   if (port === undefined) {
@@ -48,12 +64,15 @@ async function listen() {
     setInterval(() => { /* keep the loop alive */ }, 1 << 30);
     return;
   }
-  Bun.listen({
+  const srv = Bun.listen({
     hostname: flag("--host") ?? "127.0.0.1",
     port: Number(port),
     socket: { data() { /* a real dev server would answer; we only need the accept */ } },
   });
   process.stdout.write(`fake-dev-server listening on ${port}\n`);
+  // Stop accepting but stay alive. A process that EXITS is caught by the close
+  // handler; only this shape reaches the sweep's canConnect probe.
+  if (closeAfter > 0) setTimeout(() => srv.stop(true), closeAfter);
 }
 
 if (delay > 0) setTimeout(listen, delay);

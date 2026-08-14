@@ -135,6 +135,7 @@ Every surface that can be absent, loading, empty, or broken says so.
 | Board, no task | dashed empty state, one-line explanation, primary action |
 | Task row | waiting · error · running · resuming · done · stopped, each with a colored rail |
 | Preview control | absent (daemon can't) · disabled+reason (agent still editing) · Preview · Installing… · Preview… · Stopping… · Preview failed · **Preview ▸** (a link) |
+| Preview drawer | disabled-on-this-daemon · not configured (reason + Copy) · could-not-start (sticky) · Installing · Starting · Running (link + ssh guidance) · Stopping · Failed |
 
 The notice banner is the daemon's own health, not a task's. It sits between
 `</header>` and `#board` — below the header, so it joins neither row and adds no
@@ -149,6 +150,20 @@ second `margin-left:auto`. Three rules, each learned the hard way:
 - **Body text is `--text`, never the semantic colour.** `--err`/`--wait` on their
   own tints fall under the 4.5:1 floor in one theme or the other; the border
   carries the meaning and the text stays readable. See Rule 1 and Rule 3.
+
+**Disabled controls dim the border, never the label.** `opacity` on a `.btn`
+multiplies the text colour too: `--dim` at `.5` measures **2.75:1** dark and
+**2.13:1** light, under the 4.5:1 floor, and it compounds with `.row.done`'s own
+`.62` to **1.80:1**. Four of the preview control's eight states render only while
+disabled, so that treatment would have put half the feature below the floor. Signal
+it with `border-style:dashed` + `--line-soft` and leave the label at full strength.
+
+**A drawer that re-renders must not steal what the user is holding.** The preview
+drawer is the first surface that redraws from live data, and `render()` fires on
+every WebSocket frame plus every 10s. Rebuilding `innerHTML` unconditionally threw
+keyboard focus to `<body>`, wiped text selection and reset scroll — on the ssh line
+the drawer exists to let you copy. Re-render only when the markup actually changed,
+skip while a selection is anchored inside, and restore focus by `data-k`.
 
 **Preview state is never agent state.** The preview control is `.btn.ghost` in
 every one of its states, including `Preview failed`. It must not borrow `--err` or

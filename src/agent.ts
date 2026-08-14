@@ -7,7 +7,7 @@ import { emitUpdate } from "./bus.ts";
 // Process-supervision primitives, shared with the preview supervisor. See proc.ts's
 // header for why they live there rather than here.
 import {
-  EVENT_TEXT_MAX, agentEnv, createStderrTail, exitReason, scrubSecrets, shouldRelay, spawnOpts,
+  EVENT_TEXT_MAX, createStderrTail, exitReason, scrubSecrets, shouldRelay, spawnOpts,
 } from "./proc.ts";
 import { clearNotice, notice } from "./notices.ts";
 import { notify } from "./notify.ts";
@@ -257,7 +257,7 @@ function scheduleAfterExit(taskId: string, spawnFn: () => void): void {
 // ── A1b (proven): the launch config that lets an agent run gstack headlessly ──
 // The spike confirmed gstack only resolves + runs unattended with permissions
 // fully skipped; `--permission-mode acceptEdits` was not enough. baseArgs() builds
-// the flags; agentEnv()/spawnOpts() below build the environment they run in.
+// the flags; agentEnv()/spawnOpts() in proc.ts build the environment they run in.
 
 // agentEnv() and spawnOpts() moved to src/proc.ts — the preview supervisor needs
 // them too, and it must not import this module (see that file's header).
