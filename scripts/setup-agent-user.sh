@@ -234,7 +234,29 @@ Next, from the README runbook — none of it is mechanical, so none of it is her
   4. install the agentdeck binary at $AD_BIN
   5. $0 --check      # must pass BEFORE the next line
   6. systemctl enable --now $AD_USER
+
+Optional, if you will use the Preview button (see the README):
+  - deny the dev-server pool at the firewall, e.g.  ufw deny in on 8788:8790
+    Dev servers already bind 127.0.0.1 only; this is the belt-and-braces layer that
+    also covers a framework which ignores the bind flag you gave it. NOT done for
+    you: enabling a firewall you were not already running is how people lock
+    themselves out of SSH.
 EOF
+}
+
+# Preview dev servers run unreviewed, agent-written code. They bind loopback, so
+# this is defence in depth rather than the only guard — hence a WARN, and only when
+# ufw is the firewall actually in use. We cannot audit nftables rules or a cloud
+# security group from here, and pretending otherwise would be worse than silence.
+check_preview_firewall() {
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | head -1 | grep -qi 'Status: active' || return 0
+  local ports="${AGENTDECK_PREVIEW_PORTS:-8788-8790}"
+  if ufw status 2>/dev/null | grep -q "${ports%%-*}"; then
+    ok "preview-firewall" "ufw has a rule covering $ports"
+  else
+    warn "preview-firewall" "ufw is active but has no rule for the preview pool ($ports) — add: ufw deny in on ${ports}"
+  fi
 }
 
 # ── check ──────────────────────────────────────────────────────────────────────
@@ -484,6 +506,8 @@ check() {
     esac
     warn "$t" "not on the service PATH — gstack's setup needs it. Fix: $tfix"
   done
+
+  check_preview_firewall
 
   echo
   if [ "$FAILED" -ne 0 ]; then

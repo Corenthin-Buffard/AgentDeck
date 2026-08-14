@@ -33,6 +33,14 @@ Common settings (environment; systemd: EnvironmentFile=). Full list in the READM
   AGENTDECK_ALLOWED_HOSTS    extra Host header names, comma-separated (reverse proxy)
   AGENTDECK_CLAUDE_BIN       path to \`claude\` (default: resolved from PATH)
   AGENTDECK_MAX_AGENTS       concurrent agent cap (default 4)
+  AGENTDECK_PREVIEW          "false" disables the Preview button entirely
+  AGENTDECK_PREVIEW_PORTS    dev-server port pool (default 8788-8790). Sets BOTH
+                             reachability and concurrency: forward each one
+                             (ssh -L <port>:127.0.0.1:<port>) to reach a preview.
+  AGENTDECK_PREVIEW_TTL_MS   hard preview lifetime cap (default 4h; 0 disables)
+  AGENTDECK_PREVIEW_MEM_MAX  per-preview memory ceiling (default 1G)
+  AGENTDECK_PREVIEW_READY_TIMEOUT_MS    wait for the dev server to listen (60s)
+  AGENTDECK_PREVIEW_INSTALL_TIMEOUT_MS  wait for the install command (10min)
   AGENTDECK_SKIP_PERMISSIONS "false" disables --dangerously-skip-permissions.
                              gstack skills only resolve with it ON, which is the default.
   AGENTDECK_ALLOW_ROOT       "true" lets agents start when the daemon runs as root, by
