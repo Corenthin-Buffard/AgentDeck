@@ -9,6 +9,10 @@
 <meta name="ad-pipeline-default" content="__AD_PIPELINE_DEFAULT__">
 <!-- The resolved pipeline step table, daemon-wide. -->
 <meta name="ad-pipeline-steps" content="__AD_PIPELINE_STEPS__">
+<!-- Whether this daemon can run previews at all. Empty when it can't (disabled,
+     bound off-loopback, or a pool colliding with the dashboard port), so the board
+     can say so instead of rendering a button that would always fail. -->
+<meta name="ad-preview" content="__AD_PREVIEW_ENABLED__">
 <title>AgentDeck · Master Inbox</title>
 <!-- Favicon: the same deck glyph as the header, inline so the binary stays
      self-contained (no extra file, no server route). Hex is hard-coded because

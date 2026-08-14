@@ -19,6 +19,7 @@ import { parseDecisionBrief } from "./detect.ts";
 import { stepSummary } from "./pipeline.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
+import { getPreview, previewCommand, resolvePreview, startPreview, stopPreview } from "./preview.ts";
 
 const MAX_UPLOAD = 25 * 1024 * 1024; // 25MB app cap; maxRequestBodySize is the first curtain
 // The only `dest` the upload accepts beyond the per-project uploads dir: the
@@ -164,8 +165,23 @@ export function withBriefs<T extends { status: string; pendingQuestion?: string 
   });
 }
 
+/**
+ * Fold each task's live preview state onto the payload.
+ *
+ * DERIVED, never persisted — same reasoning as withBriefs above. The registry is in
+ * memory because a dev server has no `--resume` handle, so a row claiming `ready`
+ * after a restart would be a lie. Tasks without a preview are returned untouched,
+ * so the common path allocates nothing.
+ */
+export function withPreviews<T extends { id: string }>(tasks: T[]) {
+  return tasks.map((t) => {
+    const preview = getPreview(t.id);
+    return preview ? { ...t, preview } : t;
+  });
+}
+
 function tasksForClient() {
-  return withBriefs(store.listTasks());
+  return withPreviews(withBriefs(store.listTasks()));
 }
 
 function sendAll(payload: string) {
@@ -236,7 +252,11 @@ export function startServer() {
   const dashboardHtml = indexHtml
     .replace("__AD_TOKEN__", () => escAttr(config.dashboardToken))
     .replace("__AD_PIPELINE_DEFAULT__", () => (config.pipelineDefault ? "true" : "false"))
-    .replace("__AD_PIPELINE_STEPS__", () => escAttr(stepSummary().join(" | ")));
+    .replace("__AD_PIPELINE_STEPS__", () => escAttr(stepSummary().join(" | ")))
+    // Resolved AFTER daemon.ts's boot checks, which may disable previews (a pool
+    // colliding with this port, or an off-loopback bind). Serving it lets the board
+    // explain why the control is absent instead of rendering one that always fails.
+    .replace("__AD_PREVIEW_ENABLED__", () => (config.preview.enabled ? "true" : "false"));
   // From here on, a notice raised at RUNTIME (agent.ts retracting the root-bypass
   // claim) reaches every open dashboard immediately instead of waiting for the next
   // reconnect. Registered before serve() so nothing raised during startup is lost.
@@ -400,6 +420,35 @@ export function startServer() {
           catch (e: any) { return json({ error: e.message }, 409); }
         }
         if (action === "stop" && req.method === "POST") { stopTask(id); return json({ ok: true }); }
+        // ── Preview ────────────────────────────────────────────────────────
+        // POST/DELETE are token-gated by the `perTask` predicate above: starting
+        // one spawns a long-lived process from an agent-written repo, as the
+        // daemon's uid, with the daemon's environment. GET is an ungated read like
+        // the others — which is exactly why the command it returns has every env
+        // VALUE redacted (see redactCommand).
+        if (action === "preview") {
+          const t = store.getTask(id)!;
+          if (req.method === "POST") {
+            try {
+              return json({ preview: await startPreview(t, projectById(t.project)) });
+            } catch (e: any) {
+              // 409, not 500: every one of these is a state or configuration
+              // problem the operator can act on, and the message IS the fix.
+              return json({ error: String(e?.message ?? e) }, 409);
+            }
+          }
+          if (req.method === "DELETE") { await stopPreview(id, "stopped from the dashboard"); return json({ ok: true }); }
+          if (req.method === "GET") {
+            return json({
+              enabled: config.preview.enabled,
+              preview: getPreview(id) ?? null,
+              command: previewCommand(id),
+              // The reason a preview CAN'T start is the most useful thing the
+              // drawer can show, so resolve it even when nothing is running.
+              resolution: resolvePreview(projectById(t.project)),
+            });
+          }
+        }
         if (action === "events" && req.method === "GET") return json({ events: store.recentEvents(id) });
         if (action === "diff" && req.method === "GET") {
           const t = store.getTask(id)!;

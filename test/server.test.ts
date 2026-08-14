@@ -834,6 +834,99 @@ describe("DELETE on a task sub-resource must not delete the task", () => {
   });
 });
 
+// Starting a preview spawns a long-lived process from an agent-written repo, as the
+// daemon's uid, with the daemon's environment — so it sits behind the same
+// anti-CSRF gate as task creation. The GET is an ungated read like the others,
+// which is precisely why what it returns must carry no secrets.
+describe("the preview routes", () => {
+  const id = "t_pvroute";
+
+  async function seed() {
+    const { store } = await import("../src/db.ts");
+    if (!store.getTask(id)) {
+      store.insertTask({
+        id, project: "default", title: "pv", prompt: "p", branch: "b", worktree: "/nonexistent",
+        tmux: null, sessionId: null, status: "done", phase: "done", pendingQuestion: null,
+        lastActivity: Date.now(), createdAt: Date.now(), error: null,
+        planReviews: { ceo: null, design: null, eng: null },
+        pipeline: false, step: 0, stepSkillSeen: false, pipelineMissed: 0,
+      });
+    }
+  }
+
+  test("POST and DELETE require the dashboard token; GET does not", async () => {
+    await seed();
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      expect((await fetch(`${base}/api/tasks/${id}/preview`, { method: "POST" })).status).toBe(403);
+      expect((await fetch(`${base}/api/tasks/${id}/preview`, { method: "DELETE" })).status).toBe(403);
+      expect((await fetch(`${base}/api/tasks/${id}/preview`, { method: "POST", headers: { "x-agentdeck-token": "wrong" } })).status).toBe(403);
+      expect((await fetch(`${base}/api/tasks/${id}/preview`)).status).toBe(200);
+    } finally { server.stop(true); }
+  });
+
+  // The failure IS the fix: an unconfigured project must hand back the snippet to
+  // paste, not a bare "no". 409 rather than 500 — nothing here is a server fault.
+  test("starting an unconfigured preview 409s with the projects.json snippet", async () => {
+    await seed();
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      const res = await fetch(`${base}/api/tasks/${id}/preview`, {
+        method: "POST", headers: { "x-agentdeck-token": config.dashboardToken },
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error).toContain("projects.json");
+      expect(body.error).toContain("{port}");
+    } finally { server.stop(true); }
+  });
+
+  test("GET reports why a preview is unavailable even when none is running", async () => {
+    await seed();
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      const body = await (await fetch(`${base}/api/tasks/${id}/preview`)).json();
+      expect(body.preview).toBeNull();
+      expect(body.resolution.ok).toBe(false);
+      expect(body.resolution.reason).toContain("projects.json");
+    } finally { server.stop(true); }
+  });
+
+  test("a task with no preview is unchanged in the tasks payload", async () => {
+    await seed();
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      const { tasks } = await (await fetch(`${base}/api/tasks`)).json();
+      const row = tasks.find((t: any) => t.id === id);
+      expect(row).toBeDefined();
+      expect(row.preview).toBeUndefined(); // folded in only when one exists
+    } finally { server.stop(true); }
+  });
+
+  test("the dashboard advertises whether previews are available", async () => {
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    try {
+      const html = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+      expect(html).not.toContain("__AD_PREVIEW_ENABLED__");
+      expect(html).toContain(`content="${config.preview.enabled ? "true" : "false"}"`);
+    } finally { server.stop(true); }
+  });
+});
+
 // The served HTML carries the pipeline default in a meta tag. If the placeholder
 // is ever renamed or dropped, the raw `__AD_PIPELINE_DEFAULT__` ships and the
 // client's `=== "true"` read silently forces the New-task checkbox OFF on a daemon

@@ -3,6 +3,7 @@ import { store } from "./db.ts";
 import { config, projectById } from "./config.ts";
 import { createWorktree, cleanupWorktree, type CleanupResult, type CleanupMode } from "./git.ts";
 import { launchTask, killExisting, forgetTask } from "./agent.ts";
+import { stopPreview } from "./preview.ts";
 import { emitUpdate } from "./bus.ts";
 import type { Task } from "./types.ts";
 
@@ -52,6 +53,11 @@ export async function removeTask(id: string, mode: CleanupMode = "safe", expecte
   // concurrency slot for a row that no longer exists, and wrote event rows keyed to
   // a purged task_id that nothing would ever collect.
   killExisting(id);
+  // Same reasoning, one layer out: a dev server holding this worktree open is both
+  // a leak (it survives the row, still bound to a pool port) and a failure — a
+  // running process with the worktree as its cwd makes `git worktree remove` refuse.
+  // Awaited, so the process is GONE before cleanupWorktree touches the directory.
+  await stopPreview(id, "task removed");
   // expectedSha is the merged-mode CAS guard (only delete the branch if it still
   // points where isBranchMerged proved it was merged).
   const res = await cleanupWorktree(t.worktree, t.branch, mode, expectedSha);

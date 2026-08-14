@@ -3,6 +3,7 @@ import { store } from "./db.ts";
 import { repoRootOf, baseBranch, isBranchMerged, type CleanupResult } from "./git.ts";
 import { removeTask } from "./tasks.ts";
 import { isRunning } from "./agent.ts";
+import { isPreviewing } from "./preview.ts";
 import type { Task } from "./types.ts";
 
 // Auto-clean: once a task's branch is proven MERGED (a merged GitHub PR whose head
@@ -14,7 +15,7 @@ import type { Task } from "./types.ts";
 //
 //   startAutoCleanSweep() ─ setTimeout 30s → run → setInterval 5min → run
 //     run (non-overlap guarded) → sweepOnce
-//       ├─ eligible = listTasks().filter(done && !isRunning)
+//       ├─ eligible = listTasks().filter(done && !isRunning && !isPreviewing)
 //       └─ per task: resolve {repo,base} → isBranchMerged (gh) → re-check
 //                    still done+idle → remove(id, provenSha) ("merged" mode, CAS delete)
 
@@ -31,6 +32,10 @@ export interface SweepDeps {
   listTasks: () => Task[];
   getTask: (id: string) => Task | null;
   isRunning: (id: string) => boolean;
+  /** A task the operator is actively looking at in a browser. Its worktree is a
+   *  dev server's cwd, so removing it would both kill the preview mid-look and
+   *  make `git worktree remove` refuse. */
+  isPreviewing: (id: string) => boolean;
   resolveRepo: (worktree: string) => Promise<{ repo: string; base: string }>;
   isMerged: (repo: string, base: string, branch: string) => Promise<string | null>; // proven SHA or null
   remove: (id: string, expectedSha: string) => Promise<CleanupResult>;
@@ -40,6 +45,7 @@ const realDeps: SweepDeps = {
   listTasks: () => store.listTasks(),
   getTask: (id) => store.getTask(id),
   isRunning,
+  isPreviewing,
   resolveRepo: async (wt) => { const repo = await repoRootOf(wt); return { repo, base: await baseBranch(repo) }; },
   isMerged: isBranchMerged,
   remove: (id, sha) => removeTask(id, "merged", sha),
@@ -47,7 +53,7 @@ const realDeps: SweepDeps = {
 
 /** One sweep pass. Best-effort per task — a repo hiccup never aborts the whole run. */
 export async function sweepOnce(deps: SweepDeps = realDeps): Promise<void> {
-  const eligible = deps.listTasks().filter((t) => sweepEligible(t.status) && !deps.isRunning(t.id));
+  const eligible = deps.listTasks().filter((t) => sweepEligible(t.status) && !deps.isRunning(t.id) && !deps.isPreviewing(t.id));
   for (const t of eligible) {
     try {
       const { repo, base } = await deps.resolveRepo(t.worktree);
@@ -55,9 +61,12 @@ export async function sweepOnce(deps: SweepDeps = realDeps): Promise<void> {
       if (!sha) continue;
       // Anti-race: the merge probe was async and slow (network). Re-confirm the task
       // is STILL terminal + idle before the destructive remove — it may have been
-      // resumed or already cleaned in the meantime.
+      // resumed, previewed, or already cleaned in the meantime. The preview check
+      // belongs here as much as in the filter above: `gh` takes long enough that an
+      // operator can easily click Preview inside the window, and losing the worktree
+      // mid-look is exactly the surprise auto-clean is supposed to avoid.
       const fresh = deps.getTask(t.id);
-      if (!fresh || !sweepEligible(fresh.status) || deps.isRunning(t.id)) continue;
+      if (!fresh || !sweepEligible(fresh.status) || deps.isRunning(t.id) || deps.isPreviewing(t.id)) continue;
       // Pass the proven SHA so the branch delete is a compare-and-swap: if a commit
       // landed since the proof, the delete no-ops and the branch survives.
       const res = await deps.remove(t.id, sha);
