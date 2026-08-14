@@ -382,7 +382,13 @@ export function startServer() {
       if (m) {
         const [, id, action] = m;
         if (!store.getTask(id)) return json({ error: "not found" }, 404);
-        if (req.method === "DELETE") {
+        // `&& !action` is load-bearing, not defensive. The regex above captures a
+        // trailing segment into `action`, so without this guard a DELETE to ANY
+        // sub-resource — /api/tasks/<id>/preview — fell into this branch and
+        // destroyed the whole task: worktree, branch and row. It went unnoticed
+        // because no sub-resource accepted DELETE until previews did. A new
+        // sub-resource must opt IN to DELETE below, never inherit it from here.
+        if (req.method === "DELETE" && !action) {
           const q = url.searchParams.get("mode");
           const mode = q === "commit" || q === "force" ? q : "safe";
           return json(await removeTask(id, mode));

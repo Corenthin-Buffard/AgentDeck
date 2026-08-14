@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { config } from "../src/config.ts";
 
 // `config` is a singleton that may be imported by another suite first (with the
@@ -764,6 +765,72 @@ describe("pipelineFlag", () => {
     expect(pipelineFlag(0)).toBeUndefined();
     expect(pipelineFlag({})).toBeUndefined();
     expect(pipelineFlag([])).toBeUndefined();
+  });
+});
+
+// REGRESSION (CRITICAL). The per-task route matcher captures a trailing segment
+// into `action`, but the DELETE branch tested only the METHOD:
+//
+//     const m = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(\w+))?$/);
+//     if (m) { const [, id, action] = m;
+//       if (req.method === "DELETE") { ... removeTask(id, mode) }   // <- ignores action
+//
+// So any DELETE to a SUB-resource of a task destroyed the whole task: its worktree,
+// its branch and its row. Nothing exercised it, because `preview` was the first
+// sub-resource to accept DELETE. This is a real worktree on a real repo precisely
+// so the assertion has teeth — a bogus path would make cleanup fail and the row
+// would survive for the wrong reason, hiding the bug.
+describe("DELETE on a task sub-resource must not delete the task", () => {
+  test("DELETE /api/tasks/:id/preview leaves the task and its worktree intact", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "agentdeck-del-repo-"));
+    const wts = mkdtempSync(join(tmpdir(), "agentdeck-del-wts-"));
+    const g = (args: string[], cwd = repo) => spawnSync("git", args, { cwd, encoding: "utf8" });
+    g(["init", "-q", "-b", "main"]);
+    g(["config", "user.email", "t@test.local"]);
+    g(["config", "user.name", "t"]);
+    writeFileSync(join(repo, "README.md"), "# base\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "init"]);
+
+    const id = "t_delguard";
+    const branch = "agentdeck/del-guard";
+    const worktree = join(wts, "del-guard");
+    g(["worktree", "add", "-q", "-b", branch, worktree, "HEAD"]);
+    // CLEAN worktree on purpose: safe-mode cleanup refuses a dirty one, which would
+    // let the buggy code path "pass" this test without the guard.
+
+    const { store } = await import("../src/db.ts");
+    store.insertTask({
+      id, project: "default", title: "delete-guard", prompt: "p", branch, worktree,
+      tmux: null, sessionId: null, status: "done", phase: "done", pendingQuestion: null,
+      lastActivity: Date.now(), createdAt: Date.now(), error: null,
+      planReviews: { ceo: null, design: null, eng: null },
+      pipeline: false, step: 0, stepSkillSeen: false, pipelineMissed: 0,
+    });
+
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const server = startServer();
+    const base = `http://127.0.0.1:${server.port}`;
+    const auth = { "x-agentdeck-token": config.dashboardToken };
+    try {
+      await fetch(`${base}/api/tasks/${id}/preview`, { method: "DELETE", headers: auth });
+
+      // The task survives. Under the bug this row was gone.
+      expect(store.getTask(id)).not.toBeNull();
+      // And so does its worktree — the destructive half of removeTask.
+      expect(existsSync(worktree)).toBe(true);
+
+      // The guard is scoped to sub-resources: a bare DELETE still removes the task,
+      // so this fix cannot silently disable cleanup.
+      const bare = await fetch(`${base}/api/tasks/${id}`, { method: "DELETE", headers: auth });
+      expect((await bare.json()).removed).toBe(true);
+      expect(store.getTask(id)).toBeNull();
+    } finally {
+      server.stop(true);
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(wts, { recursive: true, force: true });
+    }
   });
 });
 
