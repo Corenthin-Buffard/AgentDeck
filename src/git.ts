@@ -8,11 +8,35 @@ import { config } from "./config.ts";
 // can opt into "commit" (save the agent's work onto the branch, then remove) or
 // "force" (discard) — both are explicit, never the default.
 
+/** How long any single git invocation may run before it is killed.
+ *
+ *  CLASS FIX for "a route handler awaits unbounded work". Bun.serve closes any
+ *  handler past its idleTimeout (10s by default), and three routes await git —
+ *  createTask (`worktree add`), the diff endpoint, and removeTask
+ *  (`worktree remove`). A git call that hangs on a lock file, a stale mount or a
+ *  huge worktree therefore surfaces to the operator as "request failed" on an
+ *  operation that is STILL RUNNING, and their retry races the first one. Every git
+ *  call in this daemon goes through git(), so bounding it here bounds all of them.
+ *
+ *  Generous on purpose: a real `worktree add` on a large repo is seconds, not
+ *  minutes. This is a hang breaker, not a performance budget. */
+const GIT_TIMEOUT_MS = 60_000;
+
 async function git(args: string[], cwd = config.targetRepo): Promise<{ ok: boolean; out: string; err: string }> {
   const p = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-  const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
-  const code = await p.exited;
-  return { ok: code === 0, out: out.trim(), err: err.trim() };
+  const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* already gone */ } }, GIT_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+    const code = await p.exited;
+    // A killed git looks like a plain failure to every caller, which is the right
+    // shape: they all already handle `ok: false` by refusing to do the destructive
+    // thing. Name it in `err` so the reason reaches the task row.
+    if (code !== 0 && !err) return { ok: false, out: out.trim(), err: `git ${args[0]} did not finish within ${GIT_TIMEOUT_MS / 1000}s` };
+    return { ok: code === 0, out: out.trim(), err: err.trim() };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function baseBranch(cwd = config.targetRepo): Promise<string> {

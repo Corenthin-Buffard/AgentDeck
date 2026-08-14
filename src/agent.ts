@@ -7,7 +7,7 @@ import { emitUpdate } from "./bus.ts";
 // Process-supervision primitives, shared with the preview supervisor. See proc.ts's
 // header for why they live there rather than here.
 import {
-  EVENT_TEXT_MAX, createStderrTail, exitReason, scrubSecrets, shouldRelay, spawnOpts,
+  EVENT_TEXT_MAX, createStderrTail, exitReason, fireAndForget, scrubSecrets, shouldRelay, spawnOpts,
 } from "./proc.ts";
 import { clearNotice, notice } from "./notices.ts";
 import { notify } from "./notify.ts";
@@ -211,7 +211,7 @@ function retire(taskId: string, child: ChildProcess): Promise<void> {
     try { child.kill("SIGTERM"); } catch { finish(); } // already dead
   });
   dying.set(taskId, p);
-  void p.then(() => { if (dying.get(taskId) === p) dying.delete(taskId); });
+  fireAndForget(p.then(() => { if (dying.get(taskId) === p) dying.delete(taskId); }), "agent-retire");
   return p;
 }
 
@@ -248,10 +248,10 @@ export function killExisting(taskId: string): Promise<void> {
 function scheduleAfterExit(taskId: string, spawnFn: () => void): void {
   const gone = killExisting(taskId);
   const gen = launchGen.get(taskId);
-  void gone.then(() => {
+  fireAndForget(gone.then(() => {
     if (launchGen.get(taskId) !== gen) return; // a newer answer/stop/delete superseded us
     schedule(taskId, spawnFn);
-  });
+  }), "agent-respawn");
 }
 
 // ── A1b (proven): the launch config that lets an agent run gstack headlessly ──
@@ -344,7 +344,7 @@ function attach(task: Task, child: ChildProcess) {
   // feature existed) gets its marks the moment its agent comes back, not only at
   // the next turn-end. Gated on canStillReview so a resumed ship/done task doesn't
   // spawn a reader for a phase we no longer poll. No-op for a fresh task (empty log).
-  if (canStillReview(task.phase)) void refreshPlanReviews(task);
+  if (canStillReview(task.phase)) fireAndForget(refreshPlanReviews(task), "plan-reviews");
   let buf = "";
   let text = "";
   const err = createStderrTail();
@@ -666,7 +666,7 @@ function attach(task: Task, child: ChildProcess) {
       // Fire-and-forget + best-effort: it reads its own fresh DB row and only
       // broadcasts on a change, so it can't delay or corrupt the transition below.
       const cur = store.getTask(task.id);
-      if (cur && canStillReview(cur.phase)) void refreshPlanReviews(cur);
+      if (cur && canStillReview(cur.phase)) fireAndForget(refreshPlanReviews(cur), "plan-reviews");
       const finalText = (text || e.result || "").trim();
       log("text", finalText.slice(0, EVENT_TEXT_MAX));
       // `subtype` ALONE does not mean the turn worked. Captured from a real

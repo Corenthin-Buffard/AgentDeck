@@ -20,6 +20,7 @@ import { stepSummary } from "./pipeline.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
 import { beginPreview, getPreview, previewCommand, redactedResolution, resolvePreview, stopPreview } from "./preview.ts";
+import { fireAndForget } from "./proc.ts";
 
 const MAX_UPLOAD = 25 * 1024 * 1024; // 25MB app cap; maxRequestBodySize is the first curtain
 // The only `dest` the upload accepts beyond the per-project uploads dir: the
@@ -264,6 +265,21 @@ export function startServer() {
   const server = serveOrExit({
     hostname: config.host, // A3: localhost by default — do not expose the control API publicly
     port: config.port,
+    // CLASS FIX, the other half of "a handler awaits unbounded work". Bun.serve's
+    // idleTimeout defaults to 10 SECONDS and closes the connection under the client
+    // when a handler runs longer — the client then sees a socket error for an
+    // operation that is still running, and retries it.
+    //
+    // Two complementary defences, because one is not enough:
+    //   - Anything that can take MINUTES (starting a preview, stopping one) returns
+    //     202 immediately and reports over the WebSocket. Raising a timeout would
+    //     never cover a cold `npm install`.
+    //   - Anything that must answer synchronously because the UI reads its result
+    //     (DELETE /api/tasks/:id returns {removed, reason} so the drawer can say
+    //     "worktree is dirty") gets headroom here instead. git() is bounded at 60s
+    //     per call, so this is the ceiling that keeps a legitimate multi-git
+    //     teardown from being cut off mid-flight.
+    idleTimeout: 120,
     // First curtain on upload size: reject an over-large body before it's buffered
     // into RAM (the 25MB app cap is the second curtain). ~26MB leaves headroom.
     maxRequestBodySize: 26 * 1024 * 1024,
@@ -461,7 +477,7 @@ export function startServer() {
             // the client and the dashboard announced "Could not stop the preview".
             // The entry goes to `stopping` synchronously and disappears when it is
             // done, both of which ride the WebSocket to the board.
-            void stopPreview(id, "stopped from the dashboard");
+            fireAndForget(stopPreview(id, "stopped from the dashboard"), "preview-stop");
             return json({ ok: true }, 202);
           }
           if (req.method === "GET") {

@@ -8,8 +8,9 @@ import { resetNotices, notices } from "../src/notices.ts";
 import {
   _resetPreviewsForTest, beginPreview, expandPlaceholders, getPreview, installPreviewShutdown, isPreviewing,
   parsePreviewCommand, parseStarttime, pickPort, previewCommand, previewTail, reapOrphans, redactCommand,
-  redactedResolution, resolvePreview, startPreview, stopPreview, sweepOncePreviews,
+  redactedResolution, resolvePreview, startPreview, startPreviewSweep, stopPreview, sweepOncePreviews,
 } from "../src/preview.ts";
+import { bus } from "../src/bus.ts";
 import type { Project, Task } from "../src/types.ts";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-dev-server.ts");
@@ -587,6 +588,91 @@ describe("the supervisor", () => {
       await a;
       expect(isPreviewing("t_pv")).toBe(false);
     });
+
+    // THE FAR-SIDE ABORT TEST. `aborted` is re-checked on the far side of
+    // `await canConnect`, and that second check is the load-bearing one: a stop that
+    // landed WHILE the probe was in flight used to be overwritten by the `ready` set
+    // just after it — pushing a live "Preview ▸" link to every open dashboard for a
+    // port already being torn down, and returning a `ready` PreviewState from a start
+    // the stop path believed it had aborted.
+    //
+    // That window is sub-millisecond in production and unreachable by sleeping, so a
+    // SUCCESSFUL Bun.connect is held open for 800ms for the duration of this test. A
+    // failed probe still fails at full speed, so the supervisor's loop runs normally
+    // until the child listens and is then guaranteed to be suspended, for most of a
+    // second, inside a probe that is going to come back true.
+    test("a stop landing inside the readiness probe never publishes ready", async () => {
+      const realConnect = Bun.connect;
+      const seen: string[] = [];
+      const record = (id: string) => { if (id === "t_pv") seen.push(getPreview("t_pv")?.status ?? "gone"); };
+      (Bun as any).connect = async (opts: any) => {
+        const s = await realConnect(opts);              // throws exactly as the real one does
+        await new Promise((r) => setTimeout(r, 800));   // …and only a SUCCESS is held open
+        return s;
+      };
+      bus.on("update", record);
+      try {
+        const started = startPreview(task(), project({ preview: fixtureCmd("--port", "{port}") }))
+          .then((s) => s.status, () => "aborted");
+        const port = getPreview("t_pv")!.port;
+        // Wait for the child to be listening — the precondition that makes this the
+        // window and not an ordinary stop during `starting`, since from here the
+        // supervisor's very next probe succeeds and hangs.
+        for (let i = 0; i < 200; i++) {
+          const s = await realConnect({ hostname: "127.0.0.1", port, socket: { data() { /* ignore */ }, error() { /* ignore */ } } })
+            .then((c: any) => { c.end(); return true; }, () => false);
+          if (s) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        await new Promise((r) => setTimeout(r, 300));   // that probe has started, and holds
+        expect(getPreview("t_pv")?.status).toBe("starting");
+
+        const stopped = stopPreview("t_pv");
+        expect(await started).toBe("aborted");         // not "ready": the stop owns the entry
+        await stopped;
+      } finally {
+        (Bun as any).connect = realConnect;
+        bus.off("update", record);
+      }
+      // And no frame announcing a live preview was ever pushed after the teardown
+      // began — that frame is what the board would have rendered as a working link.
+      const from = seen.indexOf("stopping");
+      expect(from).toBeGreaterThanOrEqual(0);
+      expect(seen.slice(from)).not.toContain("ready");
+      expect(isPreviewing("t_pv")).toBe(false);
+    }, 30_000);
+
+    // THE ENTRY-IDENTITY TEST. The child's close handler must act on its OWN entry, not
+    // on whatever entry the taskId points at by then. killCurrentChild resolves on the
+    // SIGKILL timer without waiting for `close`, so a stop-then-restart can install a
+    // NEW entry for the same task while the OLD child's close is still pending — and
+    // the old child then marked the new preview `failed`, with the new entry's output
+    // as the explanation.
+    //
+    // The `setsid`'d grandchild is what makes that ordering deterministic rather than a
+    // race: it escapes the process group, so it survives the kill and holds the stdout
+    // pipe open, and `close` cannot fire until it exits — seconds after the restart.
+    test("the OLD child's close cannot fail the NEW preview for the same task", async () => {
+      const t0 = Date.now();
+      const first = await startPreview(task(), project({
+        preview: ["sh", "-c", `setsid sleep 9 & exec bun ${FIXTURE} --port {port}`],
+      }));
+      expect(first.status).toBe("ready");
+
+      await stopPreview("t_pv");
+      expect(isPreviewing("t_pv")).toBe(false);
+
+      const second = await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}") }));
+      expect(second.status).toBe("ready");
+      expect(second.startedAt).not.toBe(first.startedAt);   // genuinely a second entry
+
+      // The grandchild exits, the old child's close finally lands, and it must find
+      // that its entry is no longer the registered one and do nothing.
+      await new Promise((r) => setTimeout(r, Math.max(0, 10_000 - (Date.now() - t0))));
+      expect(getPreview("t_pv")?.status).toBe("ready");
+      expect(getPreview("t_pv")?.error).toBeNull();
+      expect(getPreview("t_pv")?.startedAt).toBe(second.startedAt);
+    }, 60_000);
   });
 
   describe("node_modules", () => {
@@ -674,6 +760,43 @@ describe("the supervisor", () => {
       await sweepOncePreviews();
       expect(getPreview("t_pv")?.status).toBe("failed");
     });
+
+    // THE NON-OVERLAP TEST. The tick is `if (sweeping) return`, and it exists because a
+    // pass is a network probe per ready preview plus a TTL stop per expired one: without
+    // it a slow pass overlaps the next tick and they stack, and one wedged stop blocks
+    // the health check for every other preview.
+    //
+    // The interval is 30s, so the tick callback is taken off setInterval and driven by
+    // hand — the guard is the code under test, not the timer. A ready preview whose
+    // listener has gone away gives each pass that RUNS exactly one observable effect
+    // (the transition to failed, emitted to every dashboard), so the frames count the
+    // passes: two without the guard, one with it.
+    test("a pass already in flight makes the next tick a no-op", async () => {
+      config.preview.ttlMs = 60_000;   // not the TTL's doing
+      await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}", "--close-after", "300") }));
+      await new Promise((r) => setTimeout(r, 800));      // the listener closes; the process lives on
+      expect(getPreview("t_pv")?.status).toBe("ready");  // so the close handler cannot have fired
+
+      const ticks: Array<() => void> = [];
+      const realSetInterval = globalThis.setInterval;
+      // A real (huge, unref'd) timer is handed back so startPreviewSweep's unref() and
+      // the reset's clearInterval both still work on it.
+      (globalThis as any).setInterval = (fn: () => void) => { ticks.push(fn); return realSetInterval(() => { /* never */ }, 1 << 30); };
+      try { startPreviewSweep(); } finally { (globalThis as any).setInterval = realSetInterval; }
+      expect(ticks).toHaveLength(1);
+
+      let frames = 0;
+      const count = (id: string) => { if (id === "t_pv") frames++; };
+      bus.on("update", count);
+      try {
+        ticks[0]();                                      // pass one — suspends in canConnect
+        ticks[0]();                                      // the tick the guard has to swallow
+        await new Promise((r) => setTimeout(r, 600));
+      } finally { bus.off("update", count); }
+
+      expect(frames).toBe(1);
+      expect(getPreview("t_pv")?.status).toBe("failed");
+    }, 20_000);
   });
 
   // These are the daemon's FIRST signal handlers. Registering one for SIGTERM
@@ -836,10 +959,88 @@ describe("the supervisor", () => {
       expect(notices().some((n) => n.code === "preview-orphan")).toBe(false);
     });
 
+    // The rewrite that keeps unresolvable records was pointless on its own:
+    // writePidfile rebuilds the file from LIVE entries, so "kept for the next boot"
+    // survived only until someone started or stopped a preview. keptOrphans is
+    // merged back in by writePidfile; this is what proves that.
+    test("a kept orphan record survives a later preview start and stop", async () => {
+      const holder = Bun.listen({ hostname: "127.0.0.1", port: 18999, socket: { data() {} } });
+      try {
+        // A dead pid whose port is still held — the permanent-leak case, kept on purpose.
+        write([{ taskId: "t_gone", pid: 999_999, port: 18999, startedAt: Date.now(), starttime: 1 }]);
+        await reapOrphans();
+        expect(JSON.parse(readFileSync(pidfile(), "utf8"))).toHaveLength(1);
+
+        // Now churn the pidfile the way ordinary use does.
+        await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}") }));
+        const afterStart = JSON.parse(readFileSync(pidfile(), "utf8"));
+        expect(afterStart.some((r: any) => r.port === 18999)).toBe(true);   // still there
+        await stopPreview("t_pv");
+        const afterStop = JSON.parse(readFileSync(pidfile(), "utf8"));
+        expect(afterStop.some((r: any) => r.port === 18999)).toBe(true);   // and still there
+      } finally { holder.stop(true); }
+    });
+
     test("the pidfile is consumed, so a second boot does not re-reap", async () => {
       write([{ taskId: "t_gone", pid: 999_999, port: 18999, startedAt: Date.now(), starttime: 1 }]);
       await reapOrphans();
       expect(existsSync(pidfile())).toBe(false);
+    });
+
+    // THE ESCALATION TEST. killGroup returning true means the signal was DELIVERED, not
+    // that the group died — and a dev server that ignores SIGTERM is a shape this
+    // branch's own fixture models, not a hypothetical. Counting delivery as a reap made
+    // the boot log claim it had recovered a port that was in fact still held, by a
+    // process still running, with the record already destroyed.
+    test("an orphan that survives SIGTERM is escalated to SIGKILL before it counts", async () => {
+      // --delay far beyond the test keeps it alive without ever listening, so nothing
+      // here depends on a PORT that may be set in the environment.
+      const orphan = spawn("bun", [FIXTURE, "--ignore-sigterm", "--delay", "999999"], { detached: true, stdio: "ignore" });
+      orphan.unref();
+      const pid = orphan.pid!;
+      try {
+        await new Promise((r) => setTimeout(r, 800));   // let bun get as far as installing the handler
+        write([{ taskId: "t_gone", pid, port: 18999, startedAt: Date.now(), starttime: parseStarttime(readFileSync(`/proc/${pid}/stat`, "utf8")) }]);
+
+        const t0 = Date.now();
+        expect(await reapOrphans()).toBe(1);
+        // It really went through the grace window rather than counting the SIGTERM.
+        expect(Date.now() - t0).toBeGreaterThanOrEqual(1_400);
+        expect(spawnSync("kill", ["-0", String(pid)]).status).not.toBe(0);
+        // Reaped for real, so nothing is left for the next boot to retry.
+        expect(existsSync(pidfile())).toBe(false);
+      } finally {
+        try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    }, 20_000);
+
+    // THE REWRITE TEST. The old code unlinked the pidfile unconditionally, which
+    // discarded the records it had deliberately LEFT ALONE — an unconfirmable identity,
+    // or a group that survived even SIGKILL. Their ports then leaked forever, with the
+    // one notice that could have explained it fired on a boot nobody was watching.
+    // The records it has genuinely finished with must still go.
+    test("a record it could not confirm is kept for the next boot, not discarded with the rest", async () => {
+      const victim = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+      victim.unref();
+      const pid = victim.pid!;
+      try {
+        write([
+          { taskId: "t_unconfirmable", pid, port: 18998, startedAt: Date.now(), starttime: null },
+          { taskId: "t_finished", pid: 999_999, port: 18999, startedAt: Date.now(), starttime: 1 },
+        ]);
+        expect(await reapOrphans()).toBe(0);
+
+        expect(existsSync(pidfile())).toBe(true);
+        const kept = JSON.parse(readFileSync(pidfile(), "utf8"));
+        expect(kept).toHaveLength(1);
+        expect(kept[0].taskId).toBe("t_unconfirmable");
+        expect(kept[0].pid).toBe(pid);
+        expect(kept[0].port).toBe(18998);
+        // Kept because it was left alone, not because the kill failed.
+        expect(spawnSync("kill", ["-0", String(pid)]).status).toBe(0);
+      } finally {
+        try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+      }
     });
   });
 });

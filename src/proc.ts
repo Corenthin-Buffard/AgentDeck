@@ -94,6 +94,51 @@ export function killGroup(pid: number, signal: NodeJS.Signals = "SIGTERM"): bool
   }
 }
 
+/**
+ * CLASS FIX: run a promise we deliberately do not await, without letting it kill
+ * the daemon.
+ *
+ * `void somePromise()` is NOT safe here. Measured on bun 1.3.14: an unhandled
+ * rejection EXITS THE PROCESS with code 1 — which for this daemon means every
+ * running agent is orphaned mid-task. Any fire-and-forget path that can touch
+ * SQLite, the filesystem or process.kill must therefore carry a catch.
+ *
+ * Use this instead of `void` for anything asynchronous. `label` names the site in
+ * the log so a swallowed failure is still greppable rather than silent.
+ */
+export function fireAndForget(p: Promise<unknown>, label: string): void {
+  p.catch((e: any) => {
+    console.error(`[${label}] background task failed: ${e?.message ?? e}`);
+  });
+}
+
+/**
+ * CLASS FIX: SIGTERM a process group, escalate, and resolve only once it is
+ * actually GONE.
+ *
+ * Signal delivery is not death. `process.kill` returning without error means the
+ * signal was queued, nothing more — so a caller that resolves on the SIGKILL timer
+ * and then reports "the process is gone" is asserting something it never checked.
+ * Both the live stop path and the boot reaper had that shape, in different words.
+ *
+ * Resolves `true` if the group is confirmed gone, `false` if it outlived SIGKILL
+ * (uninterruptible sleep, or not ours). Callers MUST branch on that rather than
+ * assume success.
+ */
+export async function killAndWait(pgid: number, graceMs: number, onClose?: (fn: () => void) => void): Promise<boolean> {
+  if (!killGroup(pgid, "SIGTERM")) return true;           // already gone
+  const settled = await new Promise<boolean>((resolve) => {
+    const t = setTimeout(() => resolve(false), graceMs);
+    t.unref?.();
+    onClose?.(() => { clearTimeout(t); resolve(true); }); // the child's own close event, when we have one
+  });
+  if (settled && !isAlive(pgid)) return true;
+  killGroup(pgid, "SIGKILL");
+  // Give the kernel a tick to reap before asserting anything about it.
+  await new Promise((r) => { const t = setTimeout(r, 250); (t as any).unref?.(); });
+  return !isAlive(pgid);
+}
+
 /** Is this pid alive? `signal 0` performs the permission and existence checks
  *  without delivering anything. EPERM means it exists but isn't ours — still
  *  alive, so the answer is true. */

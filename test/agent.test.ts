@@ -3,7 +3,8 @@ import { checkRootBypassStillWorks } from "../src/agent.ts";
 // These five moved to src/proc.ts so the preview supervisor can use them without
 // importing the agent module. The assertions below are unchanged by that move —
 // which is what proves it was a pure one.
-import { agentEnv, createStderrTail, exitReason, isAlive, killGroup, scrubSecrets, shouldRelay, spawnOpts } from "../src/proc.ts";
+import { agentEnv, createStderrTail, exitReason, fireAndForget, isAlive, killAndWait, killGroup, scrubSecrets, shouldRelay, spawnOpts } from "../src/proc.ts";
+import { spawn } from "node:child_process";
 import { config } from "../src/config.ts";
 import { notices, resetNotices } from "../src/notices.ts";
 
@@ -60,6 +61,54 @@ describe("killGroup refuses anything that is not a real pid", () => {
 
   test("a pid that is real but already gone reports false rather than throwing", () => {
     expect(killGroup(999_999, "SIGTERM")).toBe(false); // ESRCH
+  });
+});
+
+// An unhandled rejection EXITS a Bun process with code 1 (measured on 1.3.14),
+// which for this daemon means every running agent is orphaned mid-task. So every
+// fire-and-forget path must carry a catch — `void somePromise()` is a kill switch,
+// not a no-op. This asserts the helper that replaced every such `void`.
+describe("fireAndForget", () => {
+  test("swallows a rejection instead of letting it terminate the process", async () => {
+    const errs: string[] = [];
+    const orig = console.error;
+    console.error = (m: any) => { errs.push(String(m)); };
+    try {
+      fireAndForget(Promise.reject(new Error("boom")), "unit-test");
+      await new Promise((r) => setTimeout(r, 50));   // if it escaped, the runner dies here
+      expect(errs.some((e) => e.includes("unit-test") && e.includes("boom"))).toBe(true);
+    } finally { console.error = orig; }
+  });
+
+  test("a resolving promise logs nothing", async () => {
+    const errs: string[] = [];
+    const orig = console.error;
+    console.error = (m: any) => { errs.push(String(m)); };
+    try {
+      fireAndForget(Promise.resolve(1), "unit-test");
+      await new Promise((r) => setTimeout(r, 50));
+      expect(errs).toEqual([]);
+    } finally { console.error = orig; }
+  });
+});
+
+// Signal delivery is not death. killAndWait exists because two call sites resolved
+// on the SIGKILL timer and then reported the process gone without checking.
+describe("killAndWait", () => {
+  test("confirms a real process group is gone", async () => {
+    const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+    child.unref();
+    const pid = child.pid!;
+    expect(await killAndWait(pid, 500)).toBe(true);
+    expect(isAlive(pid)).toBe(false);
+  });
+
+  test("a group that is already gone counts as gone, not as a failure", async () => {
+    expect(await killAndWait(999_999, 200)).toBe(true);
+  });
+
+  test("refuses a non-pid rather than signalling the caller's own group", async () => {
+    for (const bad of [0, -1, 1, 1.5]) expect(await killAndWait(bad, 100)).toBe(true);
   });
 });
 

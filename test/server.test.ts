@@ -1096,6 +1096,137 @@ describe("the preview routes", () => {
       rmSync(wts, { recursive: true, force: true });
     }
   }, 30_000);
+
+  // THE REMOVAL-WINDOW TEST. removeTask cannot delete the row up front — safe mode
+  // refuses a dirty worktree, and a deleted row with a surviving worktree is worse than
+  // the race — so `store.getTask` keeps answering for the whole of the slow, git-bound
+  // cleanup, and that is all this route used to check. A POST landing there spawned a
+  // dev server for a task that then vanished: never rendered by withPreviews, 404 on
+  // DELETE, and holding a pool port until the TTL — or forever with
+  // AGENTDECK_PREVIEW_TTL_MS=0. The `removing` set is what closes it.
+  //
+  // The window is held open deterministically by a preview that ignores SIGTERM: the
+  // `await stopPreview` inside removeTask then runs the full grace before git is even
+  // reached.
+  test("a POST while the task is being deleted is refused, and leaks no pool port", async () => {
+    const FIXTURE = join(import.meta.dir, "fixtures", "fake-dev-server.ts");
+    const rmId = "t_pvrm";
+    const repo = mkdtempSync(join(tmpdir(), "agentdeck-pvrm-repo-"));
+    const wts = mkdtempSync(join(tmpdir(), "agentdeck-pvrm-wts-"));
+    const g = (args: string[], cwd = repo) => spawnSync("git", args, { cwd, encoding: "utf8" });
+    g(["init", "-q", "-b", "main"]);
+    g(["config", "user.email", "t@test.local"]);
+    g(["config", "user.name", "t"]);
+    writeFileSync(join(repo, "README.md"), "# base\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "init"]);
+    const branch = "agentdeck/pv-rm";
+    const worktree = join(wts, "pv-rm");
+    g(["worktree", "add", "-q", "-b", branch, worktree, "HEAD"]);
+    mkdirSync(join(worktree, "node_modules"), { recursive: true }); // empty: git never sees it
+
+    const { store } = await import("../src/db.ts");
+    store.insertTask({
+      id: rmId, project: "pvrm", title: "delete during a preview start", prompt: "p", branch, worktree,
+      tmux: null, sessionId: null, status: "done", phase: "done", pendingQuestion: null,
+      lastActivity: Date.now(), createdAt: Date.now(), error: null,
+      planReviews: { ceo: null, design: null, eng: null },
+      pipeline: false, step: 0, stepSkillSeen: false, pipelineMissed: 0,
+    });
+
+    const saved = { projects: config.projects, ports: config.preview.ports, enabled: config.preview.enabled };
+    config.projects = [...config.projects, {
+      id: "pvrm", path: repo, label: "pvrm",
+      preview: ["bun", FIXTURE, "--ignore-sigterm", "--port", "{port}"],
+    }];
+    config.preview.ports = [18794, 18795];   // two slots, so a leaked reservation shows
+    config.preview.enabled = true;
+
+    const { isPreviewing, startPreview, stopPreview } = await import("../src/preview.ts");
+    const { isRemoving } = await import("../src/tasks.ts");
+    // Hoisted so the cleanup can join the removal even if an assertion throws first.
+    // The SIGKILL escalation runs on an unref'd timer, so a run that exits while the
+    // grace is still open leaves this SIGTERM-ignoring child holding a pool port for
+    // good — and the next run of this file fails on a port nothing explains.
+    let del: Promise<Response> | undefined;
+    try {
+      const st = await startPreview(store.getTask(rmId)!, config.projects.find((p) => p.id === "pvrm"));
+      expect(st.status).toBe("ready");
+
+      config.port = 0;
+      const { startServer } = await import("../src/server.ts");
+      const server = startServer();
+      const base = `http://127.0.0.1:${server.port}`;
+      const auth = { "x-agentdeck-token": config.dashboardToken };
+      try {
+        del = fetch(`${base}/api/tasks/${rmId}`, { method: "DELETE", headers: auth }); // NOT awaited
+        for (let i = 0; i < 200 && !isRemoving(rmId); i++) await new Promise((r) => setTimeout(r, 10));
+        expect(isRemoving(rmId)).toBe(true);   // the window is genuinely open
+
+        const res = await fetch(`${base}/api/tasks/${rmId}/preview`, { method: "POST", headers: auth });
+        expect(res.status).toBe(409);
+        // The reason names the removal, so it cannot pass by way of any other refusal.
+        expect((await res.json()).error).toContain("being deleted");
+
+        expect((await (await del).json()).removed).toBe(true);
+      } finally { server.stop(true); }
+
+      // The guard is released with the row, and nothing was left holding a port: the
+      // refused POST spawned nothing, and the running preview was stopped by removeTask.
+      expect(isRemoving(rmId)).toBe(false);
+      expect(store.getTask(rmId)).toBeNull();
+      expect(isPreviewing(rmId)).toBe(false);
+      for (const port of [18794, 18795]) {
+        const probe = Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } });
+        probe.stop(true);
+      }
+    } finally {
+      await del?.catch(() => { /* the removal's own stop is what frees the port */ });
+      await stopPreview(rmId).catch(() => { /* already stopped */ });
+      config.projects = saved.projects;
+      config.preview.ports = saved.ports;
+      config.preview.enabled = saved.enabled;
+      store.deleteTask(rmId);
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(wts, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // The other half of the guard: it is set before the first await and cleared in a
+  // `finally`, so a cleanup that THROWS — git spawned against a worktree that is no
+  // longer there is the ordinary way that happens — must not wedge the route shut for
+  // the daemon's lifetime. A task whose removal failed is exactly the one an operator
+  // then wants to look at.
+  test("a cleanup that throws still clears the removal guard", async () => {
+    const wedgeId = "t_pvwedge";
+    const { store } = await import("../src/db.ts");
+    store.insertTask({
+      id: wedgeId, project: "pvwedge", title: "cleanup throws", prompt: "p", branch: "b",
+      worktree: "/nonexistent/agentdeck-worktree-that-is-not-there",
+      tmux: null, sessionId: null, status: "done", phase: "done", pendingQuestion: null,
+      lastActivity: Date.now(), createdAt: Date.now(), error: null,
+      planReviews: { ceo: null, design: null, eng: null },
+      pipeline: false, step: 0, stepSkillSeen: false, pipelineMissed: 0,
+    });
+    const { removeTask, isRemoving } = await import("../src/tasks.ts");
+    try {
+      await expect(removeTask(wedgeId)).rejects.toThrow();
+      expect(isRemoving(wedgeId)).toBe(false);
+      expect(store.getTask(wedgeId)).not.toBeNull();   // nothing was removed
+
+      // And the route answers on its merits again rather than on a stale guard.
+      config.port = 0;
+      const { startServer } = await import("../src/server.ts");
+      const server = startServer();
+      try {
+        const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks/${wedgeId}/preview`, {
+          method: "POST", headers: { "x-agentdeck-token": config.dashboardToken },
+        });
+        expect(res.status).toBe(409);
+        expect((await res.json()).error).not.toContain("being deleted");
+      } finally { server.stop(true); }
+    } finally { store.deleteTask(wedgeId); }
+  });
 });
 
 // The served HTML carries the pipeline default in a meta tag. If the placeholder

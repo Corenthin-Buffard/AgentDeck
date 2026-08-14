@@ -565,8 +565,13 @@ function projectField(id,selected){
 const drawer=document.getElementById("drawer"),scrim=document.getElementById("scrim");
 // Clearing pvDrawer here is what stops a preview update from clobbering an unrelated
 // drawer. openPreview re-sets it immediately after calling this.
-function showDrawer(html){pvDrawer=null;document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
-function closeDrawer(){drawer.classList.remove("on");scrim.classList.remove("on");pvDrawer=null;}
+// Both of these BUMP pvOpenSeq, which is what makes openPreview's staleness check
+// mean anything: nulling pvDrawer alone left the in-flight fetch's token still
+// matching, so a drawer closed mid-fetch re-opened itself and a drawer opened
+// mid-fetch got overwritten (destroying a typed reply). Every path that
+// invalidates an in-flight open must invalidate the token too.
+function showDrawer(html){pvOpenSeq++;pvDrawer=null;document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
+function closeDrawer(){pvOpenSeq++;drawer.classList.remove("on");scrim.classList.remove("on");pvDrawer=null;}
 function openNew(){
   if(!projects.length){announce("No project configured.");return;}
   showDrawer(`<h2>New task</h2>
@@ -657,9 +662,10 @@ async function openPreview(id){
   const meta=await fetch(`/api/tasks/${id}/preview`).then(r=>r.json()).catch(()=>({enabled:AD_PREVIEW,resolution:null,command:null}));
   if(seq!==pvOpenSeq)return;                       // superseded by a later open
   const st={id,meta,error:null,lastHtml:null};
-  showDrawer(previewSection(tasks.find(x=>x.id===id)||{id,status:"done"},meta,null));
-  pvDrawer=st;                                     // set AFTER showDrawer, which clears it
-  pvDrawer.lastHtml=document.getElementById("drawerBody").innerHTML;
+  const html=previewSection(tasks.find(x=>x.id===id)||{id,status:"done"},meta,null);
+  showDrawer(html);                                // bumps the token and clears pvDrawer
+  pvDrawer=st;                                     // …so re-set it, after
+  pvDrawer.lastHtml=html;                          // the string we rendered, not the browser's re-serialisation
 }
 // Called from render(), which fires on every WebSocket frame AND unconditionally
 // every 10s. Rebuilding innerHTML each time threw keyboard focus back to <body>,
@@ -677,7 +683,7 @@ function renderPreviewDrawer(){
   // Focus survives the swap: re-focus whatever carried the same data-k afterwards.
   const key=document.activeElement&&drawer.contains(document.activeElement)?document.activeElement.dataset.k:null;
   const st=pvDrawer;
-  showDrawer(html);      // clears pvDrawer…
+  showDrawer(html);      // bumps the token and clears pvDrawer…
   pvDrawer=st;           // …and this is the one caller that legitimately restores it
   pvDrawer.lastHtml=html;
   if(key){const el=drawer.querySelector(`[data-k="${key}"]`);if(el)el.focus();}
@@ -766,12 +772,20 @@ async function stopPreview(id){
     return;
   }
   if(pvDrawer&&pvDrawer.id===id){pvDrawer.error=null;pvDrawer.lastHtml=null;}
-  announce("Preview stopped.");
+  announce("Stopping the preview.");   // 202 means accepted, not finished
 }
-// Sequential on purpose, and the stop must actually finish: starting into a
-// `stopping` entry 409s with "still shutting down", which then replaces the real
-// error with a confusing one.
-async function restartPreview(id){await stopPreview(id);await startPreview(id);}
+// The stop returns 202 the instant it is ACCEPTED, not when it finishes, so this
+// cannot just await it and start: starting into a `stopping` entry 409s with
+// "still shutting down". Poll until the entry is actually gone from the payload
+// the board renders from, then start.
+async function restartPreview(id){
+  await stopPreview(id);
+  for(let i=0;i<40;i++){
+    if(!(tasks.find(x=>x.id===id)||{}).preview)break;
+    await new Promise(r=>setTimeout(r,250));
+  }
+  await startPreview(id);
+}
 function copyText(text,what){
   if(!navigator.clipboard){announce("Clipboard unavailable.");return;}
   navigator.clipboard.writeText(text).then(()=>announce((what||"Text")+" copied."),()=>announce("Could not copy."));

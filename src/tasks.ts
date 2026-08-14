@@ -52,10 +52,14 @@ export async function createTask(
  * to withPreviews, unreachable by DELETE (404), and holding a pool port until the
  * TTL — or forever with AGENTDECK_PREVIEW_TTL_MS=0.
  */
-const removing = new Set<string>();
+// A COUNTER, not a Set. removeTask is re-entrant per id (double-click Delete, or a
+// retry after the request appeared to fail), and with a Set the first call to reach
+// its `finally` cleared the guard while the second was still inside
+// cleanupWorktree — reopening the very window the guard exists to close.
+const removing = new Map<string, number>();
 
-/** Is this task being torn down right now? beginPreview refuses these. */
-export function isRemoving(id: string): boolean { return removing.has(id); }
+/** Is this task being torn down right now? The preview route refuses these. */
+export function isRemoving(id: string): boolean { return (removing.get(id) ?? 0) > 0; }
 
 export async function removeTask(id: string, mode: CleanupMode = "safe", expectedSha?: string): Promise<CleanupResult> {
   const t = store.getTask(id);
@@ -68,7 +72,7 @@ export async function removeTask(id: string, mode: CleanupMode = "safe", expecte
   // a stale closure that later spawned `claude` into a deleted worktree, took a
   // concurrency slot for a row that no longer exists, and wrote event rows keyed to
   // a purged task_id that nothing would ever collect.
-  removing.add(id);
+  removing.set(id, (removing.get(id) ?? 0) + 1);
   try {
     killExisting(id);
     // Same reasoning, one layer out: a dev server holding this worktree open is both
@@ -89,7 +93,8 @@ export async function removeTask(id: string, mode: CleanupMode = "safe", expecte
     emitUpdate(id);
     return res;
   } finally {
-    removing.delete(id);
+    const n = (removing.get(id) ?? 1) - 1;
+    if (n > 0) removing.set(id, n); else removing.delete(id);
   }
 }
 

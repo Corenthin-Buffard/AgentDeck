@@ -35,7 +35,7 @@ import { join } from "node:path";
 import { config } from "./config.ts";
 import { emitUpdate } from "./bus.ts";
 import { notice } from "./notices.ts";
-import { createStderrTail, isAlive, killGroup, scrubSecrets, shouldRelay, spawnOpts, type StderrTail } from "./proc.ts";
+import { createStderrTail, fireAndForget, isAlive, killAndWait, killGroup, scrubSecrets, shouldRelay, spawnOpts, type StderrTail } from "./proc.ts";
 import type { PreviewState, PreviewStatus, Project, Task } from "./types.ts";
 
 /** Dev servers bind here. Not configurable — see the header. */
@@ -424,8 +424,13 @@ function readStarttime(pid: number): number | null {
   }
 }
 
+/** Orphan records reapOrphans could not resolve. They must survive every later
+ *  writePidfile, or "kept for the next boot" is false the moment anyone starts or
+ *  stops a preview — which was exactly the case. */
+let keptOrphans: PidRecord[] = [];
+
 function writePidfile() {
-  const records: PidRecord[] = [];
+  const records: PidRecord[] = [...keptOrphans];
   for (const e of previews.values()) {
     if (e.pgid) records.push({ taskId: e.taskId, pid: e.pgid, port: e.port, startedAt: e.startedAt, starttime: readStarttime(e.pgid) });
   }
@@ -517,20 +522,15 @@ export async function reapOrphans(): Promise<number> {
       notice("warn", "preview-orphan",
         `preview port ${r.port} is still in use by a process this daemon did not start. `
         + `Free it with: ss -ltnp 'sport = :${r.port}'`);
+      kept.push(r);   // the leader died but the port is held — the permanent-leak case
     }
   }
-  // Rewrite rather than unlink. The old code discarded EVERY record unconditionally,
-  // including the ones deliberately left alone (unconfirmable identity) and the ones
-  // that survived the kill — so their ports leaked forever with the notice firing
-  // exactly once, on a boot nobody was watching.
-  try {
-    if (kept.length) {
-      const fd = openSync(pidfilePath(), constants.O_CREAT | constants.O_TRUNC | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-      try { writeSync(fd, JSON.stringify(kept)); } finally { closeSync(fd); }
-    } else {
-      unlinkSync(pidfilePath());
-    }
-  } catch { /* best effort — a lost pidfile only costs the next boot's reap */ }
+  // Hand the unresolved records to writePidfile rather than writing them here.
+  // Writing them directly was pointless: the next writePidfile rebuilt the file
+  // from live entries only, so "kept for the next boot" survived exactly until
+  // someone started or stopped a preview.
+  keptOrphans = kept;
+  writePidfile();
   if (killed) console.log(`[preview] reaped ${killed} dev server(s) left by a previous run`);
   return killed;
 }
@@ -765,19 +765,23 @@ export function stopPreview(taskId: string, why?: string): Promise<void> {
 
 /** SIGTERM the entry's current process group, escalate to SIGKILL after the grace
  *  window, and resolve once it is actually gone. No-op when there is no child. */
-function killCurrentChild(e: Entry): Promise<void> {
+async function killCurrentChild(e: Entry): Promise<boolean> {
   const pgid = e.pgid;
   const child = e.child;
-  if (!pgid || !child) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    let settled = false;
-    const finish = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
-    const timer = setTimeout(() => { killGroup(pgid, "SIGKILL"); finish(); }, SIGKILL_AFTER_MS);
-    timer.unref?.();                              // never hold the process open for a corpse
-    child.once("close", finish);
-    child.once("error", finish);
-    if (!killGroup(pgid, "SIGTERM")) finish();    // already gone
+  if (!pgid || !child) return true;
+  // killAndWait VERIFIES. The previous version resolved on the SIGKILL timer
+  // firing, which only means the signal was delivered — so removeTask's comment
+  // promising the process was gone before `git worktree remove` touched the
+  // directory was asserting something nothing had checked.
+  const gone = await killAndWait(pgid, SIGKILL_AFTER_MS, (done) => {
+    child.once("close", done);
+    child.once("error", done);
   });
+  if (!gone) {
+    notice("warn", "preview-stuck",
+      `the dev server for ${e.taskId} (pid ${pgid}, port ${e.port}) did not die to SIGKILL — port ${e.port} stays in use. Check with: ss -ltnp 'sport = :${e.port}'`);
+  }
+  return gone;
 }
 
 /** Stop every preview. Bounded by the caller — see the shutdown handler. */
@@ -810,14 +814,19 @@ export async function sweepOncePreviews(now = Date.now()): Promise<void> {
       // — passes would stack, and one wedged stop would block the health check for
       // every other preview. stopPreview is idempotent per task, so firing and
       // forgetting is safe; `e.stopping` skips it on the next pass.
-      void stopPreview(e.taskId, `reached the ${Math.round(ttl / 60_000)}min lifetime cap`);
+      fireAndForget(stopPreview(e.taskId, `reached the ${Math.round(ttl / 60_000)}min lifetime cap`), "preview-ttl");
       continue;
     }
     // Health: a dev server that died on its own must show on the board rather than
     // sitting at `ready` while the tab fails to connect.
-    if (e.status === "ready" && !(await canConnect(e.port))) {
-      setStatus(e, "failed", e.out.excerpt() || "the dev server is no longer listening");
-    }
+    if (e.status !== "ready") continue;
+    const reachable = await canConnect(e.port);
+    // Re-check on the FAR side. A DELETE landing during that connect sets
+    // `stopping`, and writing `failed` over it shows the board a failed preview
+    // that is really mid-teardown — Stop re-enables, Retry appears, and Retry then
+    // 409s. Same class as the readiness loop's fix; this is its sibling.
+    if (e.stopping || e.aborted || previews.get(e.taskId) !== e) continue;
+    if (!reachable) setStatus(e, "failed", e.out.excerpt() || "the dev server is no longer listening");
   }
 }
 
@@ -833,7 +842,7 @@ export function startPreviewSweep(): void {
   sweepTimer = setInterval(() => {
     if (sweeping) return;
     sweeping = true;
-    void sweepOncePreviews().finally(() => { sweeping = false; });
+    fireAndForget(sweepOncePreviews().finally(() => { sweeping = false; }), "preview-sweep");
   }, SWEEP_INTERVAL_MS);
   sweepTimer.unref?.();  // a sweep must never be the reason the process stays up
 }
