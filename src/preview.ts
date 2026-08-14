@@ -143,7 +143,7 @@ export function parseStarttime(stat: string): number | null {
  *
  * LIMIT, stated because the sentence above reads like a completeness claim and is
  * not one: this covers env values only. ARGV is shown as written, so a secret passed
- * as a FLAG (`--api-key sk-live-…`) is served verbatim on that ungated GET —
+ * as a FLAG (`--api-key <the-secret>`) is served verbatim on that ungated GET —
  * scrubSecrets only knows the daemon's own two tokens and `?token=`-shaped query
  * strings. Keep secrets in the NAME=VALUE form, which is the documented shape
  * anyway. Do not read this function as "the command is safe to publish".

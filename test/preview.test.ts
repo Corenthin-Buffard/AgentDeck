@@ -148,11 +148,11 @@ describe("parseStarttime", () => {
 // misses DATABASE_URL, SENTRY_DSN, STRIPE_SK and npm_config__auth.
 describe("redactCommand", () => {
   test("shows env names but never their values", () => {
-    const out = redactCommand(["pnpm", "dev"], { API_KEY: "sk-live-abcdef", DATABASE_URL: "postgres://u:pw@h/db" });
+    const out = redactCommand(["pnpm", "dev"], { API_KEY: "FAKE-SECRET-VALUE-A", DATABASE_URL: "FAKE-SECRET-VALUE-B" });
     expect(out).toContain("API_KEY=[set]");
     expect(out).toContain("DATABASE_URL=[set]");
-    expect(out).not.toContain("sk-live-abcdef");
-    expect(out).not.toContain("postgres://u:pw@h/db");
+    expect(out).not.toContain("FAKE-SECRET-VALUE-A");
+    expect(out).not.toContain("FAKE-SECRET-VALUE-B");
   });
 
   test("keeps the program and its flags legible", () => {
@@ -198,12 +198,12 @@ describe("redactedResolution", () => {
   test("env values from projects.json are never serialised, in either field", () => {
     const out = redactedResolution({
       ok: true,
-      preview: "DATABASE_URL=postgres://u:pw@h/db pnpm dev --port {port}",
+      preview: "DATABASE_URL=FAKE-SECRET-VALUE-C pnpm dev --port {port}",
       install: ["NPM_TOKEN=npm_abcdefghijkl", "npm", "ci"],
     });
     expect(out.preview).toContain("DATABASE_URL=[set]");
     expect(out.preview).toContain("pnpm dev --port {port}"); // still answers "what runs"
-    expect(out.preview).not.toContain("postgres://u:pw@h/db");
+    expect(out.preview).not.toContain("FAKE-SECRET-VALUE-C");
     expect(out.install).toContain("NPM_TOKEN=[set]");
     expect(out.install).not.toContain("npm_abcdefghijkl");
   });
