@@ -11,7 +11,11 @@
 // Same discipline as test/agent-spawn.test.ts, which tests the agent supervisor
 // without ever running a real `claude`.
 //
-//   --port <n>        listen on this port (default: none, i.e. never listen)
+//   --port <n>        listen on this port (default: $PORT, else none — never listen).
+//                     The env fallback is how a test proves the supervisor's parsed
+//                     NAME=VALUE tokens actually REACH the child: a command with no
+//                     --port that still listens can only have got the number from
+//                     the environment.
 //   --host <addr>     bind address (default 127.0.0.1; pass 0.0.0.0 to misbehave)
 //   --delay <ms>      wait this long before listening
 //   --exit <code>     exit immediately with this code
@@ -22,6 +26,8 @@
 //   --close-after <ms> stop listening but stay alive — the only shape the sweep's
 //                     health probe is responsible for (a dead process is caught by
 //                     the close handler long before any sweep runs)
+//   --exit-after <ms> listen, then EXIT — the only shape that reaches the child's
+//                     close handler after the entry is already `ready`
 //   --ignore-sigterm  refuse SIGTERM, so the SIGKILL escalation has something to do
 
 const args = process.argv.slice(2);
@@ -50,8 +56,13 @@ if (marker) process.stdout.write(marker + "\n");
 if (args.includes("--ignore-sigterm")) process.on("SIGTERM", () => { /* deliberately unkillable by SIGTERM */ });
 
 const delay = Number(flag("--delay") ?? 0);
-const port = flag("--port");
+// $PORT is the fallback a real dev server would use, and the ONLY way this process
+// can learn a port when the command carries no --port. A test that asserts this
+// listens is therefore asserting that parsePreviewCommand's env actually reached
+// the child — the delivery, not just the parse.
+const port = flag("--port") ?? process.env.PORT;
 const closeAfter = Number(flag("--close-after") ?? 0);
+const exitAfter = Number(flag("--exit-after") ?? 0);
 // Registered UP FRONT, not inside the timeout: once the listener is stopped there
 // is nothing else holding the loop open, and the process would exit — which is the
 // close-handler shape, not the stopped-listening shape this flag exists to produce.
@@ -73,6 +84,9 @@ async function listen() {
   // Stop accepting but stay alive. A process that EXITS is caught by the close
   // handler; only this shape reaches the sweep's canConnect probe.
   if (closeAfter > 0) setTimeout(() => srv.stop(true), closeAfter);
+  // The mirror image: die once the supervisor has already seen `ready`, which is
+  // the only way to reach the child close handler's post-ready branch.
+  if (exitAfter > 0) setTimeout(() => process.exit(0), exitAfter);
 }
 
 if (delay > 0) setTimeout(listen, delay);

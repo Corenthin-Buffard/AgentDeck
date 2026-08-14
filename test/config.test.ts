@@ -2,8 +2,8 @@ import { afterAll, expect, test, describe } from "bun:test";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
-import { cmdField, config, isOptIn, loadProjects, parsePool, ROOT_BLOCKED_MESSAGE, rootBlocksAgents, rootWillBlockAgents } from "../src/config.ts";
-import { resetNotices } from "../src/notices.ts";
+import { cmdField, config, isOptIn, loadProjects, parsePool, posNum, ROOT_BLOCKED_MESSAGE, rootBlocksAgents, rootWillBlockAgents } from "../src/config.ts";
+import { notices, resetNotices } from "../src/notices.ts";
 
 // loadProjects MUST NOT throw — config.ts is imported everywhere, so a throw is a
 // systemd crash-loop. Every bad input degrades to the synthesized `default`.
@@ -265,6 +265,34 @@ describe("parsePool", () => {
     expect(parsePool("8788-", FALLBACK)).toEqual(FALLBACK);
     expect(parsePool("-", FALLBACK)).toEqual(FALLBACK);
     expect(parsePool("8788;8789", FALLBACK)).toEqual(FALLBACK);
+  });
+});
+
+// Every preview millisecond knob goes through posNum, and the reason is NaN.
+// `Number("4h")` is NaN, and NaN defeats every comparison it touches SILENTLY: a NaN
+// ttlMs makes `ttl > 0` false, so the hard lifetime cap vanishes with nothing said,
+// and a NaN readyTimeoutMs makes the readiness deadline expire on the first tick so
+// EVERY preview fails with "did not listen within NaNs". Both are far worse than a
+// documented fallback, and neither would be visible from the outside.
+describe("posNum", () => {
+  test("a real number is taken; unset or blank falls back silently", () => {
+    resetNotices();
+    expect(posNum("500", 60_000, "AGENTDECK_X")).toBe(500);
+    expect(posNum(undefined, 60_000, "AGENTDECK_X")).toBe(60_000);
+    expect(posNum("   ", 60_000, "AGENTDECK_X")).toBe(60_000);
+    expect(notices().length).toBe(0); // an unset knob is not a misconfiguration
+  });
+
+  test("junk, negatives and a zero timeout fall back, and say which knob", () => {
+    resetNotices();
+    for (const bad of ["4h", "abc", "-1", "Infinity", "0", "NaN"]) {
+      expect(posNum(bad, 60_000, "AGENTDECK_PREVIEW_TTL_MS")).toBe(60_000);
+    }
+    expect(notices().some((n) => n.code === "preview-config" && n.message.includes("AGENTDECK_PREVIEW_TTL_MS"))).toBe(true);
+    // 0 is meaningful for the TTL alone — it disables the lifetime cap — which is the
+    // whole reason allowZero exists rather than one rule for every knob.
+    expect(posNum("0", 60_000, "AGENTDECK_PREVIEW_TTL_MS", true)).toBe(0);
+    expect(posNum("-1", 60_000, "AGENTDECK_PREVIEW_TTL_MS", true)).toBe(60_000);
   });
 });
 

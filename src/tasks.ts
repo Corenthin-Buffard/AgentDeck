@@ -41,6 +41,22 @@ export async function createTask(
   return task;
 }
 
+/**
+ * Tasks with a removal in flight.
+ *
+ * `removeTask` cannot delete the row up front — safe mode refuses a dirty worktree,
+ * and a deleted row with a surviving worktree is worse than the race. So the row
+ * stays readable for the whole of the (slow, git-bound) cleanup, and during that
+ * window `store.getTask(id)` still answers, which is all the preview route checks.
+ * A POST landing there used to create an entry whose task then vanished: invisible
+ * to withPreviews, unreachable by DELETE (404), and holding a pool port until the
+ * TTL — or forever with AGENTDECK_PREVIEW_TTL_MS=0.
+ */
+const removing = new Set<string>();
+
+/** Is this task being torn down right now? beginPreview refuses these. */
+export function isRemoving(id: string): boolean { return removing.has(id); }
+
 export async function removeTask(id: string, mode: CleanupMode = "safe", expectedSha?: string): Promise<CleanupResult> {
   const t = store.getTask(id);
   if (!t) return { removed: false, reason: "not found" };
@@ -52,20 +68,29 @@ export async function removeTask(id: string, mode: CleanupMode = "safe", expecte
   // a stale closure that later spawned `claude` into a deleted worktree, took a
   // concurrency slot for a row that no longer exists, and wrote event rows keyed to
   // a purged task_id that nothing would ever collect.
-  killExisting(id);
-  // Same reasoning, one layer out: a dev server holding this worktree open is both
-  // a leak (it survives the row, still bound to a pool port) and a failure — a
-  // running process with the worktree as its cwd makes `git worktree remove` refuse.
-  // Awaited, so the process is GONE before cleanupWorktree touches the directory.
-  await stopPreview(id, "task removed");
-  // expectedSha is the merged-mode CAS guard (only delete the branch if it still
-  // points where isBranchMerged proved it was merged).
-  const res = await cleanupWorktree(t.worktree, t.branch, mode, expectedSha);
-  // Drop the in-memory retry budget with the row. taskIds are never reused, so a
-  // surviving entry would leak for the daemon's lifetime.
-  if (res.removed) { store.deleteTask(id); forgetTask(id); }
-  emitUpdate(id);
-  return res;
+  removing.add(id);
+  try {
+    killExisting(id);
+    // Same reasoning, one layer out: a dev server holding this worktree open is both
+    // a leak (it survives the row, still bound to a pool port) and a failure — a
+    // running process with the worktree as its cwd makes `git worktree remove` refuse.
+    // Awaited, so the process is GONE before cleanupWorktree touches the directory.
+    await stopPreview(id, "task removed");
+    // expectedSha is the merged-mode CAS guard (only delete the branch if it still
+    // points where isBranchMerged proved it was merged).
+    const res = await cleanupWorktree(t.worktree, t.branch, mode, expectedSha);
+    // Drop the in-memory retry budget with the row. taskIds are never reused, so a
+    // surviving entry would leak for the daemon's lifetime.
+    if (res.removed) { store.deleteTask(id); forgetTask(id); }
+    // Belt and braces: the `removing` guard closes the window, this catches anything
+    // already in flight when the removal started. Cheap, and the alternative is an
+    // untracked dev server holding a pool port with no UI path to it.
+    await stopPreview(id, "task removed");
+    emitUpdate(id);
+    return res;
+  } finally {
+    removing.delete(id);
+  }
 }
 
 export function findBySession(sessionId: string): Task | undefined {

@@ -14,7 +14,7 @@ import { store } from "./db.ts";
 import { bus } from "./bus.ts";
 import { notices, noticesTruncated, setNoticeListener } from "./notices.ts";
 import { answer, stopTask } from "./agent.ts";
-import { createTask, removeTask, findBySession } from "./tasks.ts";
+import { createTask, removeTask, findBySession, isRemoving } from "./tasks.ts";
 import { parseDecisionBrief } from "./detect.ts";
 import { stepSummary } from "./pipeline.ts";
 import { diffStat } from "./git.ts";
@@ -322,6 +322,14 @@ export function startServer() {
           url.searchParams.get("token") !== config.hookToken) {
         return new Response(null, { status: 403 });
       }
+      // INVARIANT, load-bearing since previews shipped: this gate reads a HEADER,
+      // never a cookie, and it must stay that way. Cookies are scoped by host, NOT
+      // by port — so the previewed app on 127.0.0.1:<pool port> shares a cookie jar
+      // with this dashboard on 127.0.0.1:8787. Port separation makes the previewed
+      // app a different ORIGIN (it cannot read this page or its token), but it does
+      // not stop it setting cookies we would then receive. The moment any auth here
+      // trusts a cookie, unreviewed agent-written code can forge it.
+      //
       // Dashboard writes: the BROWSER authenticates with the dashboard token
       // (injected into the served HTML) via the x-agentdeck-token header. Every
       // one of these mutates state — create/kill/drive an agent (--dangerously-
@@ -437,6 +445,7 @@ export function startServer() {
               // preview. beginPreview does the fast, throwable checks synchronously
               // and reports the slow half through the entry's status, which already
               // rides the WebSocket to the board.
+              if (isRemoving(id)) return json({ error: "this task is being deleted" }, 409);
               return json({ preview: beginPreview(t, projectById(t.project)) }, 202);
             } catch (e: any) {
               // 409, not 500: every one of these is a state or configuration
@@ -444,7 +453,17 @@ export function startServer() {
               return json({ error: String(e?.message ?? e) }, 409);
             }
           }
-          if (req.method === "DELETE") { await stopPreview(id, "stopped from the dashboard"); return json({ ok: true }); }
+          if (req.method === "DELETE") {
+            // 202, and NOT awaited — for exactly the reason POST returns 202. A stop
+            // runs a SIGTERM grace window (and can run a second one if the child has
+            // to be escalated), which is on the order of Bun.serve's 10s idleTimeout.
+            // Awaiting meant a slow-but-successful stop closed the connection under
+            // the client and the dashboard announced "Could not stop the preview".
+            // The entry goes to `stopping` synchronously and disappears when it is
+            // done, both of which ride the WebSocket to the board.
+            void stopPreview(id, "stopped from the dashboard");
+            return json({ ok: true }, 202);
+          }
           if (req.method === "GET") {
             // This read is UNGATED, so nothing here may carry a secret. The raw
             // Resolution must never be serialised: it returns projects.json's

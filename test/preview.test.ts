@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { config } from "../src/config.ts";
 import { resetNotices, notices } from "../src/notices.ts";
 import {
-  _resetPreviewsForTest, expandPlaceholders, getPreview, installPreviewShutdown, isPreviewing, parsePreviewCommand,
-  parseStarttime, pickPort, previewCommand, previewTail, reapOrphans, redactCommand, resolvePreview,
-  startPreview, stopPreview, sweepOncePreviews,
+  _resetPreviewsForTest, beginPreview, expandPlaceholders, getPreview, installPreviewShutdown, isPreviewing,
+  parsePreviewCommand, parseStarttime, pickPort, previewCommand, previewTail, reapOrphans, redactCommand,
+  redactedResolution, resolvePreview, startPreview, stopPreview, sweepOncePreviews,
 } from "../src/preview.ts";
 import type { Project, Task } from "../src/types.ts";
 
@@ -187,6 +187,37 @@ describe("resolvePreview", () => {
   });
 });
 
+// The Resolution itself must NEVER be serialised: it carries projects.json's
+// `preview`/`install` verbatim, and both accept leading NAME=VALUE tokens — so the
+// UNGATED GET that shows the drawer "what command runs" would have published every
+// env VALUE an operator put there (a DATABASE_URL, an npm_config__auth). This is
+// the function that stands between the two, so it gets its own tests rather than
+// being covered only incidentally by the route.
+describe("redactedResolution", () => {
+  test("env values from projects.json are never serialised, in either field", () => {
+    const out = redactedResolution({
+      ok: true,
+      preview: "DATABASE_URL=postgres://u:pw@h/db pnpm dev --port {port}",
+      install: ["NPM_TOKEN=npm_abcdefghijkl", "npm", "ci"],
+    });
+    expect(out.preview).toContain("DATABASE_URL=[set]");
+    expect(out.preview).toContain("pnpm dev --port {port}"); // still answers "what runs"
+    expect(out.preview).not.toContain("postgres://u:pw@h/db");
+    expect(out.install).toContain("NPM_TOKEN=[set]");
+    expect(out.install).not.toContain("npm_abcdefghijkl");
+  });
+
+  test("no install configured contributes no field at all", () => {
+    expect(redactedResolution({ ok: true, preview: "pnpm dev" })).toEqual({ preview: "pnpm dev" });
+  });
+
+  // A project with nothing configured still gets a serialisable answer — the route
+  // sends the *reason* separately, and an undefined here would render "undefined".
+  test("an unresolved project yields an empty command, not a leak or a throw", () => {
+    expect(redactedResolution({ ok: false, reason: "unknown project" })).toEqual({ preview: "" });
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Lifecycle — real processes, against the fixture
 // ─────────────────────────────────────────────────────────────────────────────
@@ -325,6 +356,239 @@ describe("the supervisor", () => {
     expect(isPreviewing("t_pv")).toBe(false); // no port burned on a config error
   });
 
+  // THE ENV DELIVERY TEST. parsePreviewCommand and expandPlaceholders are unit-tested
+  // above, but both are pure — they prove the PARSE, never the hand-off. This command
+  // carries no --port at all, so the fixture can only be listening because `PORT=18788`
+  // was parsed out, {port}-expanded and actually reached spawn's `env`. Drop the
+  // `...env` spread from spawnDetached and every pure test above stays green while the
+  // documented `PORT={port} npm start` form silently stops working.
+  test("a parsed NAME=VALUE token is really delivered to the child's environment", async () => {
+    const st = await startPreview(task(), project({ preview: ["PORT={port}", "bun", FIXTURE] }));
+    expect(st.status).toBe("ready");
+    expect(config.preview.ports).toContain(st.port);
+  });
+
+  // The child's output is SERVED: it becomes the entry's error, which rides the
+  // WebSocket to every open dashboard and is read back by the UNGATED GET. A dev
+  // server inherits the daemon's environment, and plenty of them echo a failing
+  // request URL or dump process.env on a boot error — so without the scrub, one
+  // crash publishes the daemon's own tokens to anything that can reach the port.
+  test("a secret the child prints to stderr is redacted before it is served", async () => {
+    const leak = `boot failed: POST http://h/hooks?token=${config.hookToken} (dash ${config.dashboardToken})`;
+    await expect(
+      startPreview(task(), project({ preview: fixtureCmd("--stderr", leak, "--exit", "1") })),
+    ).rejects.toThrow(/boot failed/);
+    const err = getPreview("t_pv")?.error ?? "";
+    expect(err).toContain("boot failed");        // the operator still gets the cause
+    expect(err).toContain("[redacted]");
+    expect(err).not.toContain(config.hookToken);
+    expect(err).not.toContain(config.dashboardToken);
+    // The drawer's tail is a second read of the same capture, so it has to be clean too.
+    expect(previewTail("t_pv")).not.toContain(config.hookToken);
+  });
+
+  // The spawn path has two shapes of "the program isn't there": a synchronous throw
+  // and an async `error` event. Only the second happens for ENOENT, and it is the one
+  // that would otherwise sit until the 60s readiness timeout with "did not listen" —
+  // which sends the operator hunting for a bind address instead of a typo in argv[0].
+  test("a preview program that does not exist fails on what happened, not on the timeout", async () => {
+    config.preview.readyTimeoutMs = 30_000; // would dominate if the death weren't noticed
+    const started = Date.now();
+    await expect(
+      startPreview(task(), project({ preview: ["/nonexistent/agentdeck-dev-server"] })),
+    ).rejects.toThrow(/exited before it listened/);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(getPreview("t_pv")?.status).toBe("failed");
+  });
+
+  // The mirror of the sweep's health check, and the reason that check is not enough on
+  // its own: a dev server that CRASHES after it was ready must show as failed within
+  // milliseconds (the child's close handler), not up to 30 seconds later when the sweep
+  // next runs. Dropping the pidfile record in the same breath is what stops the next
+  // boot from SIGTERMing a recycled pid on this task's behalf.
+  test("a dev server that exits after it was ready fails immediately and drops its pidfile record", async () => {
+    const st = await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}", "--exit-after", "400") }));
+    expect(st.status).toBe("ready");
+    await new Promise((r) => setTimeout(r, 1_500));
+    expect(getPreview("t_pv")?.status).toBe("failed");   // no sweepOncePreviews() call: the close handler did it
+    expect(existsSync(join(config.dataDir, "previews.json"))).toBe(false);
+  });
+
+  // Every one of these fails FAST and SYNCHRONOUSLY, before any await, because the
+  // route turns a throw into a 409 whose message is the fix. Anything that only failed
+  // later would reach the operator as a silent 202 and a preview that never appears.
+  describe("refusals", () => {
+    // Deliberately does NOT name a cause. daemon.ts clears this flag for three
+    // different reasons (the env var, a pool colliding with the dashboard port, an
+    // off-loopback bind), each with its own notice. Naming one of them sent the
+    // operator after the wrong setting — the exact mis-messaging the boot-order
+    // move was made to end, surviving on the API path.
+    test("a daemon with previews switched off says so without guessing which check did it", () => {
+      const saved = config.preview.enabled;
+      config.preview.enabled = false;
+      try {
+        expect(() => beginPreview(task(), project({ preview: fixtureCmd("--port", "{port}") })))
+          .toThrow(/previews are disabled on this daemon/);
+        expect(() => beginPreview(task(), project({ preview: fixtureCmd("--port", "{port}") })))
+          .toThrow(/boot notices/);
+        // and it must not assert a cause it cannot know
+        try { beginPreview(task(), project({ preview: fixtureCmd() })); } catch (e: any) {
+          expect(e.message).not.toContain("AGENTDECK_PREVIEW=false");
+        }
+        expect(isPreviewing("t_pv")).toBe(false);  // and no entry, so no port is held
+      } finally { config.preview.enabled = saved; }
+    });
+
+    // `PORT=3000` alone parses cleanly into env with an EMPTY argv. Without this check
+    // spawn() is handed `undefined` as its program, which throws from inside the start
+    // closure — a `failed` entry holding a pool port instead of a 409 naming the typo.
+    test("a preview command that is only NAME=VALUE is refused before a port is taken", () => {
+      expect(() => beginPreview(task(), project({ preview: "PORT=3000 HOST=127.0.0.1" })))
+        .toThrow(/only NAME=VALUE assignments/);
+      expect(isPreviewing("t_pv")).toBe(false);
+    });
+
+    test("an install command that is only NAME=VALUE is refused too", async () => {
+      rmSync(join(wt, "node_modules"), { recursive: true, force: true });
+      await expect(startPreview(task(), project({
+        install: "NODE_ENV=production", preview: fixtureCmd("--port", "{port}"),
+      }))).rejects.toThrow(/install command for 'p' has no program to run/);
+      expect(getPreview("t_pv")?.status).toBe("failed");
+    });
+  });
+
+  // For REAPING ONLY — but a supervisor that stopped recording live previews would
+  // disable orphan reaping silently, and every reapOrphans test above hand-writes the
+  // file, so none of them would notice. This is the only test that asserts the writer.
+  describe("the pidfile", () => {
+    const pidfile = () => join(config.dataDir, "previews.json");
+
+    afterEach(() => { try { rmSync(pidfile()); } catch { /* fine */ } });
+
+    test("a live preview is recorded, and the file is dropped once nothing is running", async () => {
+      const st = await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}") }));
+      const records = JSON.parse(readFileSync(pidfile(), "utf8"));
+      expect(records).toHaveLength(1);
+      expect(records[0].taskId).toBe("t_pv");
+      expect(records[0].port).toBe(st.port);
+      // The recorded pid must be the live GROUP LEADER, not a stale or invented number:
+      // reapOrphans signals `-pid`, so a wrong one is a signal sent to strangers.
+      expect(spawnSync("kill", ["-0", String(records[0].pid)]).status).toBe(0);
+      // And it must carry a starttime. reapOrphans fails CLOSED on a null one, so a
+      // writer that stopped capturing it would leave every orphan unreaped — the port
+      // leak this file exists to fix, with the file still being written.
+      if (existsSync(`/proc/${records[0].pid}/stat`)) expect(typeof records[0].starttime).toBe("number");
+
+      await stopPreview("t_pv");
+      // Not an empty array: an empty file would make the next boot read a record set
+      // it has to validate. The file is removed outright.
+      expect(existsSync(pidfile())).toBe(false);
+    });
+
+    // O_NOFOLLOW, the same hardening the dashboard token has. Both the agent and the
+    // previewed dev server run as this uid and can pre-place a link in the data dir,
+    // and without the flag the daemon would TRUNCATE whatever it points at — an
+    // agent-settings.json, a systemd unit, an authorized_keys — on the next start.
+    test("previews.json is never written THROUGH a symlink", async () => {
+      const victim = join(wt, "precious.conf");
+      writeFileSync(victim, "do-not-truncate\n");
+      try { rmSync(pidfile()); } catch { /* fine */ }
+      symlinkSync(victim, pidfile());
+
+      const st = await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}") }));
+      // The preview still runs: a pidfile we cannot write costs orphan reaping, never
+      // the feature. It is reported instead.
+      expect(st.status).toBe("ready");
+      expect(readFileSync(victim, "utf8")).toBe("do-not-truncate\n");
+      expect(notices().some((n) => n.code === "preview-pidfile")).toBe(true);
+    });
+  });
+
+  describe("stopping", () => {
+    // THE ESCALATION TEST. A dev server that traps SIGTERM (or is wedged in a rebuild)
+    // must not be able to keep a pool port forever. The 5s grace is deliberately real
+    // time here rather than injected: the thing being asserted is that the timer fires
+    // AND that the group is actually dead afterwards.
+    test("a child that ignores SIGTERM is escalated to SIGKILL and really dies", async () => {
+      const st = await startPreview(task(), project({ preview: fixtureCmd("--ignore-sigterm", "--port", "{port}") }));
+      expect(st.status).toBe("ready");
+
+      const t0 = Date.now();
+      await stopPreview("t_pv");
+      const ms = Date.now() - t0;
+      // It really waited the grace window — a resolve before it means the promise
+      // settled on something other than the process being gone.
+      expect(ms).toBeGreaterThanOrEqual(4_500);
+      expect(ms).toBeLessThan(12_000);
+
+      expect(spawnSync("pgrep", ["-f", `${FIXTURE} --ignore-sigterm --port ${st.port}`], { encoding: "utf8" }).stdout.trim()).toBe("");
+      const probe = Bun.listen({ hostname: "127.0.0.1", port: st.port, socket: { data() {} } });
+      probe.stop(true);
+    }, 20_000);
+
+    // `stopping` is not a UI nicety: the port stays BOUND for the whole grace window,
+    // so handing it to a new preview makes that child die on EADDRINUSE and surface as
+    // the far less obvious "did not listen in time".
+    test("the entry stays registered — port still reserved — until the stop completes", async () => {
+      config.preview.ports = [18790];  // one slot, so a reservation leak is visible
+      const p = project({ preview: fixtureCmd("--port", "{port}") });
+      await startPreview(task("t_pv"), p);
+
+      const done = stopPreview("t_pv");             // deliberately NOT awaited yet
+      // Asserted synchronously, before any await, which is the whole window: the entry
+      // is what reservedPorts() is built from.
+      expect(getPreview("t_pv")?.status).toBe("stopping");
+      expect(isPreviewing("t_pv")).toBe(true);
+      // A second click on the same task must not start a child on top of the one being
+      // killed. The message tells the operator to wait rather than reporting a failure.
+      expect(() => beginPreview(task("t_pv"), p)).toThrow(/still shutting down/);
+      // And the single slot is not handed to a different task while it is still bound.
+      await expect(startPreview(task("t_pv2"), p)).rejects.toThrow(/in use/);
+
+      await done;
+      expect(isPreviewing("t_pv")).toBe(false);
+      // Released, not leaked: the same slot is immediately reusable. `stopping` is a
+      // window, and this is the assertion that proves it closes.
+      expect((await startPreview(task("t_pv2"), p)).port).toBe(18790);
+    });
+
+    // The install is the LONGEST phase of a preview (minutes), so it is by far the
+    // likeliest moment for Stop to be clicked. The bug this replaces: stopPreview found
+    // no child yet, resolved, deleted the entry — and the closure carried on installing
+    // and then spawned a dev server nothing tracked, holding a pool port until reboot.
+    test("a stop during the install kills the installer and never spawns a dev server", async () => {
+      rmSync(join(wt, "node_modules"), { recursive: true, force: true });
+      config.preview.installTimeoutMs = 60_000;
+      const p = project({ install: ["sh", "-c", "sleep 47"], preview: fixtureCmd("--port", "{port}") });
+
+      const started = startPreview(task(), p).then(() => "resolved", () => "aborted");
+      await new Promise((r) => setTimeout(r, 500));
+      expect(getPreview("t_pv")?.status).toBe("installing");
+      const port = getPreview("t_pv")!.port;
+
+      await stopPreview("t_pv");
+      expect(await started).toBe("aborted");
+      expect(isPreviewing("t_pv")).toBe(false);
+      expect(spawnSync("pgrep", ["-f", "sleep 47"], { encoding: "utf8" }).stdout.trim()).toBe("");
+      expect(spawnSync("pgrep", ["-f", `${FIXTURE} --port ${port}`], { encoding: "utf8" }).stdout.trim()).toBe("");
+      const probe = Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } });
+      probe.stop(true);
+    }, 20_000);
+
+    // Both reachable from the dashboard: Stop on a row whose preview already went away
+    // (a stale frame), and a double-click. Neither may throw, and neither may run a
+    // second teardown against a pid the first one is already reaping.
+    test("stopping something unknown resolves, and a second stop joins the first", async () => {
+      await stopPreview("t_never_started");   // must not throw
+      await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}") }));
+      const a = stopPreview("t_pv");
+      const b = stopPreview("t_pv");
+      expect(b).toBe(a);                      // the same promise, not a second teardown
+      await a;
+      expect(isPreviewing("t_pv")).toBe(false);
+    });
+  });
+
   describe("node_modules", () => {
     beforeEach(() => rmSync(join(wt, "node_modules"), { recursive: true, force: true }));
 
@@ -366,11 +630,17 @@ describe("the supervisor", () => {
   });
 
   describe("the sweep", () => {
+    // The sweep fires stops WITHOUT awaiting them: each can take the full SIGTERM
+    // grace, and a pool-wide TTL expiry would otherwise run minutes against a 30s
+    // interval and stack passes. So the sweep's contract is "the stop is under way",
+    // not "the stop is finished" — assert the transition, then that it completes.
     test("a preview past its TTL is stopped", async () => {
       config.preview.ttlMs = 50;
       await startPreview(task(), project({ preview: fixtureCmd("--port", "{port}") }));
       await new Promise((r) => setTimeout(r, 80));
       await sweepOncePreviews();
+      expect(getPreview("t_pv")?.status ?? "gone").toMatch(/stopping|gone/);
+      await stopPreview("t_pv");            // joins the in-flight stop
       expect(isPreviewing("t_pv")).toBe(false);
     });
 

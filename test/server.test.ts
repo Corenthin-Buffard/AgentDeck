@@ -925,6 +925,177 @@ describe("the preview routes", () => {
       expect(html).toContain(`content="${config.preview.enabled ? "true" : "false"}"`);
     } finally { server.stop(true); }
   });
+
+  // THE ONLY ROUTE TEST THAT RUNS A REAL PREVIEW. Every other test above exercises a
+  // refusal, which left the two things the dashboard reads on EVERY frame uncovered:
+  // the 202 body shape, and withPreviews' positive branch — the fold that puts
+  // `preview` on a task row. Both are pure client contract: the daemon works perfectly
+  // with either one broken, and the board shows a button that never changes state.
+  //
+  // It drives the fake dev server rather than a real one, for the reasons in
+  // test/fixtures/fake-dev-server.ts.
+  test("a real preview: 202 with the entry, then folded onto the task payload, then gone", async () => {
+    const FIXTURE = join(import.meta.dir, "fixtures", "fake-dev-server.ts");
+    const liveId = "t_pvlive";
+    const wt = mkdtempSync(join(tmpdir(), "agentdeck-pvlive-"));
+    mkdirSync(join(wt, "node_modules"), { recursive: true }); // skip the install phase
+    const { store } = await import("../src/db.ts");
+    store.insertTask({
+      id: liveId, project: "pvlive", title: "live preview", prompt: "p", branch: "b", worktree: wt,
+      tmux: null, sessionId: null, status: "done", phase: "done", pendingQuestion: null,
+      lastActivity: Date.now(), createdAt: Date.now(), error: null,
+      planReviews: { ceo: null, design: null, eng: null },
+      pipeline: false, step: 0, stepSkillSeen: false, pipelineMissed: 0,
+    });
+
+    const saved = { projects: config.projects, ports: config.preview.ports, enabled: config.preview.enabled };
+    // A project the route can actually resolve. Registered on the live config because
+    // projectById reads the registry rather than a snapshot.
+    config.projects = [...config.projects, {
+      id: "pvlive", path: wt, label: "pvlive",
+      preview: ["bun", FIXTURE, "--port", "{port}"],
+    }];
+    config.preview.ports = [18796];   // clear of the documented default, like preview.test.ts
+    config.preview.enabled = true;    // never inherit an operator's AGENTDECK_PREVIEW
+
+    config.port = 0;
+    const { startServer } = await import("../src/server.ts");
+    const { stopPreview } = await import("../src/preview.ts");
+    const server = startServer();
+    const base = `http://127.0.0.1:${server.port}`;
+    const auth = { "x-agentdeck-token": config.dashboardToken };
+    try {
+      const res = await fetch(`${base}/api/tasks/${liveId}/preview`, { method: "POST", headers: auth });
+      // 202, not 200: the ENTRY exists, the dev server does not yet. Awaiting the whole
+      // start inside the handler is what Bun's idleTimeout kills, and the dashboard
+      // reads this body to render "starting" before the first WebSocket frame arrives.
+      expect(res.status).toBe(202);
+      const body = await res.json();
+      expect(body.preview.taskId).toBe(liveId);
+      expect(body.preview.port).toBe(18796);
+      expect(["installing", "starting", "ready"]).toContain(body.preview.status);
+      expect(body.preview.error).toBeNull();
+
+      // Now the fold, read from the ordinary payload the board renders from — not from
+      // the preview route. Polled because readiness is genuinely asynchronous.
+      let row: any;
+      for (let i = 0; i < 100; i++) {
+        const { tasks } = await (await fetch(`${base}/api/tasks`)).json();
+        row = tasks.find((t: any) => t.id === liveId);
+        if (row?.preview?.status === "ready") break;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      expect(row.preview.status).toBe("ready");
+      expect(row.preview.port).toBe(18796);
+      expect(row.title).toBe("live preview"); // folded ONTO the task, not replacing it
+
+      // The ungated GET, with something running: it resolves the configured command
+      // too, and everything it returns has been through redactCommand.
+      const meta = await (await fetch(`${base}/api/tasks/${liveId}/preview`)).json();
+      expect(meta.enabled).toBe(true);
+      expect(meta.preview.status).toBe("ready");
+      expect(meta.resolution.ok).toBe(true);
+      expect(meta.resolution.configured.preview).toContain("fake-dev-server");
+      expect(meta.command).toContain("18796"); // the RESOLVED command, {port} substituted
+
+      // DELETE returns 202, NOT 200, and deliberately does not wait: a stop runs a
+      // SIGTERM grace window (two, if the child needs escalating), which is the same
+      // order as Bun's 10s idleTimeout — awaiting it meant a slow-but-successful stop
+      // closed the connection and the dashboard announced "Could not stop".
+      const del = await fetch(`${base}/api/tasks/${liveId}/preview`, { method: "DELETE", headers: auth });
+      expect(del.status).toBe(202);
+      expect((await del.json()).ok).toBe(true);
+      // The row goes back to carrying no preview at all — the state the board needs to
+      // offer Start again. Polled, because the stop is genuinely asynchronous now.
+      let gone = false;
+      for (let i = 0; i < 60; i++) {
+        const { tasks } = await (await fetch(`${base}/api/tasks`)).json();
+        if (tasks.find((t: any) => t.id === liveId)?.preview === undefined) { gone = true; break; }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      expect(gone).toBe(true);
+    } finally {
+      await stopPreview(liveId).catch(() => { /* already stopped */ });
+      server.stop(true);
+      config.projects = saved.projects;
+      config.preview.ports = saved.ports;
+      config.preview.enabled = saved.enabled;
+      store.deleteTask(liveId);
+      rmSync(wt, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // removeTask AWAITS stopPreview before it touches the directory, and nothing else in
+  // the suite deletes a task that has one. A dev server that outlives its row is both
+  // a leak — it keeps a pool port bound with no entry left to explain it, so the next
+  // start reports "no preview port is free" and names nothing — and a process still
+  // running with a deleted worktree as its cwd.
+  test("deleting a task stops its preview first", async () => {
+    const FIXTURE = join(import.meta.dir, "fixtures", "fake-dev-server.ts");
+    const delId = "t_pvdel";
+    const repo = mkdtempSync(join(tmpdir(), "agentdeck-pvdel-repo-"));
+    const wts = mkdtempSync(join(tmpdir(), "agentdeck-pvdel-wts-"));
+    const g = (args: string[], cwd = repo) => spawnSync("git", args, { cwd, encoding: "utf8" });
+    g(["init", "-q", "-b", "main"]);
+    g(["config", "user.email", "t@test.local"]);
+    g(["config", "user.name", "t"]);
+    writeFileSync(join(repo, "README.md"), "# base\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "init"]);
+    const branch = "agentdeck/pv-del";
+    const worktree = join(wts, "pv-del");
+    g(["worktree", "add", "-q", "-b", branch, worktree, "HEAD"]);
+    mkdirSync(join(worktree, "node_modules"), { recursive: true });
+
+    const { store } = await import("../src/db.ts");
+    store.insertTask({
+      id: delId, project: "pvdel", title: "delete with preview", prompt: "p", branch, worktree,
+      tmux: null, sessionId: null, status: "done", phase: "done", pendingQuestion: null,
+      lastActivity: Date.now(), createdAt: Date.now(), error: null,
+      planReviews: { ceo: null, design: null, eng: null },
+      pipeline: false, step: 0, stepSkillSeen: false, pipelineMissed: 0,
+    });
+
+    const saved = { projects: config.projects, ports: config.preview.ports, enabled: config.preview.enabled };
+    config.projects = [...config.projects, {
+      id: "pvdel", path: repo, label: "pvdel", preview: ["bun", FIXTURE, "--port", "{port}"],
+    }];
+    config.preview.ports = [18797];
+    config.preview.enabled = true;
+
+    const { isPreviewing, startPreview, stopPreview } = await import("../src/preview.ts");
+    try {
+      // Started through the awaitable form: the point of this test is what DELETE does
+      // to a preview that is genuinely up, not the race to get one up.
+      const st = await startPreview(store.getTask(delId)!, config.projects.find((p) => p.id === "pvdel"));
+      expect(st.status).toBe("ready");
+
+      config.port = 0;
+      const { startServer } = await import("../src/server.ts");
+      const server = startServer();
+      try {
+        const res = await fetch(`http://127.0.0.1:${server.port}/api/tasks/${delId}`, {
+          method: "DELETE", headers: { "x-agentdeck-token": config.dashboardToken },
+        });
+        expect((await res.json()).removed).toBe(true);
+      } finally { server.stop(true); }
+
+      expect(store.getTask(delId)).toBeNull();
+      expect(isPreviewing(delId)).toBe(false);
+      // The process is gone, not merely forgotten — and the pool port is genuinely back.
+      expect(spawnSync("pgrep", ["-f", `${FIXTURE} --port ${st.port}`], { encoding: "utf8" }).stdout.trim()).toBe("");
+      const probe = Bun.listen({ hostname: "127.0.0.1", port: st.port, socket: { data() {} } });
+      probe.stop(true);
+    } finally {
+      await stopPreview(delId).catch(() => { /* already stopped */ });
+      config.projects = saved.projects;
+      config.preview.ports = saved.ports;
+      config.preview.enabled = saved.enabled;
+      store.deleteTask(delId);
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(wts, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 // The served HTML carries the pipeline default in a meta tag. If the placeholder

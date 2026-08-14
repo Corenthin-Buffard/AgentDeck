@@ -438,6 +438,11 @@ function phaseBar(t){
     return `<div class="seg ${cls}"><div class="bar"></div><div class="pl">${p}</div>${i===0?reviewMarks(t):""}</div>`;
   }).join("")+`</div>`+(st.cls==="missed"?`<div class="pipewarn">⚠ pipeline did not run</div>`:"");
 }
+// CLIENT-SIDE ONLY. POST /api/tasks/:id/preview accepts any status — this rule is
+// not enforced server-side, so a stale tab or a curl can still start a preview on a
+// running task. Token-gated, so not an external hole, but it is a policy the API
+// does not share. See TODOS.md ("Server-side quiescence enforcement").
+//
 // Preview is offered only when the worktree is QUIESCENT. A `running` agent is
 // actively rewriting the files a dev server watches, so a preview started there
 // shows rebuild storms and half-finished builds — which read as bad agent work
@@ -491,6 +496,11 @@ function section(title,list){
   return `<div class="lbl">${title}</div><div class="rows">${list.map(safeRow).join("")}</div>`;
 }
 function render(){
+  // The drawer keys off the UNFILTERED task list, so it must update even when the
+  // board itself has nothing to draw. Hoisted above every early return: leaving it
+  // as the last statement froze the drawer whenever the project filter selected a
+  // project with no tasks.
+  renderPreviewDrawer();
   if(!projectsReady)return; // avoid a misleading "no projects" flash before the registry loads
   const board=document.getElementById("board");
   // Empty state 1: the registry itself is empty (all paths dropped at boot).
@@ -520,9 +530,6 @@ function render(){
     return;
   }
   board.innerHTML=section("Needs you",wait)+section("Cruising",run)+section("Done",done);
-  // An open preview drawer follows the same payload the board just re-rendered
-  // from, so installing → starting → ready animates without polling.
-  renderPreviewDrawer();
 }
 // Populate the header switcher from the registry; "all" + one option per project.
 function renderSwitcher(){
@@ -556,7 +563,9 @@ function projectField(id,selected){
 
 // ── drawer ──
 const drawer=document.getElementById("drawer"),scrim=document.getElementById("scrim");
-function showDrawer(html){document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
+// Clearing pvDrawer here is what stops a preview update from clobbering an unrelated
+// drawer. openPreview re-sets it immediately after calling this.
+function showDrawer(html){pvDrawer=null;document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
 function closeDrawer(){drawer.classList.remove("on");scrim.classList.remove("on");pvDrawer=null;}
 function openNew(){
   if(!projects.length){announce("No project configured.");return;}
@@ -638,10 +647,19 @@ function doUpload(){
 // drawer re-renders from `tasks` on every board update with no extra round trip —
 // which is what makes installing → starting → ready animate by itself.
 let pvDrawer=null; // {id, meta, error, lastHtml} while a preview drawer is open
+let pvOpenSeq=0;   // staleness token for the fetch below
 async function openPreview(id){
+  // Capture a token BEFORE the await. Without it, closing the drawer (Escape, the ×,
+  // the scrim) while this fetch was in flight made the drawer re-open by itself, and
+  // opening a different drawer in that window got overwritten — destroying anything
+  // typed into it.
+  const seq=++pvOpenSeq;
   const meta=await fetch(`/api/tasks/${id}/preview`).then(r=>r.json()).catch(()=>({enabled:AD_PREVIEW,resolution:null,command:null}));
-  pvDrawer={id,meta,error:null,lastHtml:null};
-  renderPreviewDrawer();
+  if(seq!==pvOpenSeq)return;                       // superseded by a later open
+  const st={id,meta,error:null,lastHtml:null};
+  showDrawer(previewSection(tasks.find(x=>x.id===id)||{id,status:"done"},meta,null));
+  pvDrawer=st;                                     // set AFTER showDrawer, which clears it
+  pvDrawer.lastHtml=document.getElementById("drawerBody").innerHTML;
 }
 // Called from render(), which fires on every WebSocket frame AND unconditionally
 // every 10s. Rebuilding innerHTML each time threw keyboard focus back to <body>,
@@ -658,8 +676,10 @@ function renderPreviewDrawer(){
   if(sel&&!sel.isCollapsed&&sel.anchorNode&&drawer.contains(sel.anchorNode))return; // don't yank a selection mid-copy
   // Focus survives the swap: re-focus whatever carried the same data-k afterwards.
   const key=document.activeElement&&drawer.contains(document.activeElement)?document.activeElement.dataset.k:null;
+  const st=pvDrawer;
+  showDrawer(html);      // clears pvDrawer…
+  pvDrawer=st;           // …and this is the one caller that legitimately restores it
   pvDrawer.lastHtml=html;
-  showDrawer(html);
   if(key){const el=drawer.querySelector(`[data-k="${key}"]`);if(el)el.focus();}
 }
 function previewSection(t,meta,err){
@@ -679,7 +699,7 @@ function previewSection(t,meta,err){
   if(meta.resolution&&!meta.resolution.ok&&!p)
     return head+`<label class="lbl">Not configured</label>
       <div class="q">${esc(meta.resolution.reason)}</div>
-      <div class="acts"><button class="btn ghost" onclick="copyText(${JSON.stringify(meta.resolution.reason)},'Snippet')">Copy</button></div>`;
+      <div class="acts"><button class="btn ghost" data-copy="${esc(meta.resolution.reason)}" onclick="copyText(this.dataset.copy,'Snippet')">Copy</button></div>`;
 
   let body="";
   if(p&&p.status==="ready"){
@@ -745,8 +765,12 @@ async function stopPreview(id){
     announce("Could not stop the preview.");
     return;
   }
+  if(pvDrawer&&pvDrawer.id===id){pvDrawer.error=null;pvDrawer.lastHtml=null;}
   announce("Preview stopped.");
 }
+// Sequential on purpose, and the stop must actually finish: starting into a
+// `stopping` entry 409s with "still shutting down", which then replaces the real
+// error with a confusing one.
 async function restartPreview(id){await stopPreview(id);await startPreview(id);}
 function copyText(text,what){
   if(!navigator.clipboard){announce("Clipboard unavailable.");return;}

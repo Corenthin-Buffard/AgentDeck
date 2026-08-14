@@ -18,9 +18,16 @@
 // resolvePreview reads projects.json, never the worktree's package.json. A fresh
 // `git worktree add` carries only tracked files, and node_modules is gitignored, so
 // "just run scripts.dev" fails on the first click — intermittently, depending on
-// whether the agent happened to install anything. And running a script out of an
-// AGENT-AUTHORED package.json as the daemon uid, with the daemon's environment, is
-// arbitrary code execution behind a button.
+// whether the agent happened to install anything. That is the real reason.
+//
+// What this does NOT buy, stated plainly because an earlier version of this comment
+// claimed it did: it is not a sandbox. The command an operator writes here is
+// `npm install` and `npm run dev`, and BOTH execute agent-authored code — lifecycle
+// scripts and dependencies from the worktree's package.json, and `scripts.dev`
+// itself. Only the ENTRY POINT is operator-authored. The incremental risk is close
+// to zero (the agent already ran as this uid with --dangerously-skip-permissions),
+// but do not reason from here as though the previewed code were trusted. A real
+// boundary would need --ignore-scripts, a separate uid, or a namespace; see TODOS.
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, unlinkSync, openSync, closeSync, writeSync, constants } from "node:fs";
@@ -41,6 +48,10 @@ const SIGKILL_AFTER_MS = 5_000;
 const SWEEP_INTERVAL_MS = 30_000;
 /** Readiness polling interval. */
 const POLL_INTERVAL_MS = 250;
+/** How long a reaped orphan gets between SIGTERM and SIGKILL at boot. Shorter than
+ *  the live stop's grace: nothing is waiting on a graceful shutdown here, and boot
+ *  should not stall on a corpse. */
+const REAP_GRACE_MS = 1_500;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure helpers — exported so every rule is testable without spawning anything.
@@ -129,6 +140,13 @@ export function parseStarttime(stat: string): number | null {
  * /(TOKEN|SECRET|KEY|PASS)/i misses DATABASE_URL, SENTRY_DSN, STRIPE_SK and
  * npm_config__auth, and this is served by an UNGATED GET. Showing the names is
  * enough to answer "what command runs", which is the drawer's only job.
+ *
+ * LIMIT, stated because the sentence above reads like a completeness claim and is
+ * not one: this covers env values only. ARGV is shown as written, so a secret passed
+ * as a FLAG (`--api-key sk-live-…`) is served verbatim on that ungated GET —
+ * scrubSecrets only knows the daemon's own two tokens and `?token=`-shaped query
+ * strings. Keep secrets in the NAME=VALUE form, which is the documented shape
+ * anyway. Do not read this function as "the command is safe to publish".
  */
 export function redactCommand(argv: string[], env: Record<string, string>): string {
   const envPart = Object.keys(env).sort().map((k) => `${k}=[set]`).join(" ");
@@ -285,8 +303,11 @@ function memoryCapAvailable(): boolean {
   if (!Bun.which("systemd-run")) {
     memCapAvailable = false;
   } else {
+    // TIMEOUT is mandatory. This runs on the daemon's single event loop, so a
+    // systemd-run that hangs on a stalled session bus freezes the HTTP server, the
+    // WebSocket, every agent's pipe draining and every timer along with it.
     const r = Bun.spawnSync(["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=64M", "--", "true"], {
-      stdout: "ignore", stderr: "ignore",
+      stdout: "ignore", stderr: "ignore", timeout: 3_000,
     });
     memCapAvailable = r.exitCode === 0;
   }
@@ -447,6 +468,7 @@ export async function reapOrphans(): Promise<number> {
     return 0; // absent or malformed — nothing to do, and nothing worth saying
   }
   let killed = 0;
+  const kept: PidRecord[] = [];   // records still worth trying on the next boot
   for (const r of records) {
     // The file lives in the data dir, which the agent and the previewed dev server
     // can both write (same uid). Validate it as untrusted input, not as our own
@@ -465,13 +487,29 @@ export async function reapOrphans(): Promise<number> {
         notice("warn", "preview-orphan",
           `a process from a previous run may still hold preview port ${r.port} (pid ${r.pid}), but its identity cannot be confirmed, so it was left alone. `
           + `Check with: ss -ltnp 'sport = :${r.port}'`);
+        kept.push(r);
         continue;
       }
       if (now !== r.starttime) continue; // pid recycled — definitively not ours, and not worth a notice
-      // Count only what we actually signalled. killGroup returns false when the
-      // group is already gone, and reporting a reap that did not happen would make
-      // the boot log claim it recovered ports it did not.
-      if (killGroup(r.pid, "SIGTERM")) killed++;
+      // SIGTERM, then VERIFY. killGroup returning true means the signal was
+      // DELIVERED, not that the group died — and this branch's own test fixture has
+      // an --ignore-sigterm mode, so a dev server that outlives SIGTERM is a modelled
+      // case, not a hypothetical. Counting delivery as a reap made the boot log claim
+      // it had recovered a port it was still leaking.
+      if (!killGroup(r.pid, "SIGTERM")) continue;   // already gone
+      await sleep(REAP_GRACE_MS);
+      if (isAlive(r.pid)) killGroup(r.pid, "SIGKILL");
+      await sleep(POLL_INTERVAL_MS);
+      if (isAlive(r.pid)) {
+        // Survived SIGKILL (uninterruptible sleep, or not ours after all). Keep the
+        // record so the NEXT boot tries again, and say so — silently dropping it is
+        // how a held port becomes permanent with nothing to explain it.
+        kept.push(r);
+        notice("warn", "preview-orphan",
+          `a dev server from a previous run (pid ${r.pid}, port ${r.port}) did not die to SIGKILL. Check with: ss -ltnp 'sport = :${r.port}'`);
+        continue;
+      }
+      killed++;
     } else if (!probePort(r.port)) {
       // The recorded group leader is gone but the port is still held: the wrapper
       // (npm/pnpm) died and left the real dev server behind. Dropping this quietly
@@ -481,7 +519,18 @@ export async function reapOrphans(): Promise<number> {
         + `Free it with: ss -ltnp 'sport = :${r.port}'`);
     }
   }
-  try { unlinkSync(pidfilePath()); } catch { /* already gone */ }
+  // Rewrite rather than unlink. The old code discarded EVERY record unconditionally,
+  // including the ones deliberately left alone (unconfirmable identity) and the ones
+  // that survived the kill — so their ports leaked forever with the notice firing
+  // exactly once, on a boot nobody was watching.
+  try {
+    if (kept.length) {
+      const fd = openSync(pidfilePath(), constants.O_CREAT | constants.O_TRUNC | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      try { writeSync(fd, JSON.stringify(kept)); } finally { closeSync(fd); }
+    } else {
+      unlinkSync(pidfilePath());
+    }
+  } catch { /* best effort — a lost pidfile only costs the next boot's reap */ }
   if (killed) console.log(`[preview] reaped ${killed} dev server(s) left by a previous run`);
   return killed;
 }
@@ -515,7 +564,11 @@ const reservedPorts = (): Set<number> => new Set([...previews.values()].map((e) 
  * for one port.
  */
 export function beginPreview(task: Task, project: Project | undefined): PreviewState {
-  if (!config.preview.enabled) throw new Error("previews are disabled on this daemon (AGENTDECK_PREVIEW=false)");
+  // Do NOT name a cause here. daemon.ts turns this flag off for three different
+  // reasons (AGENTDECK_PREVIEW=false, a pool colliding with the dashboard port, an
+  // off-loopback bind) and each raises its own notice saying which. Asserting one
+  // of them is how the operator ends up chasing the wrong setting.
+  if (!config.preview.enabled) throw new Error("previews are disabled on this daemon — see the boot notices for which check disabled them");
 
   const existing = previews.get(task.id);
   if (existing) {
@@ -600,10 +653,14 @@ export function beginPreview(task: Task, project: Project | undefined): PreviewS
       // waitpid has run, the kernel may hand that number to anything, so a stale
       // pgid left here means a later stop/TTL/shutdown SIGTERMs a stranger's group.
       if (entry.child === child) { entry.child = null; entry.pgid = null; writePidfile(); }
-      // Only meaningful once ready: before that, the readiness loop reports it with
-      // the captured output, which is a far better message than "it closed".
-      const e = previews.get(task.id);
-      if (e && e.status === "ready") setStatus(e, "failed", e.out.excerpt() || "the dev server exited");
+      // IDENTITY, not just taskId. killCurrentChild resolves on the SIGKILL timer
+      // without waiting for `close`, so a stop can delete this entry and a restart
+      // can install a NEW one for the same task while this handler is still pending
+      // — and the old child would then mark the new preview failed, with the new
+      // entry's output as the explanation. Same hazard the pgid comment above
+      // guards for the pid; it applies to the entry too.
+      if (previews.get(task.id) !== entry) return;
+      if (entry.status === "ready") setStatus(entry, "failed", entry.out.excerpt() || "the dev server exited");
     });
     child.once("error", (e: any) => { dead = true; entry.out.push(`could not run: ${e?.message ?? e}`); });
 
@@ -611,7 +668,14 @@ export function beginPreview(task: Task, project: Project | undefined): PreviewS
     while (Date.now() < deadline) {
       if (dead) throw new Error(`the preview exited before it listened — ${entry.out.excerpt() || "no output"}`);
       if (entry.aborted) throw new AbortedError();
-      if (await canConnect(port)) {
+      const up = await canConnect(port);
+      // Re-check on the FAR side of the await too. Checking only before it left a
+      // window where a stop landed during the connect and `ready` then overwrote
+      // `stopping` — pushing a live "Preview ▸" link to every dashboard for a port
+      // being torn down. Every await in this closure is an abort boundary; this one
+      // was missed because the check reads as if it guards the whole iteration.
+      if (entry.aborted) throw new AbortedError();
+      if (up) {
         setStatus(entry, "ready", null);
         return view(entry);
       }
@@ -741,7 +805,12 @@ export async function sweepOncePreviews(now = Date.now()): Promise<void> {
   for (const e of [...previews.values()]) {
     if (e.stopping) continue;
     if (ttl > 0 && now - e.startedAt > ttl) {
-      await stopPreview(e.taskId, `reached the ${Math.round(ttl / 60_000)}min lifetime cap`);
+      // NOT awaited. Each stop can take the full SIGTERM grace, and with a pool of
+      // up to POOL_MAX that is minutes of sequential waiting against a 30s interval
+      // — passes would stack, and one wedged stop would block the health check for
+      // every other preview. stopPreview is idempotent per task, so firing and
+      // forgetting is safe; `e.stopping` skips it on the next pass.
+      void stopPreview(e.taskId, `reached the ${Math.round(ttl / 60_000)}min lifetime cap`);
       continue;
     }
     // Health: a dev server that died on its own must show on the board rather than
@@ -754,9 +823,18 @@ export async function sweepOncePreviews(now = Date.now()): Promise<void> {
 
 let sweepTimer: ReturnType<typeof setInterval> | null = null;
 
+let sweeping = false;
+
 export function startPreviewSweep(): void {
   if (sweepTimer) return;
-  sweepTimer = setInterval(() => { void sweepOncePreviews(); }, SWEEP_INTERVAL_MS);
+  // Non-overlap guard, the same discipline cleanup.ts documents for its sweep. The
+  // health probe is a network call per ready preview; without this, a slow pass
+  // overlaps the next one and they pile up.
+  sweepTimer = setInterval(() => {
+    if (sweeping) return;
+    sweeping = true;
+    void sweepOncePreviews().finally(() => { sweeping = false; });
+  }, SWEEP_INTERVAL_MS);
   sweepTimer.unref?.();  // a sweep must never be the reason the process stays up
 }
 
@@ -826,4 +904,5 @@ export function _resetPreviewsForTest(): void {
   previews.clear();
   memCapAvailable = undefined;
   if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null; }
+  sweeping = false;
 }
