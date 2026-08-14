@@ -636,8 +636,69 @@ export function startPreviewSweep(): void {
   sweepTimer.unref?.();  // a sweep must never be the reason the process stays up
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Shutdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Total budget for stopping every preview on the way out: the 5s SIGTERM grace
+ *  plus a margin. Must stay well under systemd's TimeoutStopSec (90s default). */
+const SHUTDOWN_BUDGET_MS = 6_000;
+
+let shuttingDown = false;
+
+/**
+ * Install the SIGTERM/SIGINT handlers that stop previews before the daemon exits.
+ *
+ * READ THIS BEFORE CHANGING IT. These are the daemon's FIRST signal handlers, and
+ * registering a listener for SIGTERM **removes Node's default terminate
+ * behaviour**. From that moment the process only exits if this code says so. Get it
+ * wrong and `systemctl stop` hangs until TimeoutStopSec, then SIGKILLs — which
+ * orphans every running agent, a strictly worse outcome than the leaked dev server
+ * this exists to prevent.
+ *
+ * Hence the shape: the exit is in a `finally`, so neither a throw nor a hang in
+ * stopAllPreviews can strand the process, and it is raced against a hard budget so
+ * a wedged child cannot hold shutdown open. Idempotent, because a second Ctrl-C
+ * must not start a second teardown.
+ *
+ * Dependencies are injectable so all of that is testable without killing the test
+ * runner.
+ */
+export function installPreviewShutdown(deps: {
+  stop?: () => Promise<void>;
+  exit?: (code: number) => void;
+  on?: (sig: NodeJS.Signals, fn: () => void) => void;
+  budgetMs?: number;
+} = {}): void {
+  const stop = deps.stop ?? stopAllPreviews;
+  const exit = deps.exit ?? ((c: number) => process.exit(c));
+  const on = deps.on ?? ((sig, fn) => { process.on(sig, fn); });
+  const budgetMs = deps.budgetMs ?? SHUTDOWN_BUDGET_MS;
+
+  const handler = () => {
+    if (shuttingDown) return;   // a second Ctrl-C must not start a second teardown
+    shuttingDown = true;
+    void (async () => {
+      try {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const budget = new Promise<void>((r) => { timer = setTimeout(r, budgetMs); timer.unref?.(); });
+        await Promise.race([stop(), budget]);
+        clearTimeout(timer);
+      } catch (e: any) {
+        console.error(`[preview] shutdown cleanup failed: ${e?.message ?? e}`);
+      } finally {
+        exit(0);   // the one line that must run no matter what happened above
+      }
+    })();
+  };
+
+  on("SIGTERM", handler);
+  on("SIGINT", handler);
+}
+
 /** Test seam: drop all state without signalling anything. */
 export function _resetPreviewsForTest(): void {
+  shuttingDown = false;
   previews.clear();
   memCapAvailable = undefined;
   if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null; }

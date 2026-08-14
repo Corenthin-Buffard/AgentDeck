@@ -6,6 +6,7 @@ import { startServer, isLoopbackBind } from "./server.ts";
 import { startAutoCleanSweep } from "./cleanup.ts";
 import { hookSettings } from "./hooks-config.ts";
 import { notice } from "./notices.ts";
+import { installPreviewShutdown, reapOrphans, startPreviewSweep } from "./preview.ts";
 
 // AgentDeck daemon boot. Runs as a systemd service on the VPS — as a SYSTEM unit
 // under a dedicated unprivileged user when you install as root (the supported
@@ -115,6 +116,33 @@ if (config.notificationHooks) {
 // children, so those duplicates would be orphaned: still running with permissions
 // skipped, writing into the first daemon's worktrees, invisible to both.
 startServer();
+
+// ── Previews ────────────────────────────────────────────────────────────────
+// All of this is non-fatal by construction: a preview problem must never stop the
+// daemon from running agents, which is its actual job.
+if (config.preview.enabled) {
+  // A pool port that collides with the dashboard would put an agent-written app on
+  // the SAME ORIGIN as the dashboard, where its JavaScript could read the token out
+  // of the served HTML and drive the API. Refuse rather than warn.
+  if (config.preview.ports.includes(config.port)) {
+    config.preview.enabled = false;
+    notice("error", "preview-port", `AGENTDECK_PREVIEW_PORTS includes the dashboard port (${config.port}), which would serve agent-written code on the dashboard's own origin — previews are disabled. Choose a different pool.`);
+  } else if (!isLoopbackBind(config.host)) {
+    // Previews are reached by opening http://<this host>:<pool port> from the
+    // browser, which only works over the SSH tunnel. Behind a reverse proxy the
+    // link would point at a port nothing is serving on the public name, so the
+    // button would render and then fail. Say so instead.
+    config.preview.enabled = false;
+    notice("warn", "preview-host", `the daemon is bound to ${config.host} rather than loopback, so a preview link (http://<host>:<pool port>) would not be reachable through your proxy — previews are disabled.`);
+  } else {
+    // Kill dev servers a previous daemon left behind before allocating any port,
+    // or the pool comes up smaller than it looks with nothing to explain why.
+    await reapOrphans();
+    startPreviewSweep();
+    installPreviewShutdown();
+    console.log(`[preview] ports ${config.preview.ports.join(", ")} — forward each one (ssh -L <port>:127.0.0.1:<port>) to reach a preview`);
+  }
+}
 
 // A2 durability: on (re)start, resume any task that was mid-run. Injection and
 // resume are the same operation, proven by the spike.

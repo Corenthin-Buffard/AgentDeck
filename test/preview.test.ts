@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { config } from "../src/config.ts";
 import { resetNotices, notices } from "../src/notices.ts";
 import {
-  _resetPreviewsForTest, expandPlaceholders, getPreview, isPreviewing, parsePreviewCommand,
+  _resetPreviewsForTest, expandPlaceholders, getPreview, installPreviewShutdown, isPreviewing, parsePreviewCommand,
   parseStarttime, pickPort, previewCommand, reapOrphans, redactCommand, resolvePreview,
   startPreview, stopPreview, sweepOncePreviews,
 } from "../src/preview.ts";
@@ -389,6 +389,66 @@ describe("the supervisor", () => {
       await new Promise((r) => setTimeout(r, 300));
       await sweepOncePreviews();
       expect(getPreview("t_pv")?.status).toBe("failed");
+    });
+  });
+
+  // These are the daemon's FIRST signal handlers. Registering one for SIGTERM
+  // removes the default terminate behaviour, so from then on the process exits only
+  // if this code says so. If it doesn't, `systemctl stop` hangs for TimeoutStopSec
+  // and then SIGKILLs — orphaning every agent, which is far worse than the leaked
+  // dev server the handler exists to prevent.
+  describe("installPreviewShutdown", () => {
+    const harness = join(import.meta.dir, "fixtures", "shutdown-harness.ts");
+
+    /** Signal a real child and report how long it took to actually die. */
+    function timeToExit(mode: string, signal: NodeJS.Signals): Promise<number> {
+      return new Promise((resolve, reject) => {
+        const child = spawn("bun", [harness, mode], { stdio: ["ignore", "pipe", "ignore"] });
+        const giveUp = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("never exited")); }, 15_000);
+        child.stdout.once("data", () => {
+          const t0 = Date.now();
+          child.kill(signal);
+          child.once("close", () => { clearTimeout(giveUp); resolve(Date.now() - t0); });
+        });
+      });
+    }
+
+    test("SIGTERM exits promptly", async () => {
+      expect(await timeToExit("--normal", "SIGTERM")).toBeLessThan(3_000);
+    });
+
+    test("SIGINT exits promptly too", async () => {
+      expect(await timeToExit("--normal", "SIGINT")).toBeLessThan(3_000);
+    });
+
+    // The `finally` is what makes this pass. Without it a rejected teardown leaves
+    // the process alive with no default handler left to kill it.
+    test("a teardown that throws still exits", async () => {
+      expect(await timeToExit("--throw", "SIGTERM")).toBeLessThan(3_000);
+    });
+
+    // The budget is what makes this pass: a wedged dev server must not be able to
+    // hold shutdown open past systemd's patience.
+    test("a teardown that hangs exits on the budget", async () => {
+      const ms = await timeToExit("--hang", "SIGTERM");
+      expect(ms).toBeGreaterThanOrEqual(900);   // it really did wait for the budget
+      expect(ms).toBeLessThan(5_000);           // and not a moment longer
+    });
+
+    test("a second signal does not start a second teardown", async () => {
+      let calls = 0;
+      const handlers: Array<() => void> = [];
+      let exited = 0;
+      installPreviewShutdown({
+        stop: async () => { calls++; },
+        exit: () => { exited++; },
+        on: (_sig, fn) => handlers.push(fn),
+      });
+      handlers[0]();
+      handlers[1]();  // the SIGINT handler, as a second Ctrl-C would
+      await new Promise((r) => setTimeout(r, 50));
+      expect(calls).toBe(1);
+      expect(exited).toBe(1);
     });
   });
 
