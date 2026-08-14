@@ -682,9 +682,14 @@ function renderPreviewDrawer(){
   if(sel&&!sel.isCollapsed&&sel.anchorNode&&drawer.contains(sel.anchorNode))return; // don't yank a selection mid-copy
   // Focus survives the swap: re-focus whatever carried the same data-k afterwards.
   const key=document.activeElement&&drawer.contains(document.activeElement)?document.activeElement.dataset.k:null;
-  const st=pvDrawer;
-  showDrawer(html);      // bumps the token and clears pvDrawer…
-  pvDrawer=st;           // …and this is the one caller that legitimately restores it
+  // Restore BOTH. showDrawer bumps pvOpenSeq to cancel in-flight opens, which is
+  // right for a user action but wrong here: this fires on every board update, so
+  // leaving the bump in place cancelled a legitimate openPreview that was still
+  // fetching — clicking Preview during any status change silently did nothing.
+  const st=pvDrawer,seq=pvOpenSeq;
+  showDrawer(html);
+  pvOpenSeq=seq;
+  pvDrawer=st;
   pvDrawer.lastHtml=html;
   if(key){const el=drawer.querySelector(`[data-k="${key}"]`);if(el)el.focus();}
 }

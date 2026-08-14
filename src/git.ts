@@ -24,16 +24,30 @@ const GIT_TIMEOUT_MS = 60_000;
 
 async function git(args: string[], cwd = config.targetRepo): Promise<{ ok: boolean; out: string; err: string }> {
   const p = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-  const timer = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* already gone */ } }, GIT_TIMEOUT_MS);
+  let killed = false;
+  const kill = () => { killed = true; try { p.kill("SIGKILL"); } catch { /* already gone */ } };
+  const timer = setTimeout(kill, GIT_TIMEOUT_MS);
   timer.unref?.();
   try {
-    const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
-    const code = await p.exited;
-    // A killed git looks like a plain failure to every caller, which is the right
-    // shape: they all already handle `ok: false` by refusing to do the destructive
-    // thing. Name it in `err` so the reason reaches the task row.
-    if (code !== 0 && !err) return { ok: false, out: out.trim(), err: `git ${args[0]} did not finish within ${GIT_TIMEOUT_MS / 1000}s` };
+    // Race the READS and the REAP, not just the process — same shape as bounded()
+    // below, for the reason its comment gives. Killing the leader is not enough: a
+    // grandchild (a hook, a credential helper) inherits stdout, so
+    // `new Response(p.stdout).text()` can outlive the SIGKILL indefinitely and the
+    // timeout is then inert. A first version of this function did exactly that,
+    // and a hung git() pins removeTask forever.
+    const read = (st: ReadableStream) => Promise.race([
+      new Response(st).text(),
+      new Promise<string>((r) => { const t = setTimeout(() => { kill(); r(""); }, GIT_TIMEOUT_MS + 2_000); t.unref?.(); }),
+    ]);
+    const [out, err] = await Promise.all([read(p.stdout), read(p.stderr)]);
+    const code = await Promise.race([
+      p.exited,
+      new Promise<number>((r) => { const t = setTimeout(() => r(-1), 1_000); t.unref?.(); }),
+    ]);
+    if (killed) return { ok: false, out: out.trim(), err: `git ${args[0]} did not finish within ${GIT_TIMEOUT_MS / 1000}s` };
     return { ok: code === 0, out: out.trim(), err: err.trim() };
+  } catch (e: any) {
+    return { ok: false, out: "", err: `git ${args[0]} failed: ${e?.message ?? e}` };
   } finally {
     clearTimeout(timer);
   }

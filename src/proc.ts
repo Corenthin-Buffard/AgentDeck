@@ -132,11 +132,29 @@ export async function killAndWait(pgid: number, graceMs: number, onClose?: (fn: 
     t.unref?.();
     onClose?.(() => { clearTimeout(t); resolve(true); }); // the child's own close event, when we have one
   });
-  if (settled && !isAlive(pgid)) return true;
+  // groupAlive, not isAlive: the question is whether ANYTHING is left in the group,
+  // not whether the leader died. A wrapper that exits while its child holds the
+  // port satisfies isAlive(leader) === false while the leak is still there.
+  if (settled && !groupAlive(pgid)) return true;
   killGroup(pgid, "SIGKILL");
   // Give the kernel a tick to reap before asserting anything about it.
   await new Promise((r) => { const t = setTimeout(r, 250); (t as any).unref?.(); });
-  return !isAlive(pgid);
+  return !groupAlive(pgid);
+}
+
+/** Is any process still in this GROUP? `signal 0` performs the existence check
+ *  without delivering anything. Distinct from isAlive(), which asks about the
+ *  LEADER only — and the gap between those two is exactly the case this module
+ *  cares about: the `npm` wrapper exits while the dev server it forked keeps the
+ *  port. Verifying the leader and reporting "the group is gone" was wrong. */
+export function groupAlive(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code === "EPERM";   // exists, not ours
+  }
 }
 
 /** Is this pid alive? `signal 0` performs the permission and existence checks

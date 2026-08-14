@@ -911,6 +911,7 @@ export function installPreviewShutdown(deps: {
 export function _resetPreviewsForTest(): void {
   shuttingDown = false;
   previews.clear();
+  keptOrphans = [];
   memCapAvailable = undefined;
   if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null; }
   sweeping = false;

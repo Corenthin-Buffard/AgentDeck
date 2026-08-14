@@ -49,6 +49,21 @@ The core is proven: the end-to-end loop runs with a real agent (create → workt
 
 ## Security / hardening
 
+- **`retire()` can hang a task forever, and never verifies the kill** — **Priority: P2**
+  `src/agent.ts:201-215` SIGTERMs an agent child, sets a SIGKILL timer, and resolves on `close`. It never checks whether the process actually died, and — worse than the preview supervisor's equivalent, which was fixed — if the child survives SIGKILL or `close` never fires, the promise **never settles**. `killExisting` then never resolves, `scheduleAfterExit` (`src/agent.ts:249`) never respawns, and the task stalls silently with no notice and no error. `src/proc.ts` now has `killAndWait()`, which SIGTERMs, escalates, and verifies with `groupAlive()`; `retire` should use it. Pre-existing, surfaced by the preview branch's adversarial review (2026-08-14) but deliberately not fixed there — it is on the launch path for every agent and deserves its own change.
+
+- **`killExisting` is not awaited in `removeTask`** — **Priority: P2**
+  `src/tasks.ts` awaits `stopPreview` before `cleanupWorktree` but calls `killExisting(id)` fire-and-forget on the line above, so `removeTask(id, "force")` can run `git worktree remove --force` while `claude` is still live with that directory as its cwd. The comment directly above it ("so we don't orphan the child … or race its writes") is not honoured by the line beneath. Depends on the `retire()` item above, since awaiting a promise that can never settle is worse than not awaiting it. (Adversarial review, 2026-08-14.)
+
+- **Drawer functions clobber whatever drawer is open after an await** — **Priority: P3**
+  `openPreview` checks a staleness token (`pvOpenSeq`) before touching the DOM; nothing else does. `openTask` (`public/index.html`) awaits TWO fetches — one of them `/diff`, which is three git calls — then calls `showDrawer` unconditionally, so a slow diff overwrites a reply the operator has since started typing. Same shape, unconditional `closeDrawer()` after an await, in `sendAnswer`, `stop`, `del` and the upload handler. The token exists and is bumped correctly; these five callers simply never read it. (Adversarial review, 2026-08-14.)
+
+- **No `process.on("unhandledRejection")` guard** — **Priority: P3**
+  An unhandled rejection exits Bun with code 1, which for this daemon orphans every running agent. That class is currently closed one call site at a time via `fireAndForget()`; a three-line handler in `src/daemon.ts` would close it permanently and turn every future `void somePromise()` into a logged warning instead of an outage. Worth doing precisely because the per-site approach has already been got wrong once. (Adversarial review, 2026-08-14.)
+
+- **A preview record with an unreadable starttime nags forever** — **Priority: P4**
+  `reapOrphans` keeps any record whose identity it cannot confirm so the next boot retries, and warns each time. There is no age cap and no boot counter, so a record whose pid was recycled onto something unrelated years ago is still kept and still warned about, with no path to resolution. Wants a boot count or a timestamp after which the record is dropped with a final notice. (Adversarial review, 2026-08-14.)
+
 - **Pin release-workflow actions to commit SHAs** — **Priority: P4**
   `.github/workflows/release.yml` runs three actions (`actions/checkout@v4`, `oven-sh/setup-bun@v2`, `softprops/action-gh-release@v2`) pinned to mutable major tags in a `contents: write` job. Supply-chain-hardened choice is a full commit SHA for each (add Dependabot to bump them). Major-tag pinning is fine for now; revisit if the repo gets more contributors. (Review finding, 2026-07-20.)
 
