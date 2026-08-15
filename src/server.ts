@@ -14,11 +14,13 @@ import { store } from "./db.ts";
 import { bus } from "./bus.ts";
 import { notices, noticesTruncated, setNoticeListener } from "./notices.ts";
 import { answer, stopTask } from "./agent.ts";
-import { createTask, removeTask, findBySession } from "./tasks.ts";
+import { createTask, removeTask, findBySession, isRemoving } from "./tasks.ts";
 import { parseDecisionBrief } from "./detect.ts";
 import { stepSummary } from "./pipeline.ts";
 import { diffStat } from "./git.ts";
 import { notify } from "./notify.ts";
+import { beginPreview, getPreview, previewCommand, redactedResolution, resolvePreview, stopPreview } from "./preview.ts";
+import { fireAndForget } from "./proc.ts";
 
 const MAX_UPLOAD = 25 * 1024 * 1024; // 25MB app cap; maxRequestBodySize is the first curtain
 // The only `dest` the upload accepts beyond the per-project uploads dir: the
@@ -164,8 +166,23 @@ export function withBriefs<T extends { status: string; pendingQuestion?: string 
   });
 }
 
+/**
+ * Fold each task's live preview state onto the payload.
+ *
+ * DERIVED, never persisted — same reasoning as withBriefs above. The registry is in
+ * memory because a dev server has no `--resume` handle, so a row claiming `ready`
+ * after a restart would be a lie. Tasks without a preview are returned untouched,
+ * so the common path allocates nothing.
+ */
+export function withPreviews<T extends { id: string }>(tasks: T[]) {
+  return tasks.map((t) => {
+    const preview = getPreview(t.id);
+    return preview ? { ...t, preview } : t;
+  });
+}
+
 function tasksForClient() {
-  return withBriefs(store.listTasks());
+  return withPreviews(withBriefs(store.listTasks()));
 }
 
 function sendAll(payload: string) {
@@ -236,7 +253,11 @@ export function startServer() {
   const dashboardHtml = indexHtml
     .replace("__AD_TOKEN__", () => escAttr(config.dashboardToken))
     .replace("__AD_PIPELINE_DEFAULT__", () => (config.pipelineDefault ? "true" : "false"))
-    .replace("__AD_PIPELINE_STEPS__", () => escAttr(stepSummary().join(" | ")));
+    .replace("__AD_PIPELINE_STEPS__", () => escAttr(stepSummary().join(" | ")))
+    // Resolved AFTER daemon.ts's boot checks, which may disable previews (a pool
+    // colliding with this port, or an off-loopback bind). Serving it lets the board
+    // explain why the control is absent instead of rendering one that always fails.
+    .replace("__AD_PREVIEW_ENABLED__", () => (config.preview.enabled ? "true" : "false"));
   // From here on, a notice raised at RUNTIME (agent.ts retracting the root-bypass
   // claim) reaches every open dashboard immediately instead of waiting for the next
   // reconnect. Registered before serve() so nothing raised during startup is lost.
@@ -244,6 +265,21 @@ export function startServer() {
   const server = serveOrExit({
     hostname: config.host, // A3: localhost by default — do not expose the control API publicly
     port: config.port,
+    // CLASS FIX, the other half of "a handler awaits unbounded work". Bun.serve's
+    // idleTimeout defaults to 10 SECONDS and closes the connection under the client
+    // when a handler runs longer — the client then sees a socket error for an
+    // operation that is still running, and retries it.
+    //
+    // Two complementary defences, because one is not enough:
+    //   - Anything that can take MINUTES (starting a preview, stopping one) returns
+    //     202 immediately and reports over the WebSocket. Raising a timeout would
+    //     never cover a cold `npm install`.
+    //   - Anything that must answer synchronously because the UI reads its result
+    //     (DELETE /api/tasks/:id returns {removed, reason} so the drawer can say
+    //     "worktree is dirty") gets headroom here instead. git() is bounded at 60s
+    //     per call, so this is the ceiling that keeps a legitimate multi-git
+    //     teardown from being cut off mid-flight.
+    idleTimeout: 120,
     // First curtain on upload size: reject an over-large body before it's buffered
     // into RAM (the 25MB app cap is the second curtain). ~26MB leaves headroom.
     maxRequestBodySize: 26 * 1024 * 1024,
@@ -302,6 +338,14 @@ export function startServer() {
           url.searchParams.get("token") !== config.hookToken) {
         return new Response(null, { status: 403 });
       }
+      // INVARIANT, load-bearing since previews shipped: this gate reads a HEADER,
+      // never a cookie, and it must stay that way. Cookies are scoped by host, NOT
+      // by port — so the previewed app on 127.0.0.1:<pool port> shares a cookie jar
+      // with this dashboard on 127.0.0.1:8787. Port separation makes the previewed
+      // app a different ORIGIN (it cannot read this page or its token), but it does
+      // not stop it setting cookies we would then receive. The moment any auth here
+      // trusts a cookie, unreviewed agent-written code can forge it.
+      //
       // Dashboard writes: the BROWSER authenticates with the dashboard token
       // (injected into the served HTML) via the x-agentdeck-token header. Every
       // one of these mutates state — create/kill/drive an agent (--dangerously-
@@ -382,7 +426,13 @@ export function startServer() {
       if (m) {
         const [, id, action] = m;
         if (!store.getTask(id)) return json({ error: "not found" }, 404);
-        if (req.method === "DELETE") {
+        // `&& !action` is load-bearing, not defensive. The regex above captures a
+        // trailing segment into `action`, so without this guard a DELETE to ANY
+        // sub-resource — /api/tasks/<id>/preview — fell into this branch and
+        // destroyed the whole task: worktree, branch and row. It went unnoticed
+        // because no sub-resource accepted DELETE until previews did. A new
+        // sub-resource must opt IN to DELETE below, never inherit it from here.
+        if (req.method === "DELETE" && !action) {
           const q = url.searchParams.get("mode");
           const mode = q === "commit" || q === "force" ? q : "safe";
           return json(await removeTask(id, mode));
@@ -394,6 +444,60 @@ export function startServer() {
           catch (e: any) { return json({ error: e.message }, 409); }
         }
         if (action === "stop" && req.method === "POST") { stopTask(id); return json({ ok: true }); }
+        // ── Preview ────────────────────────────────────────────────────────
+        // POST/DELETE are token-gated by the `perTask` predicate above: starting
+        // one spawns a long-lived process from an agent-written repo, as the
+        // daemon's uid, with the daemon's environment. GET is an ungated read like
+        // the others — which is exactly why the command it returns has every env
+        // VALUE redacted (see redactCommand).
+        if (action === "preview") {
+          const t = store.getTask(id)!;
+          if (req.method === "POST") {
+            try {
+              // 202, and deliberately NOT awaited. Bun.serve closes any handler that
+              // runs past its idleTimeout (10s by default, 255s ceiling), while a
+              // cold `npm install` is minutes — awaiting here killed the connection
+              // under the client and the dashboard saw a socket error instead of a
+              // preview. beginPreview does the fast, throwable checks synchronously
+              // and reports the slow half through the entry's status, which already
+              // rides the WebSocket to the board.
+              if (isRemoving(id)) return json({ error: "this task is being deleted" }, 409);
+              return json({ preview: beginPreview(t, projectById(t.project)) }, 202);
+            } catch (e: any) {
+              // 409, not 500: every one of these is a state or configuration
+              // problem the operator can act on, and the message IS the fix.
+              return json({ error: String(e?.message ?? e) }, 409);
+            }
+          }
+          if (req.method === "DELETE") {
+            // 202, and NOT awaited — for exactly the reason POST returns 202. A stop
+            // runs a SIGTERM grace window (and can run a second one if the child has
+            // to be escalated), which is on the order of Bun.serve's 10s idleTimeout.
+            // Awaiting meant a slow-but-successful stop closed the connection under
+            // the client and the dashboard announced "Could not stop the preview".
+            // The entry goes to `stopping` synchronously and disappears when it is
+            // done, both of which ride the WebSocket to the board.
+            fireAndForget(stopPreview(id, "stopped from the dashboard"), "preview-stop");
+            return json({ ok: true }, 202);
+          }
+          if (req.method === "GET") {
+            // This read is UNGATED, so nothing here may carry a secret. The raw
+            // Resolution must never be serialised: it returns projects.json's
+            // `preview`/`install` verbatim, and those accept leading NAME=VALUE
+            // tokens — so a DATABASE_URL or npm_config__auth an operator put there
+            // would be served to anything that reaches the port, bypassing
+            // redactCommand entirely. Send only the shape the drawer reads.
+            const res = resolvePreview(projectById(t.project));
+            return json({
+              enabled: config.preview.enabled,
+              preview: getPreview(id) ?? null,
+              command: previewCommand(id),
+              // The reason a preview CAN'T start is the most useful thing the
+              // drawer can show, so resolve it even when nothing is running.
+              resolution: res.ok ? { ok: true, configured: redactedResolution(res) } : { ok: false, reason: res.reason },
+            });
+          }
+        }
         if (action === "events" && req.method === "GET") return json({ events: store.recentEvents(id) });
         if (action === "diff" && req.method === "GET") {
           const t = store.getTask(id)!;

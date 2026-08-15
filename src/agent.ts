@@ -4,6 +4,11 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config.ts";
 import { store } from "./db.ts";
 import { emitUpdate } from "./bus.ts";
+// Process-supervision primitives, shared with the preview supervisor. See proc.ts's
+// header for why they live there rather than here.
+import {
+  EVENT_TEXT_MAX, createStderrTail, exitReason, fireAndForget, scrubSecrets, shouldRelay, spawnOpts,
+} from "./proc.ts";
 import { clearNotice, notice } from "./notices.ts";
 import { notify } from "./notify.ts";
 import { phaseFromSignal, mergePhase, canStillReview, slashToSkill } from "./phase.ts";
@@ -206,7 +211,7 @@ function retire(taskId: string, child: ChildProcess): Promise<void> {
     try { child.kill("SIGTERM"); } catch { finish(); } // already dead
   });
   dying.set(taskId, p);
-  void p.then(() => { if (dying.get(taskId) === p) dying.delete(taskId); });
+  fireAndForget(p.then(() => { if (dying.get(taskId) === p) dying.delete(taskId); }), "agent-retire");
   return p;
 }
 
@@ -243,88 +248,26 @@ export function killExisting(taskId: string): Promise<void> {
 function scheduleAfterExit(taskId: string, spawnFn: () => void): void {
   const gone = killExisting(taskId);
   const gen = launchGen.get(taskId);
-  void gone.then(() => {
+  fireAndForget(gone.then(() => {
     if (launchGen.get(taskId) !== gen) return; // a newer answer/stop/delete superseded us
     schedule(taskId, spawnFn);
-  });
+  }), "agent-respawn");
 }
 
 // ── A1b (proven): the launch config that lets an agent run gstack headlessly ──
 // The spike confirmed gstack only resolves + runs unattended with permissions
 // fully skipped; `--permission-mode acceptEdits` was not enough. baseArgs() builds
-// the flags; agentEnv()/spawnOpts() below build the environment they run in.
+// the flags; agentEnv()/spawnOpts() in proc.ts build the environment they run in.
 
-/**
- * The environment every spawned agent inherits.
- *
- * Claude Code refuses `--dangerously-skip-permissions` as uid 0 unless it is told
- * it's in a deliberate sandbox, so a root daemon fails every task at spawn.
- * IS_SANDBOX=1 is that signal. We honour the refusal by DEFAULT — an operator who
- * ran the daemon as root by accident (an unset systemd `User=`) should see agents
- * fail loudly, not silently get root agents with permissions skipped.
- * AGENTDECK_ALLOW_ROOT=true is the explicit "I meant it".
- *
- * PURE + exported so the whole matrix is testable without actually being uid 0.
- * Returns `base` unchanged (not a copy) when there's nothing to add, so the common
- * path allocates nothing.
- */
-export function agentEnv(base: NodeJS.ProcessEnv, allowRoot: boolean, uid: number | undefined): NodeJS.ProcessEnv {
-  if (!allowRoot || uid !== 0) return base;
-  return { ...base, IS_SANDBOX: "1" };
-}
-
-/**
- * Common spawn options for every `claude` launch — one helper, because with env
- * injection added, three copies of this literal is three places to get root wrong.
- *
- * stderr is PIPED rather than inherited so a crash can carry its own explanation
- * onto the task row. attach() relays every chunk back to our own stderr, so
- * journald still sees what `inherit` gave it. NOTE: piping means SOMEONE MUST
- * DRAIN IT — attach() always attaches a listener on the same tick. A future caller
- * that spawns without attach() would block a chatty agent on a full 64KiB pipe.
- *
- * Not memoized on purpose: the test suite shares one `config` singleton, and a
- * cached env would make config.allowRoot un-overridable in tests.
- */
-export function spawnOpts(cwd: string, uid: number | undefined): SpawnOptions {
-  return {
-    cwd,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: agentEnv(process.env, config.allowRoot, uid),
-  };
-}
+// agentEnv() and spawnOpts() moved to src/proc.ts — the preview supervisor needs
+// them too, and it must not import this module (see that file's header).
 
 /** The spawn options for THIS process. Split so the uid-dependent branch above is
  *  assertable on a non-root machine — a test that reads the runner's own uid and
  *  changes what it expects proves nothing on CI, which is never root. */
 const currentSpawnOpts = (cwd: string): SpawnOptions => spawnOpts(cwd, process.getuid?.());
 
-// How much of a dead agent's stderr we keep. STDERR_ERROR_MAX is the task.error
-// budget — enough for the whole of a real failure (the root refusal is 93 bytes)
-// without turning a card into a wall.
-// One cap for every event row we persist, so no single row is an outlier and the
-// coupling is enforced rather than asserted in a comment. Used by the stderr tail
-// and by the `text` event below.
-export const EVENT_TEXT_MAX = 2000;
-const STDERR_TAIL_MAX = EVENT_TEXT_MAX;
-const STDERR_ERROR_MAX = 300;
-// How much unflushed relay we tolerate on our OWN stderr before we stop mirroring
-// a chatty agent. Only reachable when the log sink (journald) has stalled; 1 MiB
-// is generous for a transient hiccup and small enough that four agents hitting it
-// at once can't matter.
-const STDERR_RELAY_MAX_QUEUE = 1 << 20;
-
-/**
- * Should we mirror this chunk to our own stderr?
- *
- * PURE + exported so the rule is testable against the SHIPPED code. The first
- * implementation keyed on `process.stderr.write()` returning false, which drops
- * nothing — `false` is an advisory "past the high-water mark" and the chunk is
- * queued either way. Only the already-queued length can bound the heap.
- */
-export function shouldRelay(queuedBytes: number, max = STDERR_RELAY_MAX_QUEUE): boolean {
-  return queuedBytes <= max;
-}
+// EVENT_TEXT_MAX, the stderr caps and shouldRelay() moved to src/proc.ts.
 
 // How often a task's "still alive" timestamp may be written. Every tool call used
 // to trigger one SQLite UPDATE plus a full-board JSON.stringify over a SELECT *
@@ -343,66 +286,7 @@ export function shouldBumpLiveness(last: number, now: number, interval = LIVENES
   return now - last >= interval;
 }
 
-/**
- * Bounded stderr accumulator. PURE (no I/O, no timers) + exported so eviction and
- * chunk-boundary behaviour are unit-testable without spawning.
- *
- * Deliberately NOT a line picker. An earlier design latched "the first meaningful
- * line" as the cause; measuring the real failure killed it. `claude -p` with stdin
- * ignored emits exactly one 93-byte line with no ANSI — but give it a tty stdin and
- * it PREPENDS "Warning: no stdin data received in 3s…", pushing the real cause to
- * line 2. Any first-line rule would have shown the operator the stdin warning. The
- * whole (bounded) tail has no such failure mode and is less code.
- */
-export function createStderrTail(max = STDERR_TAIL_MAX) {
-  let tail = "";
-  return {
-    push(chunk: string) {
-      // Slice the chunk first when it alone overflows, so a single huge write
-      // doesn't build a giant intermediate string just to throw most of it away.
-      tail = chunk.length >= max ? chunk.slice(-max) : (tail + chunk).slice(-max);
-    },
-    tail: (): string => tail,
-    /** One-line excerpt for `task.error`: newlines collapsed so it can't break a
-     *  card's layout, trimmed, and capped. "" when there was nothing on stderr. */
-    excerpt: (): string => {
-      // trim() BEFORE collapsing: a trailing "\n" would otherwise become " · "
-      // and survive as a dangling "·" once the space is trimmed.
-      const flat = tail.trim().replace(/\s*[\r\n]+\s*/g, " · ");
-      return flat.length > STDERR_ERROR_MAX ? flat.slice(0, STDERR_ERROR_MAX - 1) + "…" : flat;
-    },
-  };
-}
-
-/** Why a child stopped. `signal` was previously dropped, so an OOM-killed agent
- *  read as "code null" — the literal string that started this whole investigation. */
-export function exitReason(code: number | null, signal: NodeJS.Signals | null): string {
-  return signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
-}
-
-/**
- * Strip secrets out of captured stderr before it is persisted.
- *
- * This matters BECAUSE of the capture: stderr used to be `inherit`, so it reached
- * journald and nothing else. It now lands in `task.error` and the events table,
- * both of which are served by GET reads that carry no dashboard token (only the
- * Host gate). An agent inherits the daemon's environment and can read the 0600
- * agent-settings.json, whose hook URLs embed the hook token as `?token=…` — so a
- * single failed hook POST echoing its URL would publish that token to any reader.
- *
- * PURE + exported so the redaction is testable without spawning. Secrets are
- * passed in rather than read from `config` so a test can't be fooled by ordering.
- */
-export function scrubSecrets(text: string, secrets: Array<string | undefined>): string {
-  let out = text;
-  for (const s of secrets) {
-    // Guard against short/empty values: a 1-char "secret" would redact everything.
-    if (!s || s.length < 8) continue;
-    out = out.split(s).join("[redacted]");
-  }
-  // Belt and braces for anything token-shaped we didn't know to look for.
-  return out.replace(/([?&](?:token|api[-_]?key|secret)=)[^&\s"']+/gi, "$1[redacted]");
-}
+// createStderrTail(), exitReason() and scrubSecrets() moved to src/proc.ts.
 
 // Claude Code's root refusal, matched loosely on purpose. Anchoring on the exact
 // English sentence would be brittle in exactly the scenario this detects: whatever
@@ -460,7 +344,7 @@ function attach(task: Task, child: ChildProcess) {
   // feature existed) gets its marks the moment its agent comes back, not only at
   // the next turn-end. Gated on canStillReview so a resumed ship/done task doesn't
   // spawn a reader for a phase we no longer poll. No-op for a fresh task (empty log).
-  if (canStillReview(task.phase)) void refreshPlanReviews(task);
+  if (canStillReview(task.phase)) fireAndForget(refreshPlanReviews(task), "plan-reviews");
   let buf = "";
   let text = "";
   const err = createStderrTail();
@@ -782,7 +666,7 @@ function attach(task: Task, child: ChildProcess) {
       // Fire-and-forget + best-effort: it reads its own fresh DB row and only
       // broadcasts on a change, so it can't delay or corrupt the transition below.
       const cur = store.getTask(task.id);
-      if (cur && canStillReview(cur.phase)) void refreshPlanReviews(cur);
+      if (cur && canStillReview(cur.phase)) fireAndForget(refreshPlanReviews(cur), "plan-reviews");
       const finalText = (text || e.result || "").trim();
       log("text", finalText.slice(0, EVENT_TEXT_MAX));
       // `subtype` ALONE does not mean the turn worked. Captured from a real

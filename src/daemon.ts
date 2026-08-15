@@ -6,6 +6,7 @@ import { startServer, isLoopbackBind } from "./server.ts";
 import { startAutoCleanSweep } from "./cleanup.ts";
 import { hookSettings } from "./hooks-config.ts";
 import { notice } from "./notices.ts";
+import { installPreviewShutdown, reapOrphans, startPreviewSweep } from "./preview.ts";
 
 // AgentDeck daemon boot. Runs as a systemd service on the VPS — as a SYSTEM unit
 // under a dedicated unprivileged user when you install as root (the supported
@@ -108,6 +109,41 @@ if (config.notificationHooks) {
   }
 }
 
+// ── Preview boot checks ─────────────────────────────────────────────────────
+// These run BEFORE startServer() for one specific reason: startServer() bakes
+// `config.preview.enabled` into the served HTML as a meta tag, once, at call time.
+// Deciding afterwards left the dashboard advertising a feature the daemon had just
+// switched off — the button rendered, every click 409'd, and the message named
+// AGENTDECK_PREVIEW=false when the real cause was a port collision.
+//
+// Safe to run first because none of it has side effects outside this process: it
+// only reads config, sets a flag, raises notices, arms two timers and registers the
+// signal handlers. The one part that DOES touch the box — reaping another daemon's
+// leftover children — deliberately waits until after the port bind, below.
+//
+// All of it is non-fatal by construction: a preview problem must never stop the
+// daemon from running agents, which is its actual job.
+if (config.preview.enabled) {
+  // A pool port that collides with the dashboard would put an agent-written app on
+  // the SAME ORIGIN as the dashboard, where its JavaScript could read the token out
+  // of the served HTML and drive the API. Refuse rather than warn.
+  if (config.preview.ports.includes(config.port)) {
+    config.preview.enabled = false;
+    notice("error", "preview-port", `AGENTDECK_PREVIEW_PORTS includes the dashboard port (${config.port}), which would serve agent-written code on the dashboard's own origin — previews are disabled. Choose a different pool.`);
+  } else if (!isLoopbackBind(config.host)) {
+    // Previews are reached by opening http://<this host>:<pool port> from the
+    // browser, which only works over the SSH tunnel. Behind a reverse proxy the
+    // link would point at a port nothing is serving on the public name, so the
+    // button would render and then fail. Say so instead.
+    config.preview.enabled = false;
+    notice("warn", "preview-host", `the daemon is bound to ${config.host} rather than loopback, so a preview link (http://<host>:<pool port>) would not be reachable through your proxy — previews are disabled.`);
+  } else {
+    startPreviewSweep();
+    installPreviewShutdown();
+    console.log(`[preview] ports ${config.preview.ports.join(", ")} — forward each one (ssh -L <port>:127.0.0.1:<port>) to reach a preview`);
+  }
+}
+
 // Bind the port BEFORE anything with side effects. A second instance — or an
 // overlapping `systemctl restart` — would otherwise run the A2 resume loop first,
 // spawning `claude --resume` on sessions and worktrees the LIVE daemon owns, and
@@ -115,6 +151,14 @@ if (config.notificationHooks) {
 // children, so those duplicates would be orphaned: still running with permissions
 // skipped, writing into the first daemon's worktrees, invisible to both.
 startServer();
+
+// Reaping is a side effect on OTHER processes, so it waits for the port bind for
+// exactly the reason above: a second instance must die on EADDRINUSE before it can
+// SIGTERM the LIVE daemon's dev servers. Runs before any port is allocated, so the
+// pool never comes up smaller than it looks with nothing to explain why.
+if (config.preview.enabled) await reapOrphans();
+
+
 
 // A2 durability: on (re)start, resume any task that was mid-run. Injection and
 // resume are the same operation, proven by the spike.

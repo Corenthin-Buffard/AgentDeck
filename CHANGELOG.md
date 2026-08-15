@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.2.6.0] - 2026-08-14
+
+### Added
+- **Preview: see the app an agent built, without SSHing in.** A task row now carries a
+  **Preview** button. Click it and the daemon starts that task's dev server inside its own git
+  worktree, on a port from a small pool, and hands you a link. Previously the only way to judge an
+  agent's work was to read the diff or SSH in and start a dev server by hand.
+
+  Configure it per project in `projects.json`:
+
+  ```json
+  { "id": "web", "path": "/srv/web",
+    "install": "npm ci",
+    "preview": "npm run dev -- --port {port} --host 127.0.0.1 --strictPort" }
+  ```
+
+  Then forward the pool alongside the dashboard — `ssh -L 8788:127.0.0.1:8788 …` — or add one to a
+  session you already have open with `ssh -O forward`. A project without those two fields works
+  exactly as before, minus the button.
+
+  A fresh worktree has no `node_modules` (git carries tracked files only), so the daemon runs your
+  `install` command first and the board shows **Installing…** while it does. Verified end to end
+  against a real Vite app: fresh worktree → install → ready in seconds → the app at `/`, with HMR
+  reconnecting and a live edit hot-reloading in the preview tab.
+
+- **Previews run on their own port, deliberately.** The app an agent wrote is unreviewed code. On
+  the dashboard's own origin its JavaScript could read the dashboard token out of the page and drive
+  the API; on a separate port it cannot, while everything the app itself needs — its own fetches,
+  storage, cookies, HMR — keeps working. Dev servers always bind loopback regardless of
+  `AGENTDECK_HOST`, and the README documents the firewall rule that backs that up.
+
+- **Previews stop themselves.** A hard lifetime cap (`AGENTDECK_PREVIEW_TTL_MS`, 4h, `0` disables),
+  a memory ceiling per preview where systemd can provide one, and a health check that flips a dev
+  server that died on its own to **failed** on the board rather than leaving a dead link.
+
+- **New knobs:** `AGENTDECK_PREVIEW`, `AGENTDECK_PREVIEW_PORTS` (default `8788-8790`, and the pool
+  size IS the concurrency limit), `AGENTDECK_PREVIEW_TTL_MS`, `AGENTDECK_PREVIEW_MEM_MAX`,
+  `AGENTDECK_PREVIEW_READY_TIMEOUT_MS`, `AGENTDECK_PREVIEW_INSTALL_TIMEOUT_MS`.
+
+### Fixed
+- **Deleting a preview deleted the whole task.** `DELETE /api/tasks/<id>/preview` matched the
+  task-deletion branch, which tested only the HTTP method and ignored the trailing path segment — so
+  it removed the worktree, the branch and the row. Nothing had ever sent a DELETE to a task
+  sub-resource before, so nothing caught it. A sub-resource must now opt in to DELETE explicitly.
+
+- **Slow operations no longer report failure while succeeding.** Starting a preview and stopping one
+  both answer immediately and report progress live, because the server closes any request that runs
+  longer than its timeout — and a cold `npm install` is minutes. Previously the browser saw a socket
+  error while the install carried on invisibly. Every git call is now bounded too, so a repo lock or
+  a stale mount can no longer wedge a task deletion indefinitely.
+
+- **A daemon restart no longer strands dev servers.** If the daemon is killed outright, the next
+  boot finds the servers it left behind, shuts them down and frees their ports — and where it cannot
+  confirm one is safe to signal, it says so and leaves it alone rather than risking an unrelated
+  process.
+
+- **Auto-clean will not delete a worktree you are looking at.** A task with a running preview is
+  skipped by the merged-branch sweep, and deleting a task shuts its preview down first.
+
+### Changed
+- Process spawning, output capture and secret scrubbing moved into a shared module, so the agent
+  supervisor and the preview supervisor use one implementation instead of two. No behaviour change.
+- Disabled buttons are marked with a dashed border rather than by dimming their text, which had put
+  four of the preview control's states below the contrast floor the design system requires.
+
 ## [0.2.5.3] - 2026-08-13
 
 ### Fixed

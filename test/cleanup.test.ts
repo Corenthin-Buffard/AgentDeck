@@ -28,7 +28,7 @@ describe("sweepOnce (delete-decision orchestration)", () => {
   // isMerged returns the proven SHA (or null). `merged` opt: true → a fixed SHA, false → null.
   function harness(
     tasks: Task[],
-    opts: { merged?: (branch: string) => boolean; running?: Set<string> } = {},
+    opts: { merged?: (branch: string) => boolean; running?: Set<string>; previewing?: Set<string> } = {},
   ) {
     const removed: Array<{ id: string; sha: string }> = [];
     const map = new Map(tasks.map((t) => [t.id, t]));
@@ -36,6 +36,7 @@ describe("sweepOnce (delete-decision orchestration)", () => {
       listTasks: () => tasks,
       getTask: (id) => map.get(id) ?? null,
       isRunning: (id) => opts.running?.has(id) ?? false,
+      isPreviewing: (id) => opts.previewing?.has(id) ?? false,
       resolveRepo: async () => ({ repo: "/repo/default", base: "main" }),
       isMerged: async (_r, _b, branch) => ((opts.merged ? opts.merged(branch) : true) ? "sha_" + branch : null),
       remove: async (id, sha) => { removed.push({ id, sha }); map.delete(id); return { removed: true }; },
@@ -76,5 +77,27 @@ describe("sweepOnce (delete-decision orchestration)", () => {
     });
     await sweepOnce(deps);
     expect(ids(removed)).toEqual([]); // the post-probe re-check catches it
+  });
+
+  // A preview makes the worktree a live dev server's cwd. Removing it would kill
+  // the preview mid-look AND make `git worktree remove` refuse — so a task the
+  // operator is currently looking at is never swept, merged or not.
+  test("never touches a task with a live preview (even if merged)", async () => {
+    const { deps, removed } = harness([task("t1", "done")], { merged: () => true, previewing: new Set(["t1"]) });
+    await sweepOnce(deps);
+    expect(ids(removed)).toEqual([]);
+  });
+
+  // `gh` is a network call, so the window between the eligibility filter and the
+  // destructive remove is wide enough to click Preview in. The post-probe re-check
+  // has to cover previews for the same reason it covers resumes.
+  test("anti-race: skips if a preview STARTED during the async merge probe", async () => {
+    const previewing = new Set<string>();
+    const { deps, removed } = harness([task("t1", "done")], {
+      merged: () => { previewing.add("t1"); return true; }, // operator clicked Preview mid-probe
+      previewing,
+    });
+    await sweepOnce(deps);
+    expect(ids(removed)).toEqual([]);
   });
 });

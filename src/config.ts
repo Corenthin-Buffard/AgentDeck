@@ -14,6 +14,38 @@ const port = Number(process.env.AGENTDECK_PORT ?? 8787);
 const targetRepo = process.env.AGENTDECK_TARGET_REPO ?? process.cwd();
 
 /**
+ * Validate one optional command field on a projects.json entry.
+ *
+ * Accepts a non-empty string, or an array of non-empty strings. The array form
+ * exists because the string form splits on whitespace (the AGENTDECK_CLAUDE_ARGS
+ * convention), which silently mangles any argument that legitimately contains a
+ * space — `--define "API=https://x/a b"` becomes four arguments and the dev server
+ * gets a usage dump instead of a flag. An array has exactly one reading.
+ *
+ * Returns a spreadable object so an absent or invalid field simply contributes
+ * nothing. Exported for the unit tests; MUST NOT throw (see loadProjects).
+ */
+export function cmdField(
+  projectId: string,
+  key: "install" | "preview",
+  v: unknown,
+): Partial<Pick<Project, "install" | "preview">> {
+  if (v === undefined || v === null) return {};
+  if (typeof v === "string") {
+    if (v.trim()) return { [key]: v } as Partial<Project>;
+    notice("warn", "projects", `'${projectId}'.${key} is an empty string — ignoring it`);
+    return {};
+  }
+  if (Array.isArray(v)) {
+    if (v.length && v.every((s) => typeof s === "string" && s.length)) return { [key]: v as string[] } as Partial<Project>;
+    notice("warn", "projects", `'${projectId}'.${key} must be a non-empty array of non-empty strings — ignoring it`);
+    return {};
+  }
+  notice("warn", "projects", `'${projectId}'.${key} must be a string or an array of strings — ignoring it`);
+  return {};
+}
+
+/**
  * The project registry. Read from `<dataDir>/projects.json` (an array of
  * `{ id, path, label? }`); on any problem — missing, unreadable, malformed,
  * empty after validation — fall back to a single `default` project synthesized
@@ -49,7 +81,16 @@ export function loadProjects(dir: string, fallbackRepo: string): Project[] {
       }
       if (seen.has(p.id)) { notice("warn", "projects", `duplicate id '${p.id}' — keeping the first`); continue; }
       seen.add(p.id);
-      out.push({ id: p.id, path: p.path, label: (typeof p.label === "string" && p.label) ? p.label : (basename(p.path) || p.id) });
+      out.push({
+        id: p.id, path: p.path,
+        label: (typeof p.label === "string" && p.label) ? p.label : (basename(p.path) || p.id),
+        // Entries are built field-by-field (unknown keys are dropped), so these
+        // have to be carried through explicitly. A malformed value is dropped with
+        // a warning rather than kept: a half-valid command would fail at spawn
+        // time, in a worktree, minutes later — far from the typo that caused it.
+        ...cmdField(p.id, "install", p.install),
+        ...cmdField(p.id, "preview", p.preview),
+      });
     }
     if (out.length) return out;
     notice("warn", "projects", `${file} had no usable entries — using the default repo`);
@@ -132,6 +173,71 @@ function loadOrCreateDashboardToken(dir: string): string {
  */
 export const isOptIn = (v: string | undefined): boolean => v === "true";
 
+/** Upper bound for a preview port. Linux's default ephemeral range starts at
+ *  32768, and a pool inside it races the kernel handing the same port to an
+ *  outgoing connection — a rare, unreproducible "the preview randomly won't
+ *  start". Below 1024 needs root we don't have (and shouldn't want). */
+const PORT_MIN = 1024;
+const PORT_MAX = 32767;
+/** Each pool port costs one `ssh -L` line and up to ~600MB of dev server, so a
+ *  pool this large is a typo (`8788-9788`), not an intention. */
+const POOL_MAX = 16;
+
+/**
+ * A non-negative millisecond knob, with the same fail-soft contract as parsePool.
+ *
+ * `Number("4h")` is NaN, and NaN silently defeats every comparison it touches: a
+ * NaN ttlMs makes `ttl > 0` false, so the hard lifetime cap disappears without a
+ * word; a NaN readyTimeoutMs makes the readiness deadline expire on the first tick
+ * and every preview fails with "did not listen within NaNs". Both are far worse
+ * than falling back with a warning.
+ *
+ * `allowZero` exists because 0 is a meaningful value for the TTL (disable the cap)
+ * but a broken one for a timeout.
+ */
+export function posNum(raw: string | undefined, fallback: number, name: string, allowZero = false): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || (!allowZero && n === 0)) {
+    notice("warn", "preview-config", `${name}='${raw}' is not a ${allowZero ? "non-negative" : "positive"} number of milliseconds — using ${fallback}`);
+    return fallback;
+  }
+  return n;
+}
+
+/**
+ * Parse the preview port pool: `"8788-8790"` or `"8788,8790"`.
+ *
+ * PURE + exported so every rejection is testable. MUST NOT throw — config.ts is
+ * imported by every module, so a bad value degrades to the default with a warning
+ * rather than crash-looping the daemon (see this file's header).
+ */
+export function parsePool(spec: string | undefined, fallback: number[]): number[] {
+  const raw = (spec ?? "").trim();
+  if (!raw) return fallback;
+  const bad = (why: string): number[] => {
+    notice("warn", "preview-ports", `AGENTDECK_PREVIEW_PORTS='${raw}' ${why} — using ${fallback.join(",")}`);
+    return fallback;
+  };
+  let ports: number[];
+  const range = raw.match(/^(\d+)\s*-\s*(\d+)$/);
+  if (range) {
+    const lo = Number(range[1]), hi = Number(range[2]);
+    if (hi < lo) return bad("has its bounds reversed");
+    if (hi - lo + 1 > POOL_MAX) return bad(`asks for ${hi - lo + 1} ports (max ${POOL_MAX})`);
+    ports = Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+  } else {
+    const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    if (!parts.length || !parts.every((p) => /^\d+$/.test(p))) return bad("is not a range or a comma-separated list");
+    ports = [...new Set(parts.map(Number))];
+    if (ports.length > POOL_MAX) return bad(`asks for ${ports.length} ports (max ${POOL_MAX})`);
+  }
+  if (!ports.every((p) => p >= PORT_MIN && p <= PORT_MAX)) {
+    return bad(`is outside ${PORT_MIN}-${PORT_MAX} (above ${PORT_MAX} collides with the kernel's ephemeral range)`);
+  }
+  return ports;
+}
+
 export const config: AgentDeckConfig = {
   dataDir,
   // A3: bind localhost only. Reach the dashboard via SSH tunnel, not public exposure.
@@ -209,6 +315,24 @@ export const config: AgentDeckConfig = {
   agentSettingsPath: join(dataDir, "agent-settings.json"),
 
   maxConcurrentAgents: Number(process.env.AGENTDECK_MAX_AGENTS ?? 4),
+
+  // Preview dev servers. `!== "false"` (not isOptIn) because the feature is inert
+  // until someone clicks Start AND the project declares a `preview` command — there
+  // is no guard being relaxed here, which is what isOptIn is reserved for.
+  preview: {
+    enabled: (process.env.AGENTDECK_PREVIEW ?? "true") !== "false",
+    // One knob for reachability and concurrency: every pool port needs its own
+    // `ssh -L` line, so the pool IS the concurrency limit. Three is two more than
+    // most sessions need and still only ~1.8GB worst case alongside four agents.
+    ports: parsePool(process.env.AGENTDECK_PREVIEW_PORTS, [8788, 8789, 8790]),
+    readyTimeoutMs: posNum(process.env.AGENTDECK_PREVIEW_READY_TIMEOUT_MS, 60_000, "AGENTDECK_PREVIEW_READY_TIMEOUT_MS"),
+    installTimeoutMs: posNum(process.env.AGENTDECK_PREVIEW_INSTALL_TIMEOUT_MS, 600_000, "AGENTDECK_PREVIEW_INSTALL_TIMEOUT_MS"),
+    // A hard lifetime cap, NOT an idle timer. The daemon is not in the request path
+    // (dev servers are reached directly over the tunnel), so it cannot observe use;
+    // any "idle" signal would be a guess. A ceiling is honest and deterministic.
+    ttlMs: posNum(process.env.AGENTDECK_PREVIEW_TTL_MS, 4 * 60 * 60_000, "AGENTDECK_PREVIEW_TTL_MS", true),
+    memMax: process.env.AGENTDECK_PREVIEW_MEM_MAX ?? "1G",
+  },
 
   notify: {
     telegram: process.env.AGENTDECK_TG_TOKEN && process.env.AGENTDECK_TG_CHAT

@@ -9,6 +9,10 @@
 <meta name="ad-pipeline-default" content="__AD_PIPELINE_DEFAULT__">
 <!-- The resolved pipeline step table, daemon-wide. -->
 <meta name="ad-pipeline-steps" content="__AD_PIPELINE_STEPS__">
+<!-- Whether this daemon can run previews at all. Empty when it can't (disabled,
+     bound off-loopback, or a pool colliding with the dashboard port), so the board
+     can say so instead of rendering a button that would always fail. -->
+<meta name="ad-preview" content="__AD_PREVIEW_ENABLED__">
 <title>AgentDeck · Master Inbox</title>
 <!-- Favicon: the same deck glyph as the header, inline so the binary stays
      self-contained (no extra file, no server route). Hex is hard-coded because
@@ -161,11 +165,23 @@
   .aside{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:8px;padding:13px 16px;border-left:1px solid var(--line-soft);min-width:150px}
   .ago{font-family:var(--mono);font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
   .row.waiting .ago{color:var(--wait)}.row.error .ago{color:var(--err)}
-  .btn{font-family:var(--sans);font-size:13px;font-weight:600;cursor:pointer;padding:7px 14px;border-radius:6px;border:1px solid transparent;white-space:nowrap}
+  /* inline-flex + no underline so an <a class="btn"> matches a <button> exactly.
+     The preview link is the first anchor on this page; see DESIGN.md. */
+  .btn{font-family:var(--sans);font-size:13px;font-weight:600;cursor:pointer;padding:7px 14px;border-radius:6px;border:1px solid transparent;white-space:nowrap;display:inline-flex;align-items:center;text-decoration:none}
   .btn.primary{background:var(--wait);color:#14100a;border-color:var(--wait)}
   .btn.danger{background:transparent;color:var(--err);border-color:var(--err)}
   .btn.ghost{background:transparent;color:var(--dim);border-color:var(--line)}
+  /* Preview state is never --err or --wait: those are reserved for AGENT state
+     (DESIGN.md rule 1), and a dev server that won't boot is not the task failing.
+     Disabled is signalled by the BORDER, never by dimming the label. `opacity:.5`
+     put --dim at 2.75:1 (dark) / 2.13:1 (light) against the 4.5:1 floor Rule 3
+     calls binding, and compounded with .row.done's own .62 to 1.80:1 — and four of
+     the preview control's states render only in this treatment. */
+  .btn[disabled]{cursor:default;border-style:dashed;border-color:var(--line-soft)}
   .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  /* Two controls per row now, so they need their own row box — .aside becomes a
+     space-between flex row under 620px and would otherwise fling them apart. */
+  .acts{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
   .empty{margin-top:26px;padding:22px;border:1px dashed var(--line);border-radius:8px;color:var(--dim);font-family:var(--mono);font-size:13px;text-align:center}
   /* drawer */
   .scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .15s}
@@ -210,6 +226,7 @@
     .opt{min-height:44px}
     .projsel{flex:1 1 auto;min-width:0}
     .notice .x{min-width:44px;min-height:44px}
+    .acts .btn,.actions .btn{min-height:44px}
     .projsel select{min-height:44px;flex:1 1 auto;max-width:none}}
 </style>
 </head>
@@ -276,6 +293,11 @@ const BRANCH_ICON=`<svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="
   +`<path d="M3.5 10V4M3.5 7h2.5a2 2 0 0 0 2-2V4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>`
   +`<circle cx="3.5" cy="2.6" r="1.4" fill="currentColor"/><circle cx="8" cy="2.6" r="1.4" fill="currentColor"/></svg>`;
 const AD_TOKEN=(document.querySelector('meta[name=ad-token]')||{}).content||"";
+const AD_PREVIEW=((document.querySelector('meta[name=ad-preview]')||{}).content||"")==="true";
+// The dev server binds 127.0.0.1:<port> ON THE DAEMON'S BOX, so the link only
+// resolves once that port is forwarded. location.hostname (not location.host)
+// because the pool port is not the dashboard's port.
+function previewUrl(port){return `${location.protocol}//${location.hostname}:${port}/`;}
 // Whether the New-task pipeline box starts ticked (AGENTDECK_PIPELINE). Served in
 // the HTML rather than fetched, so the drawer renders correctly on first open.
 const AD_PIPELINE_DEFAULT=((document.querySelector('meta[name=ad-pipeline-default]')||{}).content||"")==="true";
@@ -416,11 +438,41 @@ function phaseBar(t){
     return `<div class="seg ${cls}"><div class="bar"></div><div class="pl">${p}</div>${i===0?reviewMarks(t):""}</div>`;
   }).join("")+`</div>`+(st.cls==="missed"?`<div class="pipewarn">⚠ pipeline did not run</div>`:"");
 }
-function actions(t){
+// CLIENT-SIDE ONLY. POST /api/tasks/:id/preview accepts any status — this rule is
+// not enforced server-side, so a stale tab or a curl can still start a preview on a
+// running task. Token-gated, so not an external hole, but it is a policy the API
+// does not share. See TODOS.md ("Server-side quiescence enforcement").
+//
+// Preview is offered only when the worktree is QUIESCENT. A `running` agent is
+// actively rewriting the files a dev server watches, so a preview started there
+// shows rebuild storms and half-finished builds — which read as bad agent work
+// rather than as work in progress, the worst possible outcome for a feature whose
+// job is judging that work. `waiting` IS included: the agent is idle, blocked on
+// your answer, and the running app is exactly the evidence you need to answer.
+const PREVIEWABLE={waiting:1,done:1,stopped:1,error:1};
+function previewBtn(t){
+  if(!AD_PREVIEW)return "";                       // daemon can't serve previews at all
+  const p=t.preview;
+  if(!PREVIEWABLE[t.status]&&!p)
+    return `<button class="btn ghost" disabled title="The agent is still editing this worktree — a preview would rebuild on every change and show half-finished work. Available once it stops.">Preview</button>`;
+  if(!p)return `<button class="btn ghost" onclick="openPreview('${t.id}')">Preview</button>`;
+  if(p.status==="installing")return `<button class="btn ghost" disabled title="Installing dependencies — a cold install takes minutes.">Installing…</button>`;
+  if(p.status==="starting")return `<button class="btn ghost" disabled>Preview…</button>`;
+  if(p.status==="stopping")return `<button class="btn ghost" disabled>Stopping…</button>`;
+  if(p.status==="failed")return `<button class="btn ghost" onclick="openPreview('${t.id}')">Preview failed</button>`;
+  // A real <a>, so middle-click and ⌘-click work. rel="noopener" is mandatory, not
+  // hygiene: the previewed app is unreviewed agent-written code on another origin,
+  // and while it cannot READ this page it could navigate it via window.opener.
+  return `<a class="btn ghost" href="${previewUrl(p.port)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" onclick="event.stopPropagation()">Preview ▸</a>`;
+}
+function primaryAction(t){
   if(t.status==="waiting")return `<button class="btn primary" onclick="reply('${t.id}')">Reply</button>`;
   if(t.status==="error")return `<button class="btn danger" onclick="openTask('${t.id}')">View logs</button>`;
   if(t.status==="done")return `<button class="btn ghost" onclick="del('${t.id}')">Clean up</button>`;
   return `<button class="btn ghost" onclick="openTask('${t.id}')">Open</button>`;
+}
+function actions(t){
+  return `<div class="acts">${previewBtn(t)}${primaryAction(t)}</div>`;
 }
 function rowHtml(t){
   return `<article class="row ${t.status}">
@@ -444,6 +496,11 @@ function section(title,list){
   return `<div class="lbl">${title}</div><div class="rows">${list.map(safeRow).join("")}</div>`;
 }
 function render(){
+  // The drawer keys off the UNFILTERED task list, so it must update even when the
+  // board itself has nothing to draw. Hoisted above every early return: leaving it
+  // as the last statement froze the drawer whenever the project filter selected a
+  // project with no tasks.
+  renderPreviewDrawer();
   if(!projectsReady)return; // avoid a misleading "no projects" flash before the registry loads
   const board=document.getElementById("board");
   // Empty state 1: the registry itself is empty (all paths dropped at boot).
@@ -506,8 +563,15 @@ function projectField(id,selected){
 
 // ── drawer ──
 const drawer=document.getElementById("drawer"),scrim=document.getElementById("scrim");
-function showDrawer(html){document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
-function closeDrawer(){drawer.classList.remove("on");scrim.classList.remove("on");}
+// Clearing pvDrawer here is what stops a preview update from clobbering an unrelated
+// drawer. openPreview re-sets it immediately after calling this.
+// Both of these BUMP pvOpenSeq, which is what makes openPreview's staleness check
+// mean anything: nulling pvDrawer alone left the in-flight fetch's token still
+// matching, so a drawer closed mid-fetch re-opened itself and a drawer opened
+// mid-fetch got overwritten (destroying a typed reply). Every path that
+// invalidates an in-flight open must invalidate the token too.
+function showDrawer(html){pvOpenSeq++;pvDrawer=null;document.getElementById("drawerBody").innerHTML=html;drawer.classList.add("on");scrim.classList.add("on");}
+function closeDrawer(){pvOpenSeq++;drawer.classList.remove("on");scrim.classList.remove("on");pvDrawer=null;}
 function openNew(){
   if(!projects.length){announce("No project configured.");return;}
   showDrawer(`<h2>New task</h2>
@@ -582,6 +646,156 @@ function doUpload(){
   xhr.onerror=()=>{btn.disabled=false;prog.hidden=true;err.textContent="Network error.";announce("Upload failed.");};
   xhr.send(fd);
 }
+// ── preview drawer ─────────────────────────────────────────────────────────
+// `command` and `resolution` are fetched once per open (they don't change while
+// the drawer is up), while the live status rides the normal task payload. So the
+// drawer re-renders from `tasks` on every board update with no extra round trip —
+// which is what makes installing → starting → ready animate by itself.
+let pvDrawer=null; // {id, meta, error, lastHtml} while a preview drawer is open
+let pvOpenSeq=0;   // staleness token for the fetch below
+async function openPreview(id){
+  // Capture a token BEFORE the await. Without it, closing the drawer (Escape, the ×,
+  // the scrim) while this fetch was in flight made the drawer re-open by itself, and
+  // opening a different drawer in that window got overwritten — destroying anything
+  // typed into it.
+  const seq=++pvOpenSeq;
+  const meta=await fetch(`/api/tasks/${id}/preview`).then(r=>r.json()).catch(()=>({enabled:AD_PREVIEW,resolution:null,command:null}));
+  if(seq!==pvOpenSeq)return;                       // superseded by a later open
+  const st={id,meta,error:null,lastHtml:null};
+  const html=previewSection(tasks.find(x=>x.id===id)||{id,status:"done"},meta,null);
+  showDrawer(html);                                // bumps the token and clears pvDrawer
+  pvDrawer=st;                                     // …so re-set it, after
+  pvDrawer.lastHtml=html;                          // the string we rendered, not the browser's re-serialisation
+}
+// Called from render(), which fires on every WebSocket frame AND unconditionally
+// every 10s. Rebuilding innerHTML each time threw keyboard focus back to <body>,
+// wiped any text selection and reset the .q scroll — on the very ssh line this
+// drawer exists to let you select and copy. So: rebuild only when the markup
+// actually changed, and never mid-selection.
+function renderPreviewDrawer(){
+  if(!pvDrawer)return;
+  const t=tasks.find(x=>x.id===pvDrawer.id);
+  if(!t){closeDrawer();return;}
+  const html=previewSection(t,pvDrawer.meta,pvDrawer.error);
+  if(html===pvDrawer.lastHtml)return;                 // the common case: nothing to do
+  const sel=window.getSelection&&window.getSelection();
+  if(sel&&!sel.isCollapsed&&sel.anchorNode&&drawer.contains(sel.anchorNode))return; // don't yank a selection mid-copy
+  // Focus survives the swap: re-focus whatever carried the same data-k afterwards.
+  const key=document.activeElement&&drawer.contains(document.activeElement)?document.activeElement.dataset.k:null;
+  // Restore BOTH. showDrawer bumps pvOpenSeq to cancel in-flight opens, which is
+  // right for a user action but wrong here: this fires on every board update, so
+  // leaving the bump in place cancelled a legitimate openPreview that was still
+  // fetching — clicking Preview during any status change silently did nothing.
+  const st=pvDrawer,seq=pvOpenSeq;
+  showDrawer(html);
+  pvOpenSeq=seq;
+  pvDrawer=st;
+  pvDrawer.lastHtml=html;
+  if(key){const el=drawer.querySelector(`[data-k="${key}"]`);if(el)el.focus();}
+}
+function previewSection(t,meta,err){
+  const p=t.preview,id=t.id;
+  const head=`<h2>Preview</h2>
+    <div class="meta"><span class="branch">${BRANCH_ICON}${esc(t.branch)}</span><span>${esc(t.title)}</span></div>`;
+
+  // The daemon's message names the fix ("all 3 preview ports are in use (t_x) —
+  // stop one first"), and for failures raised before an entry exists there is no
+  // t.preview to carry it. Render it from drawer state so it persists.
+  const errBlock=err?`<label class="lbl">Could not start</label><div class="q">${esc(err)}</div>`:"";
+  if(!meta.enabled)
+    return head+`<div class="q">Previews are disabled on this daemon. Either AGENTDECK_PREVIEW=false, the daemon is bound off-loopback (a preview link would not be reachable through a proxy), or the port pool collides with the dashboard port. Check the boot notices.</div>`;
+
+  // No command configured: the reason IS the fix, so show it verbatim and let the
+  // operator copy it rather than retype JSON from a screenshot.
+  if(meta.resolution&&!meta.resolution.ok&&!p)
+    return head+`<label class="lbl">Not configured</label>
+      <div class="q">${esc(meta.resolution.reason)}</div>
+      <div class="acts"><button class="btn ghost" data-copy="${esc(meta.resolution.reason)}" onclick="copyText(this.dataset.copy,'Snippet')">Copy</button></div>`;
+
+  let body="";
+  if(p&&p.status==="ready"){
+    const url=previewUrl(p.port);
+    body+=`<label class="lbl">Running</label>
+      <div class="acts"><a class="btn ghost" data-k="open" href="${url}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">Open preview ▸</a></div>
+      <div class="q">${esc(url)}</div>
+      <label class="lbl">Reaching it</label>
+      <div class="q">The dev server listens on 127.0.0.1:${esc(String(p.port))} on the daemon's machine, so the link only resolves once that port is forwarded:
+
+  ssh -O forward -L ${esc(String(p.port))}:127.0.0.1:${esc(String(p.port))} you@your-vps
+
+-O forward adds the forward to the SSH session you already have open, instead of starting a second login. If your local ${esc(String(p.port))} is already in use, the link will silently open whatever is running there instead — check before you trust what you see.</div>
+      <div class="acts"><button class="btn ghost" onclick="copyText('ssh -O forward -L ${esc(String(p.port))}:127.0.0.1:${esc(String(p.port))} you@your-vps','Command')">Copy ssh line</button></div>`;
+  }else if(p&&p.status==="installing"){
+    body+=`<label class="lbl">Installing</label><div class="q">This worktree has no node_modules yet, so the install command is running first. A cold install takes minutes.</div>`;
+  }else if(p&&p.status==="starting"){
+    body+=`<label class="lbl">Starting</label><div class="q">Waiting for the dev server to listen on port ${esc(String(p.port))}…</div>`;
+  }else if(p&&p.status==="stopping"){
+    body+=`<label class="lbl">Stopping</label><div class="q">Shutting the dev server down…</div>`;
+  }
+  if(p&&p.status==="failed")
+    body+=`<label class="lbl">Failed</label><div class="q">${esc(p.error||"the preview stopped")}</div>`;
+  const cfg=meta.resolution&&meta.resolution.ok?meta.resolution.configured:null;
+  const shown=meta.command||(cfg&&cfg.preview);
+  if(shown)
+    body+=`<label class="lbl">Command</label><div class="q">${esc(shown)}${cfg&&cfg.install?`\ninstall: ${esc(cfg.install)}`:""}</div>`;
+
+  const quiescent=!!PREVIEWABLE[t.status];
+  const controls=`<div class="acts">`
+    +(p?`<button class="btn ghost" data-k="stop" ${p.status==="stopping"?"disabled":""} onclick="stopPreview('${id}')">Stop</button>`
+       :quiescent
+         ?`<button class="btn ghost" data-k="start" onclick="startPreview('${id}')">Start</button>`
+         :`<button class="btn ghost" data-k="start" disabled>Start</button>`)
+    +(p&&p.status==="failed"?`<button class="btn ghost" data-k="retry" onclick="restartPreview('${id}')">Retry</button>`:"")
+    +`</div>`
+    // Same rule as the row control, stated rather than implied: a file-watcher
+    // pointed at a worktree an agent is rewriting shows half-finished builds.
+    +(!p&&!quiescent?`<div class="q">The agent is still editing this worktree, so a preview would rebuild on every change and show half-finished work. Available once it stops.</div>`:"");
+  return head+errBlock+body+controls;
+}
+async function startPreview(id){
+  if(pvDrawer&&pvDrawer.id===id){pvDrawer.error=null;pvDrawer.lastHtml=null;}
+  announce("Starting the preview.");
+  // 202 with no body worth trusting: the daemon answers as soon as the entry
+  // exists, because a cold install runs for minutes and Bun would close the
+  // connection long before it finished. Progress arrives over the WebSocket as
+  // installing → starting → ready, which is what the drawer renders from — so
+  // announcing "ready" here would be a lie.
+  const r=await fetch(`/api/tasks/${id}/preview`,{method:"POST",headers:authHeaders()}).catch(()=>null);
+  if(!r||!r.ok){
+    const b=r?await r.json().catch(()=>({error:"request failed"})):{error:"could not reach the daemon"};
+    // The daemon's message names the fix (the projects.json snippet, which previews
+    // to stop, or the install command to run), so keep it verbatim and sticky.
+    if(pvDrawer&&pvDrawer.id===id){pvDrawer.error=b.error||"unknown error";pvDrawer.lastHtml=null;renderPreviewDrawer();}
+    announce("Could not start the preview.");
+  }
+}
+async function stopPreview(id){
+  const r=await fetch(`/api/tasks/${id}/preview`,{method:"DELETE",headers:authHeaders()}).catch(()=>null);
+  if(!r||!r.ok){
+    if(pvDrawer&&pvDrawer.id===id){pvDrawer.error="could not stop the preview";pvDrawer.lastHtml=null;renderPreviewDrawer();}
+    announce("Could not stop the preview.");
+    return;
+  }
+  if(pvDrawer&&pvDrawer.id===id){pvDrawer.error=null;pvDrawer.lastHtml=null;}
+  announce("Stopping the preview.");   // 202 means accepted, not finished
+}
+// The stop returns 202 the instant it is ACCEPTED, not when it finishes, so this
+// cannot just await it and start: starting into a `stopping` entry 409s with
+// "still shutting down". Poll until the entry is actually gone from the payload
+// the board renders from, then start.
+async function restartPreview(id){
+  await stopPreview(id);
+  for(let i=0;i<40;i++){
+    if(!(tasks.find(x=>x.id===id)||{}).preview)break;
+    await new Promise(r=>setTimeout(r,250));
+  }
+  await startPreview(id);
+}
+function copyText(text,what){
+  if(!navigator.clipboard){announce("Clipboard unavailable.");return;}
+  navigator.clipboard.writeText(text).then(()=>announce((what||"Text")+" copied."),()=>announce("Could not copy."));
+}
+
 // ── toast (upload result: a path you copy, not an alert to hand-retype) ──
 let lastToastPath="",toastTimer=null;
 function showToast(path){
@@ -667,7 +881,8 @@ async function openTask(id){
     <label class="lbl">Diff</label><div class="q">${esc(diffShown||"(no changes)")}</div>
     <label class="lbl">Recent events</label>
     <div class="q">${ev.events.slice(-40).map(evLine).join("\n")||"(none)"}</div>
-    <div style="display:flex;gap:8px">
+    <div class="acts">
+      ${AD_PREVIEW?`<button class="btn ghost" data-id="${esc(id)}" onclick="openPreview(this.dataset.id)">Preview</button>`:""}
       <button class="btn ghost" data-id="${esc(id)}" onclick="stop(this.dataset.id)">Pause</button>
       <button class="btn danger" data-id="${esc(id)}" onclick="del(this.dataset.id)">Delete</button></div>`);
 }

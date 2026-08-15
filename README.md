@@ -11,7 +11,7 @@ Self-hosted, **gstack-native** orchestrator for running multiple Claude Code age
 
 <p align="center"><sub>One agent flips to <code>waiting</code>, you answer in the drawer, and it resumes — live over WebSocket.</sub></p>
 
-> Status: **v0.2.5.1** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
+> Status: **v0.2.6.0** — early but working end to end. The full loop runs with a real agent: create a task → branch → git worktree → the agent runs → it asks a question in prose → you reply from the dashboard → `claude --resume` continues → done, with the artifact on disk. Ships as a single self-contained binary (see **Install**). Not yet production-hardened.
 
 ## Why this and not Claude Squad / Conductor / amux
 
@@ -24,6 +24,7 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
    Browser ──WS──────┼─▶ AgentDeck daemon (Bun, systemd, non-root)    │
    Slack/Telegram ◀──┼── notification-only (reply in the dashboard)   │
                      │   Agent supervisor: N × headless Claude Code    │
+                     │   Preview supervisor: dev servers on a port pool│
                      │   State store (SQLite, keyed by sessionId)      │
                      └───▲──────────────────────────────▲──────────────┘
                          │ HTTP hooks / SDK stream       │
@@ -32,7 +33,16 @@ Those orchestrate agents generically. AgentDeck is coupled to the **gstack workf
               │ cwd=worktree-1│                    │ cwd=worktree-N│
               └───────────────┘                    └──────────────┘
                  git worktree                         git worktree
+                      ▲                                    ▲
+                      │ same worktree, on demand           │
+              ┌────────┴────────┐                  ┌────────┴────────┐
+              │ dev server :8788│  (pool)          │ dev server :8789│
+              └─────────────────┘                  └─────────────────┘
+                 Browser ──────── ssh -L 8788 ─────────▶ (loopback only)
 ```
+
+The preview row is opt-in per project and per click: nothing starts a dev server
+unless you press **Preview**. See [Preview what an agent built](#preview-what-an-agent-built).
 
 **The human-in-loop mechanic (proven):** in headless mode Claude Code has no AskUserQuestion tool, so the agent asks in **prose** and the turn ends. AgentDeck reads the question, notifies you (Slack/Telegram), and when you reply in the dashboard it injects the answer as a new `claude --resume <sessionId>` turn. That same `resume` is also how agents survive a daemon restart — injection and durability are one operation.
 
@@ -149,7 +159,7 @@ This runbook is deliberately short. `scripts/setup-agent-user.sh --check` enumer
   If the three do not agree, the install is not finished no matter what the board says.
 
 8. DONE — summarize: mode and WHICH USER the daemon runs as, what `--check` finally reported, `/api/health` ok + uid + notices, what the witness task actually left on the remote, and anything still on me (the deploy key, a fine-grained token).
-- Dashboard: http://127.0.0.1:8787 (localhost-bound). From my laptop: `ssh -L 8787:127.0.0.1:8787 user@vps` then http://localhost:8787.
+- Dashboard: http://127.0.0.1:8787 (localhost-bound). From my laptop: `ssh -L 8787:127.0.0.1:8787 user@vps` then http://localhost:8787. To use Preview, forward the dev-server pool too (`-L 8788:127.0.0.1:8788 -L 8789:127.0.0.1:8789 -L 8790:127.0.0.1:8790`).
 ```
 
 </details>
@@ -201,7 +211,7 @@ bun run daemon
 bun run build     # → dist/agentdeck, the same self-contained binary CI ships
 ```
 
-Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json`), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_PIPELINE` (off — ticks the gstack-pipeline box by default on new tasks; see [The gstack pipeline](#the-gstack-pipeline)), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_REVIEW_READ_BIN` (gstack-review-read; resolved from PATH — the `[plan-reviews]` boot notice names it when missing), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_ALLOWED_HOSTS` (comma-separated Hosts accepted besides loopback — needed behind a reverse proxy, see [Upload files to the VPS](#upload-files-to-the-vps)), `AGENTDECK_AUTO_CLEAN_MERGED` (off; `true` periodically drops a done task's worktree, branch and row once its branch is merged), `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret agents use for hooks), `AGENTDECK_DASHBOARD_TOKEN` (per-session secret the browser uses for writes/uploads — injected into the served HTML), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
+Config knobs (env): `AGENTDECK_HOST` (default `127.0.0.1`), `AGENTDECK_PORT` (`8787`), `AGENTDECK_TARGET_REPO` (default: cwd — seeds the `default` project when there's no `projects.json`), `AGENTDECK_DATA_DIR` (default `~/.agentdeck` — SQLite DB + worktrees + uploads + `projects.json` + `previews.json`, the pidfile that lets a restart reap dev servers it left behind), `AGENTDECK_WORKTREES`, `AGENTDECK_UPLOADS` (default `<dataDir>/uploads`), `AGENTDECK_MAX_AGENTS` (`4`), `AGENTDECK_PREVIEW` (on; `false` disables the Preview button), `AGENTDECK_PREVIEW_PORTS` (`8788-8790` — the dev-server pool, as a range or a comma-separated list; sets reachability *and* concurrency, see [Preview what an agent built](#preview-what-an-agent-built). Bounds: 1024-32767, at most 16 ports — anything else is a typo, and falls back to the default with a boot warning), `AGENTDECK_PREVIEW_TTL_MS` (4h; `0` disables), `AGENTDECK_PREVIEW_MEM_MAX` (`1G`), `AGENTDECK_PREVIEW_READY_TIMEOUT_MS` (60s), `AGENTDECK_PREVIEW_INSTALL_TIMEOUT_MS` (10min), `AGENTDECK_PIPELINE` (off — ticks the gstack-pipeline box by default on new tasks; see [The gstack pipeline](#the-gstack-pipeline)), `AGENTDECK_CLAUDE_BIN` (`claude`), `AGENTDECK_REVIEW_READ_BIN` (gstack-review-read; resolved from PATH — the `[plan-reviews]` boot notice names it when missing), `AGENTDECK_SKIP_PERMISSIONS` (default on — `--dangerously-skip-permissions`; set `false` to disable), `AGENTDECK_PERMISSION_MODE` (`acceptEdits`, used only when skip is off), `AGENTDECK_CLAUDE_ARGS`, `AGENTDECK_ALLOWED_HOSTS` (comma-separated Hosts accepted besides loopback — needed behind a reverse proxy, see [Upload files to the VPS](#upload-files-to-the-vps)), `AGENTDECK_AUTO_CLEAN_MERGED` (off; `true` periodically drops a done task's worktree, branch and row once its branch is merged), `AGENTDECK_HOOKS` (opt-in Notification hooks, off by default), `AGENTDECK_HOOK_BASE_URL`, `AGENTDECK_HOOK_TOKEN` (per-session secret agents use for hooks), `AGENTDECK_DASHBOARD_TOKEN` (per-session secret the browser uses for writes/uploads — injected into the served HTML), `AGENTDECK_TG_TOKEN`/`AGENTDECK_TG_CHAT`, `AGENTDECK_SLACK_WEBHOOK`.
 
 `AGENTDECK_ALLOW_ROOT` exists too, and is deliberately not in that list: it is an escape hatch for a machine where no service account can be created, not a configuration choice — see [Don't run the daemon as root](#dont-run-the-daemon-as-root).
 
@@ -299,7 +309,9 @@ One daemon can drive several repos. Drop a **`projects.json`** in the data dir
 ```json
 [
   { "id": "api", "path": "/srv/billing-api", "label": "Billing API" },
-  { "id": "web", "path": "/srv/web" }
+  { "id": "web", "path": "/srv/web",
+    "install": "npm ci",
+    "preview": "npm run dev -- --port {port} --host 127.0.0.1" }
 ]
 ```
 
@@ -310,6 +322,84 @@ remembered across reloads. Each task's branch/worktree lands in its project's
 repo. Bad entries are skipped at boot with a warning; if there's no
 `projects.json`, a single `default` project is synthesized from
 `AGENTDECK_TARGET_REPO` — so existing single-repo setups keep working unchanged.
+The optional `install`/`preview` commands power the Preview button; see
+[Preview what an agent built](#preview-what-an-agent-built). A project without them
+behaves exactly as before: the button still renders on an idle task, and clicking it
+opens a drawer that says the project isn't configured for previews and what to add.
+
+## Preview what an agent built
+
+A phase bar and a diff tell you an agent finished. They don't tell you whether the
+thing *works*. **Preview** starts that task's dev server in its own worktree and
+gives you a link.
+
+Add an `install` and a `preview` command to the project in `projects.json`:
+
+```json
+[
+  { "id": "web", "path": "/srv/web",
+    "install": "npm ci",
+    "preview": "npm run dev -- --port {port} --host 127.0.0.1 --strictPort" }
+]
+```
+
+`{port}` is substituted with a port from the pool. Both fields also take an array
+(`["npm","run","dev","--","--define","API=https://x/a b"]`) for arguments that
+contain spaces — the string form splits on whitespace. Leading `NAME=VALUE` tokens
+become environment for the child, which is how frameworks that ignore `--port` are
+handled (`PORT={port} HOST=127.0.0.1 npm start`).
+
+Then forward the pool alongside the dashboard:
+
+```
+ssh -L 8787:127.0.0.1:8787 \
+    -L 8788:127.0.0.1:8788 -L 8789:127.0.0.1:8789 -L 8790:127.0.0.1:8790 user@vps
+```
+
+Already connected? `ssh -O forward -L 8788:127.0.0.1:8788 user@vps` adds a forward
+to the session you have open instead of starting a second login.
+
+**Why a separate port and not a path on 8787.** The previewed app is code an agent
+just wrote and nobody reviewed. Served from the dashboard's own origin, its
+JavaScript could read the dashboard token out of the page and drive the API —
+creating tasks with `--dangerously-skip-permissions`. A different port is a
+different origin, and everything the app needs (its own fetches, `localStorage`,
+cookies, HMR) keeps working because within that origin it is still same-origin with
+itself.
+
+Things worth knowing before you rely on it:
+
+- **`AGENTDECK_PREVIEW_PORTS` (default `8788-8790`) sets reachability *and*
+  concurrency.** Each port needs its own forward, so the pool size is the number of
+  simultaneous previews. Three dev servers is 0.6–1.8GB; on a 4GB box also running
+  four agents, consider `8788-8789`. `AGENTDECK_PREVIEW_MEM_MAX` (default `1G`)
+  caps each one — but only where `systemd-run --user --scope` works. With no user
+  session bus (many containers) the daemon says so in a boot notice and runs
+  previews uncapped, so the pool size is your only real ceiling there.
+- **The daemon can switch previews off at boot**, and says which case on the
+  dashboard: the pool includes the dashboard's own port (which would put
+  agent-written code on the dashboard's origin), or `AGENTDECK_HOST` isn't
+  loopback (a preview link points at a port your reverse proxy isn't serving). The
+  control is then absent rather than present and failing on every click.
+- **Lock the pool down at the firewall.** Dev servers always bind `127.0.0.1`, but
+  a belt-and-braces `ufw deny 8788:8790/tcp` costs nothing and covers any
+  framework that ignores the bind flag you gave it.
+- **Preview is offered only when the agent is idle** — waiting, done, stopped or
+  errored. On a running task the button is disabled: a file-watcher pointed at a
+  worktree being rewritten shows rebuild storms and half-finished builds, which
+  look like bad work rather than work in progress.
+- **Previews do not survive a daemon restart.** A dev server has no `--resume`
+  handle, so the control simply returns to *Start*. A daemon killed with `-9`
+  leaves its dev servers running; the next boot reaps them and frees the pool.
+- **They stop themselves after `AGENTDECK_PREVIEW_TTL_MS`** (default 4h; `0`
+  disables). This is a hard lifetime cap, not an idle timer — the daemon isn't in
+  the request path, so it cannot tell whether you're looking.
+- **If your *local* 8788 is already in use**, the link opens whatever is running
+  there. A plausible wrong app is more confusing than a dead link, so check before
+  trusting what you see.
+
+Nothing starts on its own: previews are never auto-started on `done` or by the
+pipeline, for the same reason `AGENTDECK_AUTO_CLEAN_MERGED` ships off.
 
 ## Upload files to the VPS
 
@@ -351,9 +441,17 @@ there are no cookies to transfer at all.
 
 ```
 src/        daemon: config, types, db (SQLite/WAL), git (worktrees), phase,
-            agent (supervisor), notify, tasks, bus, server, daemon
+            agent (supervisor), preview (dev servers), proc (shared process
+            supervision), notify, tasks, bus, server, daemon
 public/     Master Inbox dashboard (live over WebSocket)
+test/       unit + integration tests (`bun test`)
+scripts/    setup-agent-user.sh (provision + `--check`), check-release-current.sh
 ```
+
+The other docs at the root: [DESIGN.md](DESIGN.md) (the dashboard's design system —
+tokens, contrast floors, layout invariants), [TODOS.md](TODOS.md) (the backlog, by
+component and priority, completed work at the bottom), and
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

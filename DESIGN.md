@@ -134,6 +134,8 @@ Every surface that can be absent, loading, empty, or broken says so.
 | Board, no project | dashed empty state, `projects.json` guidance, Reload action |
 | Board, no task | dashed empty state, one-line explanation, primary action |
 | Task row | waiting · error · running · resuming · done · stopped, each with a colored rail |
+| Preview control | absent (daemon can't) · disabled+reason (agent still editing) · Preview · Installing… · Preview… · Stopping… · Preview failed · **Preview ▸** (a link) |
+| Preview drawer | disabled-on-this-daemon · not configured (reason + Copy) · could-not-start (sticky) · Installing · Starting · Running (link + ssh guidance) · Stopping · Failed |
 
 The notice banner is the daemon's own health, not a task's. It sits between
 `</header>` and `#board` — below the header, so it joins neither row and adds no
@@ -149,6 +151,35 @@ second `margin-left:auto`. Three rules, each learned the hard way:
   own tints fall under the 4.5:1 floor in one theme or the other; the border
   carries the meaning and the text stays readable. See Rule 1 and Rule 3.
 
+**Disabled controls dim the border, never the label.** `opacity` on a `.btn`
+multiplies the text colour too: `--dim` at `.5` measures **2.75:1** dark and
+**2.13:1** light, under the 4.5:1 floor, and it compounds with `.row.done`'s own
+`.62` to **1.80:1**. Four of the preview control's eight states render only while
+disabled, so that treatment would have put half the feature below the floor. Signal
+it with `border-style:dashed` + `--line-soft` and leave the label at full strength.
+
+**A drawer that re-renders must not steal what the user is holding.** The preview
+drawer is the first surface that redraws from live data, and `render()` fires on
+every WebSocket frame plus every 10s. Rebuilding `innerHTML` unconditionally threw
+keyboard focus to `<body>`, wiped text selection and reset scroll — on the ssh line
+the drawer exists to let you copy. Re-render only when the markup actually changed,
+skip while a selection is anchored inside, and restore focus by `data-k`.
+
+**Preview state is never agent state.** The preview control is `.btn.ghost` in
+every one of its states, including `Preview failed`. It must not borrow `--err` or
+`--wait`: those are reserved for the agent (Rule 1), and a dev server that won't
+boot is not the task failing — the agent's work may be perfect while the operator's
+`preview` command has a typo. Borrowing the loud colour here trains people to
+discount the one signal that means "an agent needs you".
+
+**The preview link is the page's first and only `<a>`.** It carries
+`rel="noopener noreferrer"` and `referrerpolicy="no-referrer"`, and that is a
+requirement rather than hygiene: the target is unreviewed, agent-written code on a
+different origin. It cannot *read* this page, but without `noopener` it could
+navigate the tab it was opened from. `.btn` is `display:inline-flex` with
+`text-decoration:none` so an anchor and a button are indistinguishable. Any future
+link inherits the same rule.
+
 A daemon restart is routine. It must read as *reconnecting*, never as an error.
 But an unchanging retry message hides the difference between a two-second blip
 and a daemon that never came back, so the state escalates to `--err` once.
@@ -162,7 +193,7 @@ Empty states are features: warmth, context, and a primary action. Never
 
 - **Contrast** — every text/background pair clears 4.5:1 in both themes. See Rule 3.
 - **Touch targets** — interactive controls are at least 44px under 620px
-  (`.newbtn`, `.projsel select`, `.opt`). Desktop keeps its density; a mouse does
+  (`.newbtn`, `.projsel select`, `.opt`, `.acts .btn`). Desktop keeps its density; a mouse does
   not need the area. Add every new control to that media query — the reply
   drawer's option rows shipped at 35px until a measurement caught them.
 - **Focus** — visible focus rings on every control: `outline: 2px solid var(--accent)`

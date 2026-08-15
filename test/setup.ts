@@ -25,6 +25,12 @@ delete process.env.AGENTDECK_ALLOW_ROOT;
 // pipeline ARMED, so every task created by a test would try to walk seven gstack
 // steps. config.pipelineDefault is asserted explicitly via isOptIn instead.
 delete process.env.AGENTDECK_PIPELINE;
+// Same again for the preview switch. An operator who sourced their EnvironmentFile
+// with AGENTDECK_PREVIEW=false would otherwise turn the whole of test/preview.test.ts
+// red — beginPreview refuses before it does anything — with a failure message that
+// blames the daemon rather than the environment. The refusal itself is asserted
+// explicitly by flipping config.preview.enabled in the test that cares.
+delete process.env.AGENTDECK_PREVIEW;
 // A test must never be able to reach an external service. The suite drives the
 // real supervisor, whose error path calls notify() — and notify() does a live
 // fetch to Telegram/Slack whenever these are set. An operator who sources their
